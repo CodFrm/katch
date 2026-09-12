@@ -6,13 +6,20 @@
 package migrations
 
 import (
+	"fmt"
+
 	"github.com/go-gormigrate/gormigrate/v2"
 	"gorm.io/gorm"
+
+	"github.com/CodFrm/katch/internal/model/entity/setting_entity"
+	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
 )
 
 // migrationList 按执行顺序返回全部迁移。
 func migrationList() []*gormigrate.Migration {
-	return []*gormigrate.Migration{}
+	return []*gormigrate.Migration{
+		upstreamAndSetting(),
+	}
 }
 
 // RunMigrations 执行全部未执行的迁移。
@@ -28,4 +35,96 @@ func runMigrations(db *gorm.DB, list []*gormigrate.Migration) error {
 		return nil
 	}
 	return gormigrate.New(db, gormigrate.DefaultOptions, list).Migrate()
+}
+
+// tableName 取出 gorm 为该实体生成的表名（含配置里的表前缀）。
+//
+// 不把表名写死：表前缀来自 configs/config.yaml 的 db.prefix，写死就会让改过前缀的
+// 部署建出一张 repository 永远查不到的表。代价是这条迁移的表名跟着实体的结构体名走，
+// 因此**重命名这些实体必须配一条补丁迁移**，不能只改结构体。
+func tableName(tx *gorm.DB, model any) (string, error) {
+	stmt := &gorm.Statement{DB: tx}
+	if err := stmt.Parse(model); err != nil {
+		return "", err
+	}
+	return stmt.Table, nil
+}
+
+// upstreamAndSetting 建上游表与设置表。
+//
+// upstream 是代理的白名单：不在表里或 enabled 为假的主机一律 404，
+// 否则 katch 就是一个任何人都能拿来当跳板的开放代理。
+// setting 是运行时配置的键值表，眼下先承载管理密钥的哈希。
+func upstreamAndSetting() *gormigrate.Migration {
+	return &gormigrate.Migration{
+		ID: "20260912000001_upstream_and_setting",
+		Migrate: func(tx *gorm.DB) error {
+			upstream, setting, err := tables(tx)
+			if err != nil {
+				return err
+			}
+			// 自增主键是 sqlite 和 MySQL 唯一写不到一起的地方：MySQL 要
+			// AUTO_INCREMENT，sqlite 的 AUTOINCREMENT 只认 INTEGER PRIMARY KEY。
+			// 其余列两种方言同形，所以只有这一处分方言。
+			autoPK := "BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY"
+			if tx.Name() == "sqlite" {
+				autoPK = "INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT"
+			}
+			stmts := []string{
+				fmt.Sprintf("CREATE TABLE `%s` ("+
+					"`id` %s,"+
+					"`host` VARCHAR(191) NOT NULL,"+
+					"`kind` VARCHAR(32) NOT NULL,"+
+					"`origin` VARCHAR(512) NOT NULL,"+
+					"`enabled` BOOLEAN NOT NULL DEFAULT 0,"+
+					"`immutable_patterns` TEXT,"+
+					"`mutable_ttl_seconds` INT NOT NULL DEFAULT 0,"+
+					"`default_policy` VARCHAR(32) NOT NULL DEFAULT 'allow_all',"+
+					"`library_completion` BOOLEAN NOT NULL DEFAULT 0,"+
+					"`note` VARCHAR(512) NOT NULL DEFAULT '',"+
+					"`createtime` BIGINT NOT NULL DEFAULT 0,"+
+					"`updatetime` BIGINT NOT NULL DEFAULT 0)", upstream, autoPK),
+				// host 唯一由数据库保证，而不是只靠 service 里的那次查重：
+				// 并发的两次创建都能查到「不存在」，唯一索引是最后一道闸。
+				fmt.Sprintf("CREATE UNIQUE INDEX `idx_%s_host` ON `%s` (`host`)", upstream, upstream),
+				// key 在 MySQL 里是保留字，必须带反引号；sqlite 也认反引号。
+				fmt.Sprintf("CREATE TABLE `%s` ("+
+					"`key` VARCHAR(191) NOT NULL PRIMARY KEY,"+
+					"`value` TEXT,"+
+					"`createtime` BIGINT NOT NULL DEFAULT 0,"+
+					"`updatetime` BIGINT NOT NULL DEFAULT 0)", setting),
+			}
+			for _, stmt := range stmts {
+				if err := tx.Exec(stmt).Error; err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			upstream, setting, err := tables(tx)
+			if err != nil {
+				return err
+			}
+			for _, name := range []string{upstream, setting} {
+				if err := tx.Exec(fmt.Sprintf("DROP TABLE IF EXISTS `%s`", name)).Error; err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}
+}
+
+// tables 取这条迁移涉及的两张表名。
+func tables(tx *gorm.DB) (string, string, error) {
+	upstream, err := tableName(tx, &upstream_entity.Upstream{})
+	if err != nil {
+		return "", "", err
+	}
+	setting, err := tableName(tx, &setting_entity.Setting{})
+	if err != nil {
+		return "", "", err
+	}
+	return upstream, setting, nil
 }

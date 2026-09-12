@@ -16,8 +16,14 @@ app/controller  →  service  →  repository  →  model/entity
 - **entity**（`internal/model/entity/<domain>_entity/`）：充血模型。存在性检查、状态校验、
   字段格式化这类只依赖自身的规则写在实体上；跨实体协调和依赖外部服务的逻辑放 service。
 
-`internal/api/` 只放请求/响应结构与路由注册，不含逻辑。
+`internal/api/` 只放请求/响应结构与路由注册，不含逻辑。按面分子包：
+`internal/api/admin/` 是需要密钥的管理接口，公开接口另开子包。
 横切层（`pkg/`）不得反向引用 service / repository。
+
+service 的方法直接收发 `internal/api/` 里的结构体（cago 的惯例），因此
+**api 子包不许反向 import service**，否则会构成循环。路由鉴权中间件之所以写在
+`internal/api/router.go` 里而不是单开一个包，就是这个原因：`internal/api` 自身
+没有任何包反向引用它，把「要调 service」的那点代码放在这里不会闭环。
 
 新领域开新的一组包（`<domain>_entity` / `_repo` / `_svc`），不要往已有领域里塞。
 
@@ -47,6 +53,11 @@ MySQL 特有语法。DDL 优先写原生 SQL 而不是依赖 gorm 的 AutoMigrat
 迁移只追加不修改：新迁移加到 `migrations.migrationList()` 末尾。已经在环境里跑过的
 迁移即使改了也不会重跑，只会让新旧环境的表结构悄悄分叉；需要修正时追加一条补丁迁移。
 
+表名带 `db.prefix` 前缀，由 gorm 的 NamingStrategy 生成。迁移里的原生 DDL 因此
+不写死表名，而是从实体反解（`migrations.tableName`）——写死会让改过前缀的部署建出
+一张 repository 永远查不到的表。代价是表名跟着实体的结构体名走，**重命名实体必须
+配一条补丁迁移**。
+
 sqlite 的 DSN 里两个 pragma 不能省（见 `configs/config.yaml` 的注释）：
 `journal_mode(WAL)` 让读不阻塞写，`busy_timeout` 让遇锁时等待而不是立刻返回
 `SQLITE_BUSY`——缺了它并发写会直接报 "database is locked"。
@@ -59,3 +70,24 @@ sqlite 的 DSN 里两个 pragma 不能省（见 `configs/config.yaml` 的注释�
 
 一条已经确定的原则：上游配置以**主机名**为 key，加一个新上游应当是加一行配置，
 而不是加一个新的路径前缀约定。
+
+## 配置的边界与管理密钥
+
+`configs/config.yaml` 只放「**进程起不来就没法从界面改的东西**」：监听地址、
+数据库 DSN、日志、缓存目录、初始管理密钥。这是一条可判定的规则，不是逐项拍脑袋
+——数据库连不上时界面本身就不可用，所以 DSN 必须在文件里；配额、TTL、并发这些
+进程跑起来之后才生效的参数一律落 `setting` 表，改完不用重启。
+
+上游同理：上游是 `upstream` 表里的记录，不是配置项。增删上游、暂停上游是运维日常
+动作，做成配置项意味着每次变更都要改文件并重启。这张表同时就是白名单——不在表里
+或 `enabled` 为假的主机一律 404，否则 katch 就是一个开放代理。
+
+管理密钥以 bcrypt 哈希存在 `setting` 表的 `admin_key_hash` 键上。`config.yaml` 里的
+`admin.initialKey` 是**初始**密钥，只在库中尚无密钥时落一次；之后的轮换在界面上完成，
+改配置文件不会把已轮换的密钥覆盖回去。没配初始密钥不阻断启动：管理接口全量 401，
+拉取路径照常服务。
+
+`/api/v1/admin/*` 一律要密钥，拉取路径公开。**密钥错误与未提供密钥必须返回完全相同的
+401**——状态码、响应体、响应头都一致，且不带 `WWW-Authenticate`。任何差异都在告诉
+探测者「密钥这个字段你找对了，只是值不对」。校验路径上即使没带密钥也照样比一次
+bcrypt，否则两者的耗时差本身就是一个可区分的信号。

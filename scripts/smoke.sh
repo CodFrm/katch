@@ -47,6 +47,29 @@ echo "✓ /metrics 输出了指标"
 check / 200 "SPA 首页可用"
 check /api/v1/does-not-exist 404 "未命中的 API 返回 404 而不是回落 index.html"
 
+# 管理接口：密钥的两种失败必须不可区分，带对密钥则能写进去再读回来。
+# 单元测试用的是 mock 仓储，这里走的是真二进制 + 真 sqlite——迁移建的表对不对、
+# 初始密钥有没有落库，只有在这里才会暴露。
+ADMIN_KEY=$(awk '/^admin:/{f=1;next} f && /initialKey:/{sub(/^[^:]*:[[:space:]]*/,""); gsub(/"/,""); print; exit}' "$workdir/config.yaml")
+[ -n "$ADMIN_KEY" ] || fail "没能从配置里读出 admin.initialKey"
+
+check /api/v1/admin/upstreams 401 "管理接口未带密钥返回 401"
+
+nokey=$(curl -s "${BASE}/api/v1/admin/upstreams")
+wrongkey=$(curl -s -H "Authorization: Bearer definitely-not-the-key" "${BASE}/api/v1/admin/upstreams")
+[ "$nokey" = "$wrongkey" ] || fail "未带密钥与密钥错误的响应体不同，可被用来确认密钥字段名"
+echo "✓ 未带密钥与密钥错误的响应完全一致"
+
+curl -s -X POST "${BASE}/api/v1/admin/upstreams" \
+  -H "Authorization: Bearer ${ADMIN_KEY}" -H 'Content-Type: application/json' \
+  -d '{"host":"smoke.example.com","kind":"static","origin":"https://smoke.example.com","enabled":true}' \
+  | grep -q '"code":0' || fail "带正确密钥创建上游失败"
+echo "✓ 带正确密钥可以创建上游"
+
+curl -s -H "Authorization: Bearer ${ADMIN_KEY}" "${BASE}/api/v1/admin/upstreams" \
+  | grep -q 'smoke.example.com' || fail "刚创建的上游没能被列表读回"
+echo "✓ 创建的上游能被列表读回"
+
 diff -q "$workdir/config.expect" "$workdir/config.yaml" > /dev/null \
   || fail "配置文件被进程改写了（只读配置源可能失效）"
 echo "✓ 配置文件未被改写"

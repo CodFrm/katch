@@ -38,3 +38,10 @@ db:
   maxIdleConns: 4
   connMaxLifetime: 30m
   connMaxIdleTime: 5m
+
+admin:
+  # 管理接口（/api/v1/admin/*）的**初始**密钥。密钥以 bcrypt 哈希存在库的 setting
+  # 表里，这里的值只在库中尚无密钥时生效一次；之后的轮换在界面上完成，改这里不会
+  # 有任何效果，也不会把已经轮换过的密钥覆盖回去。
+  # 留空则不设密钥：管理接口全量 401，拉取路径照常服务。
+  initialKey: "change-me-before-exposing-katch"
