@@ -28,6 +28,12 @@ type Request struct {
 	RawQuery string
 	// Header 客户端的请求头。按白名单转发，不在白名单里的一律不带走。
 	Header http.Header
+	// Authorization katch **自己**换来的上游凭据，空串表示匿名请求。
+	//
+	// 它和 Header 分开是刻意的：Header 是客户端那一侧的头，白名单里永远不会有
+	// Authorization（决策 11，客户端的凭据不外泄给上游）；这一项是 katch 向上游
+	// 出示的凭据，目前只有 registry 适配器换到 token 时会填（决策 5）。
+	Authorization string
 }
 
 // Response 上游的响应。Body 由调用方负责关闭。
@@ -116,6 +122,10 @@ func (c *Client) Do(ctx context.Context, req *Request) (*Response, error) {
 		if v := req.Header.Values(k); len(v) > 0 {
 			httpReq.Header[http.CanonicalHeaderKey(k)] = append([]string(nil), v...)
 		}
+	}
+	if req.Authorization != "" {
+		// 放在白名单复制之后：这一项是 katch 的凭据，不受客户端请求头影响。
+		httpReq.Header.Set("Authorization", req.Authorization)
 	}
 	// 响应体不在这里关：它就是要流式交给调用方的那个东西，调用方负责 Close。
 	resp, err := c.http.Do(httpReq)

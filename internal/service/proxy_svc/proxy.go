@@ -13,6 +13,7 @@ import (
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
 	"github.com/CodFrm/katch/internal/proxy/dispatch"
 	"github.com/CodFrm/katch/internal/proxy/origin"
+	"github.com/CodFrm/katch/internal/proxy/registry"
 	"github.com/CodFrm/katch/internal/service/upstream_svc"
 )
 
@@ -73,12 +74,21 @@ type Options struct {
 
 type proxySvc struct {
 	origin *origin.Client
-	gate   Gate
+	// registry registry 上游的适配器：token 交换与 /v2、library/ 的路径补全。
+	// 它坐在这个缝的后面，而不是另开一条数据通路——白名单、退避、缓存都在
+	// 上面那几行里，绕过去就等于绕过它们。
+	registry *registry.Adapter
+	gate     Gate
 }
 
 // New 构造拉取路径的业务层。
 func New(opt Options) ProxySvc {
-	return &proxySvc{origin: origin.New(), gate: opt.Gate}
+	client := origin.New()
+	return &proxySvc{
+		origin:   client,
+		registry: registry.New(registry.Options{Origin: client}),
+		gate:     opt.Gate,
+	}
 }
 
 var defaultProxy = New(Options{})
@@ -102,8 +112,7 @@ func (p *proxySvc) Fetch(ctx context.Context, target *Target) (io.ReadCloser, *M
 	if upstream == nil {
 		return nil, nil, ErrUpstreamNotAllowed
 	}
-	path, ok := upstreamPath(target, upstream)
-	if !ok {
+	if !kindMatches(target, upstream) {
 		return nil, nil, ErrUpstreamNotAllowed
 	}
 	// 闸问在这里，而不是在白名单判定之前：表里没有的主机名必须先拿到那一个
@@ -112,13 +121,7 @@ func (p *proxySvc) Fetch(ctx context.Context, target *Target) (io.ReadCloser, *M
 	if p.gate != nil && !p.gate.Allow(target.Host) {
 		return nil, nil, ErrUpstreamBackoff
 	}
-	resp, err := p.origin.Do(ctx, &origin.Request{
-		Method:   target.Method,
-		Origin:   upstream.Origin,
-		Path:     path,
-		RawQuery: target.RawQuery,
-		Header:   target.Header,
-	})
+	resp, err := p.fetchUpstream(ctx, target, upstream)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -129,25 +132,46 @@ func (p *proxySvc) Fetch(ctx context.Context, target *Target) (io.ReadCloser, *M
 	}, nil
 }
 
-// upstreamPath 求出上游侧路径，并顺带校验请求形态与上游类别是否相符。
+// fetchUpstream 按上游类别选一条回源方式。
+//
+// registry 走适配器：它要补回 /v2 协议前缀、按记录补全 library/，还要在上游
+// 要求鉴权时自己换 token（决策 5）。static 上游原样回源，一个字节都不改——
+// APT 的响应体在 InRelease 的 GPG 签名覆盖范围内。
+func (p *proxySvc) fetchUpstream(
+	ctx context.Context, target *Target, upstream *upstream_entity.Upstream,
+) (*origin.Response, error) {
+	if target.Kind == dispatch.KindRegistry {
+		return p.registry.Do(ctx, &registry.Request{
+			Host:              target.Host,
+			Origin:            upstream.Origin,
+			Path:              target.Path,
+			RawQuery:          target.RawQuery,
+			Method:            target.Method,
+			Header:            target.Header,
+			LibraryCompletion: upstream.LibraryCompletion,
+		})
+	}
+	return p.origin.Do(ctx, &origin.Request{
+		Method:   target.Method,
+		Origin:   upstream.Origin,
+		Path:     target.Path,
+		RawQuery: target.RawQuery,
+		Header:   target.Header,
+	})
+}
+
+// kindMatches 校验请求形态与上游类别是否相符。
 //
 // 类别对不上就当作没有这个上游：registry 客户端固定走 /v2 前缀，一个 static 上游
 // 出现在 /v2/ 之下（或反过来）只可能是拼错或在试探，按白名单之外处理最省事。
-func upstreamPath(target *Target, upstream *upstream_entity.Upstream) (string, bool) {
+func kindMatches(target *Target, upstream *upstream_entity.Upstream) bool {
 	switch target.Kind {
 	case dispatch.KindRegistry:
-		if upstream.Kind != upstream_entity.KindRegistry {
-			return "", false
-		}
-		// dispatch 摘掉的 /v2 是 registry 的协议前缀，回源时补回去。
-		return "/v2" + target.Path, true
+		return upstream.Kind == upstream_entity.KindRegistry
 	case dispatch.KindStatic:
-		if upstream.Kind != upstream_entity.KindStatic {
-			return "", false
-		}
-		return target.Path, true
+		return upstream.Kind == upstream_entity.KindStatic
 	default:
 		// 其余归属根本不该走到回源，走到了就是调用方漏判了一种分支。
-		return "", false
+		return false
 	}
 }
