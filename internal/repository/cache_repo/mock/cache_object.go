@@ -174,6 +174,21 @@ func (mr *MockCacheObjectRepoMockRecorder) SetPinned(ctx, id, pinned any) *gomoc
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetPinned", reflect.TypeOf((*MockCacheObjectRepo)(nil).SetPinned), ctx, id, pinned)
 }
 
+// SizeByUpstream mocks base method.
+func (m *MockCacheObjectRepo) SizeByUpstream(ctx context.Context) (map[int64]int64, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "SizeByUpstream", ctx)
+	ret0, _ := ret[0].(map[int64]int64)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// SizeByUpstream indicates an expected call of SizeByUpstream.
+func (mr *MockCacheObjectRepoMockRecorder) SizeByUpstream(ctx any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SizeByUpstream", reflect.TypeOf((*MockCacheObjectRepo)(nil).SizeByUpstream), ctx)
+}
+
 // TotalSize mocks base method.
 func (m *MockCacheObjectRepo) TotalSize(ctx context.Context) (int64, error) {
 	m.ctrl.T.Helper()

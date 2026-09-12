@@ -22,6 +22,27 @@ const sumColumns = "COALESCE(SUM(requests), 0) AS requests," +
 	"COALESCE(SUM(bytes_served), 0) AS bytes_served," +
 	"COALESCE(SUM(bytes_origin), 0) AS bytes_origin"
 
+// dayColumn 把整分钟折算回它所属的自然日（UTC）起点。
+//
+// 在 SQL 里分组而不是把分钟桶捞回 Go 里分：14 天是 14×1440 个桶乘上游数，
+// 光把它们扫进内存就比这次聚合本身贵得多，而首页是匿名就能打的。
+const dayColumn = "(bucket - bucket % 86400) AS day"
+
+// DayTotals 一个自然日的聚合结果。
+//
+// 放在 repo 包而不是 rollup_entity：它不是一个实体，是这张表按天读出来的形状，
+// day 这一列在表里根本不存在。
+type DayTotals struct {
+	// Day 这一天 00:00:00 UTC 的秒数。
+	Day          int64 `gorm:"column:day" json:"day"`
+	Requests     int64 `gorm:"column:requests" json:"requests"`
+	Hits         int64 `gorm:"column:hits" json:"hits"`
+	Denied       int64 `gorm:"column:denied" json:"denied"`
+	OriginErrors int64 `gorm:"column:origin_errors" json:"origin_errors"`
+	BytesServed  int64 `gorm:"column:bytes_served" json:"bytes_served"`
+	BytesOrigin  int64 `gorm:"column:bytes_origin" json:"bytes_origin"`
+}
+
 // TrafficRollupRepo 分钟桶的存取。
 //
 // 区间一律是左闭右开 [from, to)：相邻的两个区间各自聚合时，边界那一分钟只能被
@@ -34,6 +55,8 @@ type TrafficRollupRepo interface {
 	Sum(ctx context.Context, from, to int64) (*rollup_entity.Totals, error)
 	// SumByUpstream 按上游分组的区间聚合。
 	SumByUpstream(ctx context.Context, from, to int64) ([]*rollup_entity.Totals, error)
+	// SumByDay 按自然日（UTC）分组的区间聚合，由旧到新。只有有流量的日子会有行。
+	SumByDay(ctx context.Context, from, to int64) ([]*DayTotals, error)
 	// Prune 裁掉 bucket 小于 before 的行，返回裁掉多少行。
 	Prune(ctx context.Context, before int64) (int64, error)
 }
@@ -89,6 +112,20 @@ func (t *trafficRollupRepo) SumByUpstream(ctx context.Context, from, to int64) (
 		Select("upstream_id,"+sumColumns).
 		Where("bucket >= ? AND bucket < ?", from, to).
 		Group("upstream_id").
+		Scan(&list).Error; err != nil {
+		return nil, err
+	}
+	return list, nil
+}
+
+func (t *trafficRollupRepo) SumByDay(ctx context.Context, from, to int64) ([]*DayTotals, error) {
+	list := make([]*DayTotals, 0)
+	if err := db.Ctx(ctx).Model(&rollup_entity.TrafficRollup{}).
+		Select(dayColumn+","+sumColumns).
+		Where("bucket >= ? AND bucket < ?", from, to).
+		Group("day").
+		// 由旧到新：界面上是一条时间轴，顺序在这里定好，调用方就不必各排一次。
+		Order("day asc").
 		Scan(&list).Error; err != nil {
 		return nil, err
 	}

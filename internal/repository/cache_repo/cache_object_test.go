@@ -175,3 +175,35 @@ func TestCacheObjectRepo_Delete(t *testing.T) {
 		convey.So(mock.ExpectationsWereMet(), convey.ShouldBeNil)
 	})
 }
+
+func TestCacheObjectRepo_SizeByUpstream(t *testing.T) {
+	convey.Convey("按上游统计缓存占用", t, func() {
+		ctx, _, mock := testutils.Database(t)
+		repo := NewCacheObject()
+
+		convey.Convey("每个有缓存的上游一行", func() {
+			mock.ExpectQuery("SELECT upstream_id,COALESCE\\(SUM\\(size\\), 0\\) AS size " +
+				"FROM `cache_objects` GROUP BY `upstream_id`").
+				WillReturnRows(sqlmock.NewRows([]string{"upstream_id", "size"}).
+					AddRow(7, 4096).
+					AddRow(8, 1024))
+
+			got, err := repo.SizeByUpstream(ctx)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(len(got), convey.ShouldEqual, 2)
+			convey.So(got[7], convey.ShouldEqual, 4096)
+			convey.So(got[8], convey.ShouldEqual, 1024)
+			convey.So(mock.ExpectationsWereMet(), convey.ShouldBeNil)
+		})
+
+		convey.Convey("一条记录都没有时是空表而不是错误", func() {
+			// 空缓存是一个新装的镜像站的正常状态，当成错误会让首页打不开。
+			mock.ExpectQuery("SELECT upstream_id,COALESCE\\(SUM\\(size\\), 0\\) AS size").
+				WillReturnRows(sqlmock.NewRows([]string{"upstream_id", "size"}))
+
+			got, err := repo.SizeByUpstream(ctx)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(len(got), convey.ShouldEqual, 0)
+		})
+	})
+}

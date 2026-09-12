@@ -16,9 +16,11 @@ import (
 
 	"github.com/CodFrm/katch/internal/api/admin"
 	"github.com/CodFrm/katch/internal/api/stat"
+	api_upstream "github.com/CodFrm/katch/internal/api/upstream"
 	"github.com/CodFrm/katch/internal/metrics"
 	"github.com/CodFrm/katch/internal/model/entity/rollup_entity"
 	"github.com/CodFrm/katch/internal/proxy/backoff"
+	"github.com/CodFrm/katch/internal/repository/cache_repo"
 	"github.com/CodFrm/katch/internal/repository/rollup_repo"
 	"github.com/CodFrm/katch/internal/service/upstream_svc"
 )
@@ -36,6 +38,8 @@ const (
 	// defaultPruneInterval 多久裁一次保留期外的行。保留期是 90 天，
 	// 每小时裁一次已经远远够用。
 	defaultPruneInterval = time.Hour
+	// secondsPerDay 一天有多少秒，逐日序列分桶用。
+	secondsPerDay = 86400
 )
 
 // rangeSeconds 界面上可选的三个区间。
@@ -82,6 +86,8 @@ type StatSvc interface {
 	Overview(ctx context.Context, req *stat.OverviewRequest) (*stat.OverviewResponse, error)
 	// ByUpstream 按上游的区间统计，附带此刻的降级状态。
 	ByUpstream(ctx context.Context, req *admin.UpstreamStatsRequest) (*admin.UpstreamStatsResponse, error)
+	// PublicUpstreams 每个上游对外可见的命中率与状态，按主机名索引。
+	PublicUpstreams(ctx context.Context) (map[string]*UpstreamPublicStat, error)
 	// Flush 把进程内计数器攒下的分钟桶落库。
 	Flush(ctx context.Context) error
 	// Prune 裁掉超过保留期的分钟桶，返回裁掉多少行。
@@ -191,10 +197,22 @@ func (s *statSvc) Overview(ctx context.Context, req *stat.OverviewRequest) (*sta
 	if err != nil {
 		return nil, err
 	}
+	// 缓存量与逐日趋势不随 Range 变：区间问的是「这段时间发生了什么」，
+	// 缓存量问的是「现在存着什么」，趋势是侧栏那张固定的 14 天图。
+	cacheBytes, err := cache_repo.CacheObject().TotalSize(ctx)
+	if err != nil {
+		return nil, err
+	}
+	daily, err := s.daily(ctx)
+	if err != nil {
+		return nil, err
+	}
 	return &stat.OverviewResponse{
 		Range:        name,
 		From:         from,
 		To:           to,
+		CacheBytes:   cacheBytes,
+		Daily:        daily,
 		Requests:     totals.Requests,
 		Hits:         totals.Hits,
 		Denied:       totals.Denied,
@@ -242,6 +260,103 @@ func (s *statSvc) ByUpstream(ctx context.Context, req *admin.UpstreamStatsReques
 		resp.List = append(resp.List, item)
 	}
 	return resp, nil
+}
+
+// UpstreamPublicStat 一个上游对外可见的那部分状态。
+//
+// 单独一个结构体而不是直接给 admin.UpstreamStatItem：后台那一份带着请求量、
+// 回源字节和退避时刻，都是运营数据，整份递给公开列表只要日后谁往里加一个字段
+// 就会默认公开出去。
+type UpstreamPublicStat struct {
+	// HitRate 命中率，0~1。
+	HitRate float64
+	// CacheBytes 这个上游此刻在缓存里占了多少字节。
+	CacheBytes int64
+	// Status upstream.StatusNormal 或 upstream.StatusDegraded。
+	Status string
+}
+
+func (s *statSvc) PublicUpstreams(ctx context.Context) (map[string]*UpstreamPublicStat, error) {
+	// 直接走 ByUpstream：后台那张健康矩阵已经把「区间聚合 + 此刻的退避」
+	// 算过一遍，这里再算一遍，同一个上游迟早会在首页和后台给出两个说法。
+	stats, err := s.ByUpstream(ctx, &admin.UpstreamStatsRequest{})
+	if err != nil {
+		return nil, err
+	}
+	// 缓存量一次查回来按 upstream_id 索引：逐个上游问一次，十来个上游就是
+	// 十来次查询，而这是匿名就能打的首页。
+	sizes, err := cache_repo.CacheObject().SizeByUpstream(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ret := make(map[string]*UpstreamPublicStat, len(stats.List))
+	for _, item := range stats.List {
+		status := api_upstream.StatusNormal
+		if item.Degraded {
+			status = api_upstream.StatusDegraded
+		}
+		ret[item.Host] = &UpstreamPublicStat{
+			HitRate: hitRate(item.Hits, item.Requests, item.Denied, item.OriginErrors),
+			// 没缓存过的上游不在 sizes 里，取零值正是它此刻的缓存量。
+			CacheBytes: sizes[item.UpstreamID],
+			Status:     status,
+		}
+	}
+	return ret, nil
+}
+
+// hitRate 命中率 = hits / (hits + misses)（可观测性一节：比值一律由计数推导）。
+//
+// 分母里去掉 denied 与 origin_errors：被规则挡住的请求和上游不可达都没走到
+// 「缓存里有没有」这个问题上，算进分母会让一次上游故障看起来像缓存变差了。
+func hitRate(hits, requests, denied, originErrors int64) float64 {
+	lookups := requests - denied - originErrors
+	if lookups <= 0 {
+		// 一次都没问过缓存时命中率无从谈起，给 0 而不是让它变成 NaN——
+		// NaN 序列化成 JSON 会直接让整个响应失败。
+		return 0
+	}
+	return float64(hits) / float64(lookups)
+}
+
+// daily 近 DailyDays 天的逐日序列，由旧到新，缺的日子补零。
+//
+// 从分钟桶聚合而不是另立一张日表：rollup 只有这一张表（决策 16），多一张就
+// 多一套要对齐的口径。补零放在服务端：一个刚上线三天的站点，图上应该是 11 个
+// 零点加 3 根柱子，而不是 3 个点被拉满整张图。
+func (s *statSvc) daily(ctx context.Context) ([]*stat.DailyPoint, error) {
+	today := dayStart(s.opt.Now().Unix())
+	from := today - int64(stat.DailyDays-1)*secondsPerDay
+	// 右边界取到今天结束：左闭右开的区间里，今天这一天的桶必须整个落进来。
+	rows, err := rollup_repo.TrafficRollup().SumByDay(ctx, from, today+secondsPerDay)
+	if err != nil {
+		return nil, err
+	}
+	byDay := make(map[int64]*rollup_repo.DayTotals, len(rows))
+	for _, row := range rows {
+		byDay[row.Day] = row
+	}
+	points := make([]*stat.DailyPoint, 0, stat.DailyDays)
+	for i := 0; i < stat.DailyDays; i++ {
+		day := from + int64(i)*secondsPerDay
+		point := &stat.DailyPoint{Day: day}
+		if row, ok := byDay[day]; ok {
+			point.Requests = row.Requests
+			point.Hits = row.Hits
+			point.BytesServed = row.BytesServed
+			point.BytesOrigin = row.BytesOrigin
+		}
+		points = append(points, point)
+	}
+	return points, nil
+}
+
+// dayStart 这一秒所属自然日（UTC）的零点。
+//
+// UTC 而不是进程本地时区：分钟桶本身是 UTC 秒，SQL 那边也是按 UTC 分的组，
+// 两边用不同的天会让序列的边界日对不上。
+func dayStart(sec int64) int64 {
+	return sec - sec%secondsPerDay
 }
 
 // degraded 此刻降级中的上游，按主机名索引。

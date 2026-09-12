@@ -11,10 +11,13 @@ import (
 
 	"github.com/CodFrm/katch/internal/api/admin"
 	"github.com/CodFrm/katch/internal/api/stat"
+	api_upstream "github.com/CodFrm/katch/internal/api/upstream"
 	"github.com/CodFrm/katch/internal/metrics"
 	"github.com/CodFrm/katch/internal/model/entity/rollup_entity"
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
 	"github.com/CodFrm/katch/internal/proxy/backoff"
+	"github.com/CodFrm/katch/internal/repository/cache_repo"
+	mock_cache_repo "github.com/CodFrm/katch/internal/repository/cache_repo/mock"
 	"github.com/CodFrm/katch/internal/repository/rollup_repo"
 	mock_rollup_repo "github.com/CodFrm/katch/internal/repository/rollup_repo/mock"
 	"github.com/CodFrm/katch/internal/repository/upstream_repo"
@@ -27,9 +30,17 @@ import (
 // 固定时刻：2023-11-14 22:13:20 UTC。
 const testNow = int64(1700000000)
 
+// 今天（UTC）的零点与 14 天序列的左边界，按 testNow 算死在这里：
+// 序列的分桶必须是 UTC，跟着进程时区走会让同一批数据在两台部署上落到不同的天。
+const (
+	testToday    = int64(1699920000)
+	testDailyDay = testToday - int64(stat.DailyDays-1)*86400
+)
+
 type testDeps struct {
 	rollup   *mock_rollup_repo.MockTrafficRollupRepo
 	upstream *mock_upstream_repo.MockUpstreamRepo
+	cache    *mock_cache_repo.MockCacheObjectRepo
 	drained  []metrics.Bucket
 	svc      StatSvc
 }
@@ -47,9 +58,11 @@ func setup(t *testing.T, degraded DegradeReporter) *testDeps {
 	deps := &testDeps{
 		rollup:   mock_rollup_repo.NewMockTrafficRollupRepo(ctrl),
 		upstream: mock_upstream_repo.NewMockUpstreamRepo(ctrl),
+		cache:    mock_cache_repo.NewMockCacheObjectRepo(ctrl),
 	}
 	rollup_repo.RegisterTrafficRollup(deps.rollup)
 	upstream_repo.RegisterUpstream(deps.upstream)
+	cache_repo.RegisterCacheObject(deps.cache)
 	deps.svc = New(Options{
 		Now:      func() time.Time { return time.Unix(testNow, 0) },
 		Drainer:  deps,
@@ -146,6 +159,12 @@ func TestStat_Overview(t *testing.T) {
 		convey.Convey("默认 24 小时", func() {
 			deps.rollup.EXPECT().Sum(gomock.Any(), testNow-24*3600, testNow).
 				Return(&rollup_entity.Totals{Requests: 100, Hits: 60, BytesServed: 4096, BytesOrigin: 1024}, nil)
+			deps.cache.EXPECT().TotalSize(gomock.Any()).Return(int64(777), nil)
+			deps.rollup.EXPECT().SumByDay(gomock.Any(), testDailyDay, testToday+86400).
+				Return([]*rollup_repo.DayTotals{
+					{Day: testDailyDay, Requests: 10, Hits: 4, BytesServed: 100, BytesOrigin: 90},
+					{Day: testToday, Requests: 20, Hits: 20, BytesServed: 200, BytesOrigin: 0},
+				}, nil)
 
 			got, err := deps.svc.Overview(ctx, &stat.OverviewRequest{})
 			convey.So(err, convey.ShouldBeNil)
@@ -155,16 +174,97 @@ func TestStat_Overview(t *testing.T) {
 			convey.So(got.Requests, convey.ShouldEqual, 100)
 			convey.So(got.Hits, convey.ShouldEqual, 60)
 			convey.So(got.BytesOrigin, convey.ShouldEqual, 1024)
+			convey.So(got.CacheBytes, convey.ShouldEqual, 777)
+
+			convey.Convey("逐日序列固定 14 个点，缺的日子补零", func() {
+				// 补零放在服务端：一个刚上线三天的站点，图上应该是 11 个零点
+				// 加 3 根柱子，而不是 3 个点被拉满整张图。
+				convey.So(len(got.Daily), convey.ShouldEqual, 14)
+				convey.So(got.Daily[0].Day, convey.ShouldEqual, testDailyDay)
+				convey.So(got.Daily[0].Requests, convey.ShouldEqual, 10)
+				convey.So(got.Daily[0].Hits, convey.ShouldEqual, 4)
+				convey.So(got.Daily[0].BytesServed, convey.ShouldEqual, 100)
+				convey.So(got.Daily[0].BytesOrigin, convey.ShouldEqual, 90)
+				// 中间那些没有流量的日子也要占一个点，且相邻两点正好差一天。
+				convey.So(got.Daily[1].Day, convey.ShouldEqual, testDailyDay+86400)
+				convey.So(got.Daily[1].Requests, convey.ShouldEqual, 0)
+				convey.So(got.Daily[13].Day, convey.ShouldEqual, testToday)
+				convey.So(got.Daily[13].Requests, convey.ShouldEqual, 20)
+				convey.So(got.Daily[13].BytesServed, convey.ShouldEqual, 200)
+			})
 		})
 
 		convey.Convey("30 天区间", func() {
 			deps.rollup.EXPECT().Sum(gomock.Any(), testNow-30*24*3600, testNow).
 				Return(&rollup_entity.Totals{Requests: 9}, nil)
+			deps.cache.EXPECT().TotalSize(gomock.Any()).Return(int64(0), nil)
+			// 趋势始终是近 14 天：区间问的是「看多久的合计」，趋势是首页侧栏
+			// 那张固定的 14 天图，改 range 不该把它一起改掉。
+			deps.rollup.EXPECT().SumByDay(gomock.Any(), testDailyDay, testToday+86400).
+				Return(nil, nil)
 
 			got, err := deps.svc.Overview(ctx, &stat.OverviewRequest{Range: "30d"})
 			convey.So(err, convey.ShouldBeNil)
 			convey.So(got.Range, convey.ShouldEqual, "30d")
 			convey.So(got.Requests, convey.ShouldEqual, 9)
+			convey.So(len(got.Daily), convey.ShouldEqual, 14)
+			convey.So(got.Daily[13].Day, convey.ShouldEqual, testToday)
+			convey.So(got.Daily[13].Requests, convey.ShouldEqual, 0)
+		})
+	})
+}
+
+func TestStat_PublicUpstreams(t *testing.T) {
+	convey.Convey("公开列表要的命中率与状态", t, func() {
+		clock := time.Unix(testNow, 0)
+		tracker := backoff.New(backoff.Options{
+			Threshold: 1, Base: time.Minute, Now: func() time.Time { return clock },
+		})
+		tracker.Failure("deb.debian.org")
+		deps := setup(t, tracker)
+
+		deps.upstream.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{
+			{ID: 7, Host: "deb.debian.org", Enabled: true},
+			{ID: 8, Host: "proxy.golang.org", Enabled: true},
+			{ID: 9, Host: "quiet.example.com", Enabled: true},
+		}, nil)
+		deps.rollup.EXPECT().SumByUpstream(gomock.Any(), testNow-24*3600, testNow).
+			Return([]*rollup_entity.Totals{
+				// 100 次请求里 10 次被规则挡住、10 次上游出错，真正问过缓存的
+				// 是 80 次，命中 60 次。
+				{UpstreamID: 7, Requests: 100, Hits: 60, Denied: 10, OriginErrors: 10},
+				{UpstreamID: 8, Requests: 5, Hits: 0, Denied: 5},
+			}, nil)
+		// 缓存量按 upstream_id 分组求和，没有缓存的上游干脆不在结果里。
+		deps.cache.EXPECT().SizeByUpstream(gomock.Any()).Return(map[int64]int64{7: 4096}, nil)
+
+		got, err := deps.svc.PublicUpstreams(context.Background())
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(len(got), convey.ShouldEqual, 3)
+
+		convey.Convey("命中率是 hits/(hits+misses)，被拒和回源失败不进分母", func() {
+			// 分母算进 denied 与 origin_errors，会让一次上游故障看起来像
+			// 缓存变差了，而那两件事根本没走到「缓存里有没有」这个问题上。
+			convey.So(got["deb.debian.org"].HitRate, convey.ShouldAlmostEqual, 0.75, 1e-9)
+		})
+
+		convey.Convey("分母为零时是 0 而不是除零", func() {
+			// 全被规则挡住的上游：真正问过缓存的次数是 0。
+			convey.So(got["proxy.golang.org"].HitRate, convey.ShouldEqual, 0)
+			// 一次请求都没有的上游也要有一行，否则刚加的上游在页脚表里没有状态。
+			convey.So(got["quiet.example.com"].HitRate, convey.ShouldEqual, 0)
+		})
+
+		convey.Convey("缓存量按上游给出，没缓存过的是 0", func() {
+			convey.So(got["deb.debian.org"].CacheBytes, convey.ShouldEqual, 4096)
+			convey.So(got["proxy.golang.org"].CacheBytes, convey.ShouldEqual, 0)
+			convey.So(got["quiet.example.com"].CacheBytes, convey.ShouldEqual, 0)
+		})
+
+		convey.Convey("状态取的是此刻的退避，与后台那张矩阵同一套", func() {
+			convey.So(got["deb.debian.org"].Status, convey.ShouldEqual, api_upstream.StatusDegraded)
+			convey.So(got["proxy.golang.org"].Status, convey.ShouldEqual, api_upstream.StatusNormal)
+			convey.So(got["quiet.example.com"].Status, convey.ShouldEqual, api_upstream.StatusNormal)
 		})
 	})
 }

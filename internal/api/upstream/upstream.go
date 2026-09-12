@@ -8,16 +8,34 @@ package upstream
 
 import "github.com/cago-frame/cago/server/mux"
 
+// 上游此刻的可服务状态。降级是内存里的退避状态（决策 17），不落库——它说的是
+// 「现在」，重启后重新探测。
+const (
+	// StatusNormal 正常服务。
+	StatusNormal = "normal"
+	// StatusDegraded 正处在回源退避里，界面上标为「限流中/降级」。
+	StatusDegraded = "degraded"
+)
+
 // Item 公开列表里的一条上游。
 //
-// 只有三个字段，且都是使用者自己拼拉取地址时用得上的：主机名是路径第一段，
-// 类别决定用 docker 还是 curl，library_completion 决定 docker.io 上的官方镜像
-// 能不能省掉 library/ 前缀。回源地址、默认策略、不可变模式、备注都是运营数据，
-// 留在管理接口那一侧。
+// 前三个字段是使用者自己拼拉取地址时用得上的：主机名是路径第一段，类别决定用
+// docker 还是 curl，library_completion 决定 docker.io 上的官方镜像能不能省掉
+// library/ 前缀。后面两个回答的是「这个上游现在好不好用」——首页页脚那张表
+// 要答的正是「支不支持我要的东西」（spec 前台一节）。回源地址、默认策略、
+// 不可变模式、备注都是运营数据，留在管理接口那一侧。
 type Item struct {
 	Host              string `json:"host"`
 	Kind              string `json:"kind"`
 	LibraryCompletion bool   `json:"library_completion"`
+	// HitRate 近 24 小时的命中率，取值 0~1。
+	//
+	// 由计数推导而不是存一个比值（可观测性一节），口径与后台那张健康矩阵同一套。
+	HitRate float64 `json:"hit_rate"`
+	// CacheBytes 这个上游此刻在缓存里占了多少字节，没缓存过是 0。
+	CacheBytes int64 `json:"cache_bytes"`
+	// Status 此刻的可服务状态，StatusNormal 或 StatusDegraded。
+	Status string `json:"status"`
 }
 
 // ListRequest 列出公开的上游。

@@ -28,6 +28,11 @@ type CacheObjectRepo interface {
 	SetPinned(ctx context.Context, id int64, pinned bool) error
 	// TotalSize 缓存占用的总字节数，配额判定用。
 	TotalSize(ctx context.Context) (int64, error)
+	// SizeByUpstream 按上游分组的缓存占用，键是 upstream_id。
+	//
+	// 在 SQL 里求和而不是把记录捞回去加：首页页脚那张表是匿名就能打的，
+	// 每打一次就把整张 cache_object 扫进内存，等于给自己开了一条放大路径。
+	SizeByUpstream(ctx context.Context) (map[int64]int64, error)
 	// EvictCandidates 按最久未访问给出淘汰候选，只含不可变且未被 pin 的对象。
 	EvictCandidates(ctx context.Context, limit int) ([]*cache_entity.CacheObject, error)
 	// CountByDigest 还有多少条记录引用同一份内容，删文件之前要问一次。
@@ -109,6 +114,26 @@ func (c *cacheObjectRepo) TotalSize(ctx context.Context) (int64, error) {
 		return 0, err
 	}
 	return total, nil
+}
+
+func (c *cacheObjectRepo) SizeByUpstream(ctx context.Context) (map[int64]int64, error) {
+	rows := make([]struct {
+		UpstreamID int64 `gorm:"column:upstream_id"`
+		Size       int64 `gorm:"column:size"`
+	}, 0)
+	// COALESCE 的理由同 TotalSize：一组里的 size 全是 NULL 时 SUM 也是 NULL，
+	// 扫进 int64 会报错。没有缓存的上游干脆不在结果里，由调用方按 0 处理。
+	if err := db.Ctx(ctx).Model(&cache_entity.CacheObject{}).
+		Select("upstream_id,COALESCE(SUM(size), 0) AS size").
+		Group("upstream_id").
+		Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	ret := make(map[int64]int64, len(rows))
+	for _, row := range rows {
+		ret[row.UpstreamID] = row.Size
+	}
+	return ret, nil
 }
 
 func (c *cacheObjectRepo) EvictCandidates(ctx context.Context, limit int) ([]*cache_entity.CacheObject, error) {

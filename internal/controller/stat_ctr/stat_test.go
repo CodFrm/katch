@@ -23,6 +23,8 @@ import (
 	"github.com/CodFrm/katch/internal/model/entity/setting_entity"
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
 	"github.com/CodFrm/katch/internal/proxy/backoff"
+	"github.com/CodFrm/katch/internal/repository/cache_repo"
+	mock_cache_repo "github.com/CodFrm/katch/internal/repository/cache_repo/mock"
 	"github.com/CodFrm/katch/internal/repository/rollup_repo"
 	mock_rollup_repo "github.com/CodFrm/katch/internal/repository/rollup_repo/mock"
 	"github.com/CodFrm/katch/internal/repository/setting_repo"
@@ -37,8 +39,15 @@ const adminKey = "correct-admin-key"
 
 const testNow = int64(1700000000)
 
+// testToday、testDailyDay 由 testNow 折算出的 UTC 自然日边界。
+const (
+	testToday    = int64(1699920000)
+	testDailyDay = testToday - int64(stat.DailyDays-1)*86400
+)
+
 type statEnv struct {
 	rollup   *mock_rollup_repo.MockTrafficRollupRepo
+	cache    *mock_cache_repo.MockCacheObjectRepo
 	upstream *mock_upstream_repo.MockUpstreamRepo
 	setting  *mock_setting_repo.MockSettingRepo
 	mux      *muxtest.TestMux
@@ -51,9 +60,11 @@ func setupStatTest(t *testing.T, degraded stat_svc.DegradeReporter) *statEnv {
 	ctrl := gomock.NewController(t)
 	env := &statEnv{
 		rollup:   mock_rollup_repo.NewMockTrafficRollupRepo(ctrl),
+		cache:    mock_cache_repo.NewMockCacheObjectRepo(ctrl),
 		upstream: mock_upstream_repo.NewMockUpstreamRepo(ctrl),
 	}
 	rollup_repo.RegisterTrafficRollup(env.rollup)
+	cache_repo.RegisterCacheObject(env.cache)
 	upstream_repo.RegisterUpstream(env.upstream)
 	setRepo := mock_setting_repo.NewMockSettingRepo(ctrl)
 	setting_repo.RegisterSetting(setRepo)
@@ -93,6 +104,12 @@ func TestStatOverviewIsPublic(t *testing.T) {
 				BytesServed: 4096, BytesOrigin: 1024,
 			}, nil)
 
+		env.cache.EXPECT().TotalSize(gomock.Any()).Return(int64(1<<30), nil)
+		env.rollup.EXPECT().SumByDay(gomock.Any(), testDailyDay, testToday+86400).
+			Return([]*rollup_repo.DayTotals{
+				{Day: testToday, Requests: 20, Hits: 15, BytesServed: 2048, BytesOrigin: 512},
+			}, nil)
+
 		resp := &stat.OverviewResponse{}
 		convey.So(env.mux.Do(context.Background(), &stat.OverviewRequest{}, resp), convey.ShouldBeNil)
 		convey.So(resp.Range, convey.ShouldEqual, "24h")
@@ -102,6 +119,19 @@ func TestStatOverviewIsPublic(t *testing.T) {
 		convey.So(resp.Hits, convey.ShouldEqual, 60)
 		convey.So(resp.BytesServed, convey.ShouldEqual, 4096)
 		convey.So(resp.BytesOrigin, convey.ShouldEqual, 1024)
+
+		convey.Convey("侧栏要的缓存量与近 14 天趋势也在同一份响应里", func() {
+			// 侧栏是命中率、缓存量、省下的回源流量和近 14 天趋势（spec 前台
+			// 一节），四样都得从这一个接口拿到，否则首页要打三次请求。
+			convey.So(resp.CacheBytes, convey.ShouldEqual, int64(1<<30))
+			convey.So(len(resp.Daily), convey.ShouldEqual, 14)
+			convey.So(resp.Daily[0].Day, convey.ShouldEqual, testDailyDay)
+			convey.So(resp.Daily[13].Day, convey.ShouldEqual, testToday)
+			convey.So(resp.Daily[13].Requests, convey.ShouldEqual, 20)
+			convey.So(resp.Daily[13].Hits, convey.ShouldEqual, 15)
+			convey.So(resp.Daily[13].BytesServed, convey.ShouldEqual, 2048)
+			convey.So(resp.Daily[13].BytesOrigin, convey.ShouldEqual, 512)
+		})
 	})
 }
 
@@ -173,6 +203,8 @@ func TestStatOverviewHidden(t *testing.T) {
 				&setting_entity.Setting{Key: setting_svc.PublicHomepageSetting, Value: "false"}, nil)
 			env.rollup.EXPECT().Sum(gomock.Any(), testNow-24*3600, testNow).
 				Return(&rollup_entity.Totals{Requests: 100, Hits: 60}, nil)
+			env.cache.EXPECT().TotalSize(gomock.Any()).Return(int64(4096), nil)
+			env.rollup.EXPECT().SumByDay(gomock.Any(), testDailyDay, testToday+86400).Return(nil, nil)
 
 			req := httptest.NewRequest(http.MethodGet, "/api/v1/stats/overview", nil)
 			req.Header.Set("Authorization", "Bearer "+adminKey)
@@ -180,6 +212,10 @@ func TestStatOverviewHidden(t *testing.T) {
 			env.engine.ServeHTTP(w, req)
 			convey.So(w.Code, convey.ShouldEqual, http.StatusOK)
 			convey.So(w.Body.String(), convey.ShouldContainSubstring, `"requests":100`)
+			// 新加的两样和老字段走同一道闸：关掉公开首页之后，它们对匿名调用方
+			// 一起消失，对带密钥的调用方一起还在。
+			convey.So(w.Body.String(), convey.ShouldContainSubstring, `"cache_bytes":4096`)
+			convey.So(w.Body.String(), convey.ShouldContainSubstring, `"daily":[`)
 		})
 	})
 }

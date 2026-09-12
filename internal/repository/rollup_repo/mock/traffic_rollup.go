@@ -14,6 +14,7 @@ import (
 	reflect "reflect"
 
 	rollup_entity "github.com/CodFrm/katch/internal/model/entity/rollup_entity"
+	rollup_repo "github.com/CodFrm/katch/internal/repository/rollup_repo"
 	gomock "go.uber.org/mock/gomock"
 )
 
@@ -98,6 +99,21 @@ func (m *MockTrafficRollupRepo) Sum(ctx context.Context, from, to int64) (*rollu
 func (mr *MockTrafficRollupRepoMockRecorder) Sum(ctx, from, to any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Sum", reflect.TypeOf((*MockTrafficRollupRepo)(nil).Sum), ctx, from, to)
+}
+
+// SumByDay mocks base method.
+func (m *MockTrafficRollupRepo) SumByDay(ctx context.Context, from, to int64) ([]*rollup_repo.DayTotals, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "SumByDay", ctx, from, to)
+	ret0, _ := ret[0].([]*rollup_repo.DayTotals)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// SumByDay indicates an expected call of SumByDay.
+func (mr *MockTrafficRollupRepoMockRecorder) SumByDay(ctx, from, to any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SumByDay", reflect.TypeOf((*MockTrafficRollupRepo)(nil).SumByDay), ctx, from, to)
 }
 
 // SumByUpstream mocks base method.

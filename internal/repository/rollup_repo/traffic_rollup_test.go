@@ -111,3 +111,28 @@ func TestTrafficRollupRepo_Save(t *testing.T) {
 		convey.So(mock.ExpectationsWereMet(), convey.ShouldBeNil)
 	})
 }
+
+func TestTrafficRollupRepo_SumByDay(t *testing.T) {
+	convey.Convey("按自然日分组聚合", t, func() {
+		ctx, _, mock := testutils.Database(t)
+		// 分组键在 SQL 里算：把 14 天的分钟桶捞回 Go 里再分组，等于每次打开
+		// 首页都要扫回 14×1440 行。UTC 而不是进程时区：桶本身是 UTC 秒。
+		mock.ExpectQuery("SELECT \\(bucket - bucket % 86400\\) AS day,COALESCE\\(SUM\\(requests\\), 0\\).*"+
+			"FROM `traffic_rollups` WHERE bucket >= \\? AND bucket < \\? GROUP BY `day` ORDER BY day asc").
+			WithArgs(int64(1699920000), int64(1700092800)).
+			WillReturnRows(sqlmock.NewRows([]string{"day", "requests", "hits", "denied", "origin_errors", "bytes_served", "bytes_origin"}).
+				AddRow(1699920000, 100, 60, 5, 3, 4096, 1024).
+				AddRow(1700006400, 20, 20, 0, 0, 8192, 0))
+
+		got, err := NewTrafficRollup().SumByDay(ctx, 1699920000, 1700092800)
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(len(got), convey.ShouldEqual, 2)
+		convey.So(got[0].Day, convey.ShouldEqual, 1699920000)
+		convey.So(got[0].Requests, convey.ShouldEqual, 100)
+		convey.So(got[0].Hits, convey.ShouldEqual, 60)
+		convey.So(got[0].BytesOrigin, convey.ShouldEqual, 1024)
+		convey.So(got[1].Day, convey.ShouldEqual, 1700006400)
+		convey.So(got[1].BytesServed, convey.ShouldEqual, 8192)
+		convey.So(mock.ExpectationsWereMet(), convey.ShouldBeNil)
+	})
+}
