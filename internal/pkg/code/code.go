@@ -19,6 +19,14 @@ const (
 	AdminKeyNotInitialized
 	// RuleNotFound 访问规则不存在。
 	RuleNotFound
+	// CacheObjectNotFound 缓存对象不存在。
+	CacheObjectNotFound
+	// PurgeTargetRequired 清缓存没说清谁。
+	PurgeTargetRequired
+	// SettingKeyUnknown 写入了一个不认识的设置项。
+	SettingKeyUnknown
+	// SettingValueInvalid 设置项的值不合法（类型不对或超出取值范围）。
+	SettingValueInvalid
 )
 
 func init() {
@@ -31,4 +39,8 @@ var zhCN = map[int]string{
 	UpstreamHostExists:     "该上游主机名已存在",
 	AdminKeyNotInitialized: "尚未设置管理密钥，请在 configs/config.yaml 的 admin.initialKey 中给出初始密钥",
 	RuleNotFound:           "访问规则不存在",
+	CacheObjectNotFound:    "缓存对象不存在",
+	PurgeTargetRequired:    "请指定要清理的缓存对象或上游",
+	SettingKeyUnknown:      "没有 %s 这个设置项",
+	SettingValueInvalid:    "设置项 %s 的值不合法：%s",
 }

@@ -166,3 +166,42 @@ func TestPut_WithoutStoreFails(t *testing.T) {
 		convey.So(err, convey.ShouldNotBeNil)
 	})
 }
+
+// TestPurge_SkipsPinnedInBatch pin 的对象不参与按上游的批量清除：pin 表达的是
+// 「这份内容要常驻」，它既挡住了 LRU 淘汰，也该挡住一次「清掉这个上游」的操作——
+// 否则运维清一次缓存就把所有 pin 过的对象顺手抹了，而界面上看不出发生过这件事。
+//
+// 按 id 清单条不受这条约束：那是人指着这一条说「就清它」，见 Purge 的实现。
+func TestPurge_SkipsPinnedInBatch(t *testing.T) {
+	convey.Convey("按上游清缓存时跳过 pin 过的对象", t, func() {
+		o := newOrigin(t, func(http.ResponseWriter, *http.Request) {})
+		svc, repo, store := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+
+		putObject(t, svc, "/pool/keep.deb", "keep", true)
+		putObject(t, svc, "/pool/drop.deb", "drop", true)
+		convey.So(svc.Pin(context.Background(), &PinRequest{
+			ID: repo.byKey("/pool/keep.deb").ID, Pinned: true}), convey.ShouldBeNil)
+
+		resp, err := svc.Purge(context.Background(), &PurgeRequest{UpstreamID: 7})
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(resp.Removed, convey.ShouldEqual, 1)
+		// 跳过的条数要报出去，否则界面只能说「清了 1 条」，看不出还有 1 条没清。
+		convey.So(resp.Skipped, convey.ShouldEqual, 1)
+		convey.So(repo.byKey("/pool/drop.deb"), convey.ShouldBeNil)
+		convey.So(repo.byKey("/pool/keep.deb"), convey.ShouldNotBeNil)
+		// 记录留下了，盘上那份内容也必须留着，否则命中时会读到一个空文件。
+		_, ok := store.Has(digestOfString("keep"))
+		convey.So(ok, convey.ShouldBeTrue)
+	})
+}
+
+// TestPin_RejectsMissingObject pin 一个不存在的 id 不能当作成功：SetPinned 更新
+// 0 行也返回 nil，直接透传等于对着一个空操作回 200。
+func TestPin_RejectsMissingObject(t *testing.T) {
+	convey.Convey("pin 不存在的对象时报错", t, func() {
+		o := newOrigin(t, func(http.ResponseWriter, *http.Request) {})
+		svc, _, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+		convey.So(svc.Pin(context.Background(), &PinRequest{ID: 404, Pinned: true}),
+			convey.ShouldNotBeNil)
+	})
+}

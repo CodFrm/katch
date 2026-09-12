@@ -11,7 +11,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"github.com/CodFrm/katch/internal/controller/cache_ctr"
 	"github.com/CodFrm/katch/internal/controller/rule_ctr"
+	"github.com/CodFrm/katch/internal/controller/setting_ctr"
 	"github.com/CodFrm/katch/internal/controller/stat_ctr"
 	"github.com/CodFrm/katch/internal/controller/system_ctr"
 	"github.com/CodFrm/katch/internal/controller/upstream_ctr"
@@ -56,6 +58,12 @@ func Router(_ context.Context, root *mux.Router) error {
 	adminGroup.Bind(statCtr.ByUpstream)
 	ruleCtr := rule_ctr.NewRule()
 	adminGroup.Bind(ruleCtr.List, ruleCtr.Save, ruleCtr.Delete, ruleCtr.Test)
+	cacheCtr := cache_ctr.NewCache()
+	adminGroup.Bind(cacheCtr.Search, cacheCtr.Purge, cacheCtr.Pin)
+	// 设置读写与密钥轮换和其余管理接口同一道闸：轮换尤其不能另开一套入口，
+	// 一个不要当前密钥就能换密钥的端点等于把后台直接送出去。
+	settingCtr := setting_ctr.NewSetting()
+	adminGroup.Bind(settingCtr.List, settingCtr.Save, settingCtr.RotateAdminKey)
 
 	return nil
 }

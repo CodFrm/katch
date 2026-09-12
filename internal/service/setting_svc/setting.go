@@ -1,4 +1,5 @@
-// Package setting_svc 是运行时设置的业务层，眼下只承担管理密钥。
+// Package setting_svc 是运行时设置的业务层：管理密钥，以及决策 4 划在库这一侧的
+// 那些「进程跑起来之后才生效」的参数。
 package setting_svc
 
 import (
@@ -11,6 +12,7 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/CodFrm/katch/internal/api/admin"
 	"github.com/CodFrm/katch/internal/model/entity/setting_entity"
 	"github.com/CodFrm/katch/internal/pkg/code"
 	"github.com/CodFrm/katch/internal/repository/setting_repo"
@@ -38,6 +40,14 @@ type SettingSvc interface {
 	// PublicHomepage 首页的上游列表与命中率是否对匿名调用方可见。
 	// 库里没有这一行、或者这一行的值读不懂时都按可见处理，理由见实现。
 	PublicHomepage(ctx context.Context) (bool, error)
+	// List 读出全部运行时设置，库里没写过的项给默认值。
+	List(ctx context.Context, req *admin.ListSettingsRequest) (*admin.ListSettingsResponse, error)
+	// Save 写入若干运行时设置。不认识的键、类型不对或超出取值范围的值会让整批
+	// 写入失败，而不是挑能写的写进去。
+	Save(ctx context.Context, req *admin.SaveSettingsRequest) (*admin.SaveSettingsResponse, error)
+	// RotateAdminKey 换一把新的管理密钥，写完立刻生效：旧密钥在下一个请求上
+	// 就不再被接受（决策 18）。
+	RotateAdminKey(ctx context.Context, req *admin.RotateAdminKeyRequest) (*admin.RotateAdminKeyResponse, error)
 }
 
 type settingSvc struct{}
@@ -80,7 +90,7 @@ func (s *settingSvc) EnsureAdminKey(ctx context.Context, initialKey string) erro
 		// 把这当成致命错误会让一个纯拉取用途的部署起不来。
 		return nil
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(initialKey), bcrypt.DefaultCost)
+	hash, err := hashAdminKey(initialKey)
 	if err != nil {
 		return err
 	}
@@ -91,6 +101,12 @@ func (s *settingSvc) EnsureAdminKey(ctx context.Context, initialKey string) erro
 		Createtime: now,
 		Updatetime: now,
 	})
+}
+
+// hashAdminKey 算一把密钥的哈希。落库的只有哈希（决策 18）：setting 表在后台是
+// 可读的，明文密钥躺在一张能被列出来的键值表里，等于摊开给任何一个进了后台的人。
+func hashAdminKey(key string) ([]byte, error) {
+	return bcrypt.GenerateFromPassword([]byte(key), bcrypt.DefaultCost)
 }
 
 func (s *settingSvc) PublicHomepage(ctx context.Context) (bool, error) {

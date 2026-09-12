@@ -15,12 +15,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cago-frame/cago/pkg/i18n"
 	"github.com/cago-frame/cago/pkg/logger"
 	"go.uber.org/zap"
 
 	"github.com/CodFrm/katch/internal/cache"
 	"github.com/CodFrm/katch/internal/model/entity/cache_entity"
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
+	"github.com/CodFrm/katch/internal/pkg/code"
 	"github.com/CodFrm/katch/internal/repository/cache_repo"
 	"github.com/CodFrm/katch/internal/service/proxy_svc"
 	"github.com/CodFrm/katch/internal/service/upstream_svc"
@@ -29,9 +31,6 @@ import (
 // ErrCacheUnavailable 缓存目录不可用。只有显式写缓存的接口会返回它，
 // 拉取路径遇到同样的情况是降级透传，而不是报错。
 var ErrCacheUnavailable = errors.New("缓存不可用")
-
-// ErrPurgeTargetRequired 清缓存必须指明清谁。
-var ErrPurgeTargetRequired = errors.New("请指定要清理的缓存对象或上游")
 
 // ErrPutIncomplete 写入缓存至少要有上游、键和内容。
 var ErrPutIncomplete = errors.New("缓存写入缺少上游、键或内容")
@@ -89,9 +88,14 @@ type SearchRequest struct {
 }
 
 // SearchResponse 搜索结果。
+//
+// 带上归一化之后的 Page 与 Size：页号和页大小会被下面的 Search 兜底改写，
+// 不回声一份的话，调用方按自己传的参数画分页器会画错。
 type SearchResponse struct {
 	List  []*cache_entity.CacheObject `json:"list"`
 	Total int64                       `json:"total"`
+	Page  int                         `json:"page"`
+	Size  int                         `json:"size"`
 }
 
 // PurgeRequest 清缓存：给 ID 清一条，给 UpstreamID 清整个上游。
@@ -100,9 +104,12 @@ type PurgeRequest struct {
 	UpstreamID int64
 }
 
-// PurgeResponse 清掉了几条。
+// PurgeResponse 清掉了几条，以及因为被 pin 而跳过了几条。
 type PurgeResponse struct {
 	Removed int64 `json:"removed"`
+	// Skipped 批量清除时被跳过的 pin 对象数。不报出来的话，界面只能说
+	// 「清了 N 条」，看不出还有几条留在那里，看起来就像清缓存没生效。
+	Skipped int64 `json:"skipped"`
 }
 
 // PinRequest 把一个对象钉住/放开。钉住的对象不参与淘汰。
@@ -576,30 +583,44 @@ func (c *cacheSvc) Search(ctx context.Context, req *SearchRequest) (*SearchRespo
 	if err != nil {
 		return nil, err
 	}
-	return &SearchResponse{List: list, Total: total}, nil
+	return &SearchResponse{List: list, Total: total, Page: page, Size: size}, nil
 }
 
 func (c *cacheSvc) Purge(ctx context.Context, req *PurgeRequest) (*PurgeResponse, error) {
 	repo := cache_repo.CacheObject()
 	var objects []*cache_entity.CacheObject
+	skipped := int64(0)
 	switch {
 	case req.ID > 0:
 		object, err := repo.Find(ctx, req.ID)
 		if err != nil {
 			return nil, err
 		}
-		if object != nil {
-			objects = append(objects, object)
+		if object == nil {
+			// 不存在的 id 不能算清除成功：那会让界面上一次点错的清除看起来
+			// 生效了，而对象其实还在。
+			return nil, i18n.NewNotFoundError(ctx, code.CacheObjectNotFound)
 		}
+		// 指名道姓清一条时不看 pinned：这是人指着这一条说「就清它」，
+		// 再拦一道只会逼他先解开 pin 再清，白绕一圈。
+		objects = append(objects, object)
 	case req.UpstreamID > 0:
 		list, err := repo.ListByUpstream(ctx, req.UpstreamID)
 		if err != nil {
 			return nil, err
 		}
-		objects = list
+		for _, object := range list {
+			// pin 表达的是「这份内容要常驻」。它挡住了 LRU 淘汰，也必须挡住
+			// 批量清除，否则清一次上游就把所有 pin 过的对象顺手抹了。
+			if object.Pinned {
+				skipped++
+				continue
+			}
+			objects = append(objects, object)
+		}
 	default:
 		// 不给「清空一切」留一个不写参数就能触发的形态。
-		return nil, ErrPurgeTargetRequired
+		return nil, i18n.NewError(ctx, code.PurgeTargetRequired)
 	}
 	removed := int64(0)
 	for _, object := range objects {
@@ -611,9 +632,19 @@ func (c *cacheSvc) Purge(ctx context.Context, req *PurgeRequest) (*PurgeResponse
 		}
 		removed++
 	}
-	return &PurgeResponse{Removed: removed}, nil
+	return &PurgeResponse{Removed: removed, Skipped: skipped}, nil
 }
 
 func (c *cacheSvc) Pin(ctx context.Context, req *PinRequest) error {
-	return cache_repo.CacheObject().SetPinned(ctx, req.ID, req.Pinned)
+	repo := cache_repo.CacheObject()
+	// 先确认对象在：SetPinned 更新 0 行也返回 nil，不查一次就等于对着一个
+	// 空操作回 200，界面上那个图钉会亮着，而库里什么都没变。
+	object, err := repo.Find(ctx, req.ID)
+	if err != nil {
+		return err
+	}
+	if object == nil {
+		return i18n.NewNotFoundError(ctx, code.CacheObjectNotFound)
+	}
+	return repo.SetPinned(ctx, req.ID, req.Pinned)
 }
