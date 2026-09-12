@@ -4,6 +4,11 @@
 # 存在的理由：这个项目初始化时踩到的三个缺陷——配置文件被框架回写、迁移列表为空
 # 导致启动 panic、metric 组件重复注册让 /metrics 返回 500——lint 和单元测试全都
 # 发现不了，它们只在进程真正跑起来时才暴露。
+#
+# 最后一段还守着 spec 的「扩展点」：一个此前不存在的上游，只经管理接口加一条记录
+# 就要能拉通并在第二次命中缓存，全程不改代码、不重启进程。用例那一侧
+# （internal/proxy/extension）用的是拉取处理器的替身，这里用的是 make build 出来的
+# 真二进制——生产的 NoRoute、真配置、真 sqlite 只有在这里才走得到。
 set -euo pipefail
 
 BIN=${BIN:-./bin/katch}
@@ -20,7 +25,8 @@ cleanup() {
 trap cleanup EXIT
 
 # 用临时配置副本跑，同时保留一份原始配置用于比对是否被改写
-sed "s#0.0.0.0:8080#0.0.0.0:${PORT}#; s#./data/katch.db#${workdir}/katch.db#; s#./runtime/logs#${workdir}/logs#g" \
+sed "s#0.0.0.0:8080#0.0.0.0:${PORT}#; s#./data/katch.db#${workdir}/katch.db#; \
+     s#./data/cache#${workdir}/cache#; s#./runtime/logs#${workdir}/logs#g" \
   configs/config.yaml > "$workdir/config.yaml"
 cp "$workdir/config.yaml" "$workdir/config.expect"
 
@@ -69,6 +75,48 @@ echo "✓ 带正确密钥可以创建上游"
 curl -s -H "Authorization: Bearer ${ADMIN_KEY}" "${BASE}/api/v1/admin/upstreams" \
   | grep -q 'smoke.example.com' || fail "刚创建的上游没能被列表读回"
 echo "✓ 创建的上游能被列表读回"
+
+# 扩展点：只经管理接口加一条记录，就能拉通一个此前不存在的上游并命中缓存。
+#
+# 假上游的源站就是这台 katch 自己的版本接口。smoke 不该为了造一个假源站引入
+# python -m http.server 之类的新依赖，而这条边界要验的是「只加一条记录就够了」，
+# 源站是谁与它无关——回源走的是记录上的 origin 字段，和打到公网别无二致。
+FAKE_HOST="packages.smoke-new-mirror.invalid"
+FAKE_PULL="${BASE}/${FAKE_HOST}/version"
+
+# 注册之前它必须什么都不是：这既是对照组，也把「表里没有这个主机」塞进了上游那层
+# 进程内快照——后面那次拉取要成立，写入就必须把快照掀掉，这正是「不重启」的兑现点。
+check "/${FAKE_HOST}/version" 404 "未注册的上游拉取返回 404"
+
+curl -s -X POST "${BASE}/api/v1/admin/upstreams" \
+  -H "Authorization: Bearer ${ADMIN_KEY}" -H 'Content-Type: application/json' \
+  -d "{\"host\":\"${FAKE_HOST}\",\"kind\":\"static\",\"origin\":\"${BASE}/api/v1/system\",\
+       \"enabled\":true,\"immutable_patterns\":[\"/version\"]}" \
+  | grep -q '"code":0' || fail "经管理接口注册假上游失败"
+echo "✓ 经管理接口注册了一个此前不存在的上游"
+
+pull() { # pull <名字>：状态码写进 $status，响应头进 <名字>.h，响应体进 <名字>.b
+  status=$(curl -s -D "$workdir/$1.h" -o "$workdir/$1.b" -w '%{http_code}' "$FAKE_PULL")
+}
+
+# 拉取之前先确认进程还是启动时那一个，后面的「不重启」才说得出口。
+kill -0 "$PID" 2>/dev/null || fail "服务进程已经不在了，后面的拉取说明不了「不重启」"
+
+pull first
+[ "$status" = "200" ] || fail "经新上游的第一次拉取：期望 200，实际 $status"
+grep -q '"version"' "$workdir/first.b" || fail "第一次拉取没有把源站的内容带回来"
+grep -qi '^x-katch-cache: MISS' "$workdir/first.h" || fail "第一次拉取应当是 MISS"
+echo "✓ 新上游第一次拉取回源成功（MISS）"
+
+pull second
+[ "$status" = "200" ] || fail "经新上游的第二次拉取：期望 200，实际 $status"
+grep -qi '^x-katch-cache: HIT' "$workdir/second.h" || fail "第二次拉取没有命中缓存"
+# 命中不能是一份残缺副本：磁盘上那一份要和回源拿到的逐字节相同。
+cmp -s "$workdir/first.b" "$workdir/second.b" || fail "缓存命中的内容和回源拿到的不一致"
+echo "✓ 新上游第二次拉取由缓存服务（HIT），内容与回源逐字节相同"
+
+kill -0 "$PID" 2>/dev/null || fail "拉取过程中服务进程重启过"
+echo "✓ 从注册到命中全程是同一个进程，没有重启"
 
 diff -q "$workdir/config.expect" "$workdir/config.yaml" > /dev/null \
   || fail "配置文件被进程改写了（只读配置源可能失效）"
