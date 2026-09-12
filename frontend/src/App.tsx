@@ -1,37 +1,21 @@
-import { useEffect, useState } from 'react'
-import { useTranslation } from 'react-i18next'
+import { Navigate, Route, Routes } from 'react-router-dom'
 
-interface VersionInfo {
-  version: string
-  commit: string
-}
+import { AdminPage } from '@/routes/admin-page'
+import { PublicPage } from '@/routes/public-page'
 
+/**
+ * 两个面的路由：前台公开，后台要密钥。
+ *
+ * Router 本身装在 main.tsx 上而不是这里，用例才能用 MemoryRouter 指定起始路径。
+ * 认不出来的路径回前台而不是给一页 404：后端已经把 /assets/ 与 /api/ 之外的未命中
+ * 路径回落到 index.html 了，走到这里的都是站内链接敲错，回首页比一块空白有用。
+ */
 export default function App() {
-  const { t } = useTranslation()
-  const [info, setInfo] = useState<VersionInfo | null>(null)
-  const [failed, setFailed] = useState(false)
-
-  useEffect(() => {
-    fetch('/api/v1/system/version')
-      .then((r) => {
-        if (!r.ok) throw new Error(String(r.status))
-        return r.json()
-      })
-      .then((d: VersionInfo) => setInfo(d))
-      .catch(() => setFailed(true))
-  }, [])
-
   return (
-    <main className="mx-auto flex min-h-screen max-w-2xl flex-col justify-center gap-2 px-6">
-      <h1 className="text-3xl font-semibold tracking-tight">{t('app.name')}</h1>
-      <p className="text-muted-foreground">{t('app.tagline')}</p>
-      <p className="text-muted-foreground text-sm">
-        {failed
-          ? t('system.error')
-          : info
-            ? `${t('system.version')} ${info.version} (${info.commit})`
-            : t('system.loading')}
-      </p>
-    </main>
+    <Routes>
+      <Route path="/" element={<PublicPage />} />
+      <Route path="/admin/*" element={<AdminPage />} />
+      <Route path="*" element={<Navigate to="/" replace />} />
+    </Routes>
   )
 }

@@ -1,11 +1,53 @@
 {
   "app": {
     "name": "katch",
-    "tagline": "多上游镜像代理"
+    "version": "v{{version}}"
   },
-  "system": {
-    "version": "版本",
-    "loading": "加载中",
-    "error": "无法获取版本信息"
+  "nav": {
+    "admin": "管理"
+  },
+  "assistant": {
+    "guide": "要拉什么，写在这里。支持镜像、APT、Go module、GitHub 静态资源。",
+    "inputLabel": "要拉什么",
+    "placeholder": "redis:7",
+    "submitHint": "⏎ 复制",
+    "recognized": "识别为",
+    "cached": "已缓存 {{size}}",
+    "unknown": "这台镜像站没有收录 {{host}}",
+    "commandLabel": "直接拉取",
+    "copy": "复制",
+    "copied": "已复制",
+    "persistent": "不想每次改命令？把配置里的上游地址换成 katch 的前缀，长期生效",
+    "persistentShow": "查看前缀 →",
+    "persistentHide": "收起 ↑",
+    "persistentLabel": "上游前缀"
+  },
+  "kind": {
+    "registry": "容器镜像",
+    "static": "静态资源"
+  },
+  "status": {
+    "normal": "正常",
+    "degraded": "限流中"
+  },
+  "metrics": {
+    "hitRate": "近 30 天命中率",
+    "cached": "已缓存",
+    "savedToday": "今日省下回源",
+    "trend": "近 14 天",
+    "trendLabel": "近 14 天命中率趋势"
+  },
+  "upstreams": {
+    "title": "支持的上游",
+    "count": "全部 {{count}} 个",
+    "host": "上游",
+    "kind": "类型",
+    "hitRate": "命中率",
+    "cached": "已缓存",
+    "status": "状态"
+  },
+  "admin": {
+    "title": "管理后台",
+    "pending": "这一面还没有搭起来。"
   }
 }

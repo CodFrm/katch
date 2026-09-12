@@ -1,11 +1,53 @@
 {
   "app": {
     "name": "katch",
-    "tagline": "Multi-upstream mirror proxy"
+    "version": "v{{version}}"
   },
-  "system": {
-    "version": "Version",
-    "loading": "Loading",
-    "error": "Failed to load version"
+  "nav": {
+    "admin": "Admin"
+  },
+  "assistant": {
+    "guide": "Type what you want to pull. Images, APT, Go modules and GitHub assets all work.",
+    "inputLabel": "What to pull",
+    "placeholder": "redis:7",
+    "submitHint": "⏎ copy",
+    "recognized": "Resolved to",
+    "cached": "{{size}} cached",
+    "unknown": "This mirror does not carry {{host}}",
+    "commandLabel": "Pull it",
+    "copy": "Copy",
+    "copied": "Copied",
+    "persistent": "Tired of editing commands? Point the upstream address in your config at the katch prefix instead.",
+    "persistentShow": "Show prefix →",
+    "persistentHide": "Hide ↑",
+    "persistentLabel": "Upstream prefix"
+  },
+  "kind": {
+    "registry": "Container image",
+    "static": "Static files"
+  },
+  "status": {
+    "normal": "Normal",
+    "degraded": "Throttled"
+  },
+  "metrics": {
+    "hitRate": "Hit rate, 30 days",
+    "cached": "Cached",
+    "savedToday": "Origin saved today",
+    "trend": "Last 14 days",
+    "trendLabel": "Hit rate over the last 14 days"
+  },
+  "upstreams": {
+    "title": "Supported upstreams",
+    "count": "{{count}} in total",
+    "host": "Upstream",
+    "kind": "Kind",
+    "hitRate": "Hit rate",
+    "cached": "Cached",
+    "status": "Status"
+  },
+  "admin": {
+    "title": "Admin",
+    "pending": "This side is not built yet."
   }
 }
