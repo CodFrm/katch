@@ -89,6 +89,10 @@ func (t *Tracker) Allow(host string) bool {
 }
 
 // Failure 记一次回源失败。
+//
+// 只记真的打到上游的那些。窗口里的请求被闸挡在回源之前，调用方看到的同样是一次
+// 失败并原样喂回来，但上游根本没被碰过：把它算成新证据，会让 docker / apt 的自动
+// 重试把退避一路顶到上限并不断顺延，上游恢复了也等不到那次探测。
 func (t *Tracker) Failure(host string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -96,6 +100,9 @@ func (t *Tracker) Failure(host string) {
 	if !ok {
 		s = &hostState{}
 		t.state[host] = s
+	}
+	if s.failures >= t.opt.Threshold && t.opt.Now().Before(s.retryAt) {
+		return
 	}
 	s.failures++
 	if s.failures >= t.opt.Threshold {

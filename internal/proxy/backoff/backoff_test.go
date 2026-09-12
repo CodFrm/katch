@@ -79,11 +79,26 @@ func TestTracker_DelayCappedAtMax(t *testing.T) {
 		clock := time.Unix(1700000000, 0)
 		tracker := newTestTracker(&clock)
 		// 阈值 3，base 1s，上限 8s：第 3 次失败退 1s，之后 2、4、8、8……
+		//
+		// 每记一次失败就把时钟推到这一次的窗口末尾：只有被放行、真的打到上游的
+		// 失败才计数（见 TestTracker_BlockedRequestsDoNotExtendWindow），挤在同
+		// 一个窗口里连打 12 次的话，量到的根本不是第 12 次的退避时长。
+		window := time.Duration(0)
 		for i := 0; i < 12; i++ {
+			at := clock
 			tracker.Failure("deb.debian.org")
+			snapshot := tracker.Snapshot()
+			if len(snapshot) == 0 {
+				// 还没到阈值，这一次失败没有窗口。
+				continue
+			}
+			retryAt := time.Unix(snapshot[0].RetryAt, 0)
+			window = retryAt.Sub(at)
+			clock = retryAt
 		}
-		clock = clock.Add(8 * time.Second)
-		// 上限之外再长的退避只会让一个已经恢复的上游迟迟不被重试。
+		// 上限之外再长的退避只会让一个已经恢复的上游迟迟不被重试：没有上限的话，
+		// 第 12 次失败要退 512s。
+		convey.So(window, convey.ShouldEqual, 8*time.Second)
 		convey.So(tracker.Allow("deb.debian.org"), convey.ShouldBeTrue)
 	})
 }
@@ -113,5 +128,39 @@ func TestTracker_Defaults(t *testing.T) {
 		}
 		convey.So(tracker.Allow("deb.debian.org"), convey.ShouldBeFalse)
 		convey.So(tracker.Degraded("deb.debian.org"), convey.ShouldBeTrue)
+	})
+}
+
+// TestTracker_BlockedRequestsDoNotExtendWindow 退避窗口里的失败不是新证据。
+//
+// 闸接上之后，窗口期内的请求会被挡在回源之前直接失败，而计数中间件看到的仍旧
+// 是一个失败的响应，于是原样喂回来。若把它当成一次新的回源失败记下来，docker /
+// apt 这些会自己重试的客户端只要还在问，退避就会被一路顶到上限、并且每来一个
+// 请求就再顺延一次——上游早恢复了也永远等不到那次探测。
+func TestTracker_BlockedRequestsDoNotExtendWindow(t *testing.T) {
+	convey.Convey("被闸挡住的请求不延长退避窗口", t, func() {
+		clock := time.Unix(1700000000, 0)
+		tracker := newTestTracker(&clock)
+		for i := 0; i < 3; i++ {
+			tracker.Failure("deb.debian.org")
+		}
+
+		// 窗口里来了一批请求：它们一个都没打到上游，只是各自快速失败了一次。
+		for i := 0; i < 10; i++ {
+			convey.So(tracker.Allow("deb.debian.org"), convey.ShouldBeFalse)
+			tracker.Failure("deb.debian.org")
+		}
+
+		// 窗口该还是原来那 1 秒。
+		clock = clock.Add(time.Second)
+		convey.So(tracker.Allow("deb.debian.org"), convey.ShouldBeTrue)
+		convey.So(tracker.Snapshot()[0].Failures, convey.ShouldEqual, 3)
+
+		convey.Convey("窗口过去之后真的探测过一次再失败，才翻倍", func() {
+			tracker.Failure("deb.debian.org")
+			convey.So(tracker.Allow("deb.debian.org"), convey.ShouldBeFalse)
+			clock = clock.Add(2 * time.Second)
+			convey.So(tracker.Allow("deb.debian.org"), convey.ShouldBeTrue)
+		})
 	})
 }

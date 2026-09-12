@@ -68,6 +68,10 @@ func main() {
 	// 上游退避状态，进程内唯一一份（决策 17，不落库）：计数中间件往里喂回源的
 	// 成败，管理接口从里面读出「这个上游正在降级」。
 	backoffTracker := backoff.New(backoff.Options{})
+	// 闸装在回源那一缝上：上游降级期间拉取直接快速失败，不再每个请求都去等一次
+	// 连不上的拨号。装在这里而不是缓存前面——缓存命中不花上游任何成本，降级期间
+	// 盘上已有的副本必须照常服务。
+	proxy_svc.Register(proxy_svc.New(proxy_svc.Options{Gate: backoffTracker}))
 
 	ctx := context.Background()
 	// 自己装配配置源，而不是让 cago 用默认的文件源：默认那个在读到配置里没写的
