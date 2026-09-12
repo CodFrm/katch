@@ -21,6 +21,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/CodFrm/katch/internal/proxy/dispatch"
+	"github.com/CodFrm/katch/internal/service/cache_svc"
 	"github.com/CodFrm/katch/internal/service/proxy_svc"
 )
 
@@ -121,7 +122,12 @@ func serveUpstream(c *gin.Context, kind dispatch.Kind, host, rest string) bool {
 	return false
 }
 
-// serveProxy 回源并把响应流式转发给客户端。
+// serveProxy 取一个对象并把响应流式转发给客户端。
+//
+// 入口是 cache_svc 而不是 proxy_svc：缓存必须坐在拉取路径上，否则「第二次拉取由
+// 磁盘服务」只在服务层成立，经 HTTP 拉两次仍然是回源两次。白名单那道闸没有被
+// 绕开——cache_svc 未命中时仍旧落到 proxy_svc.Fetch，ErrUpstreamNotAllowed
+// 依然从这里出来（判定只有一个出处）。
 func serveProxy(c *gin.Context, kind dispatch.Kind, host, rest string) {
 	// 镜像站只读。别的方法要么是写操作，要么是探测，一律不回源——转发一个
 	// 没有请求体的 POST 给上游，得到的结果没有任何意义。
@@ -130,7 +136,7 @@ func serveProxy(c *gin.Context, kind dispatch.Kind, host, rest string) {
 		return
 	}
 	ctx := c.Request.Context()
-	body, meta, err := proxy_svc.Proxy().Fetch(ctx, &proxy_svc.Target{
+	body, meta, err := cache_svc.Cache().Get(ctx, &proxy_svc.Target{
 		Kind:     kind,
 		Host:     host,
 		Path:     rest,
