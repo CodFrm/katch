@@ -21,6 +21,7 @@ import (
 	"github.com/CodFrm/katch/internal/buildinfo"
 	"github.com/CodFrm/katch/internal/repository/setting_repo"
 	"github.com/CodFrm/katch/internal/repository/upstream_repo"
+	"github.com/CodFrm/katch/internal/service/proxy_svc"
 	"github.com/CodFrm/katch/internal/service/setting_svc"
 	"github.com/CodFrm/katch/internal/web"
 	"github.com/CodFrm/katch/migrations"
@@ -67,7 +68,10 @@ func main() {
 		// 仓储的实现在这里装配（DIP：service 只认接口），随后按决策 18 处理
 		// 初始管理密钥。必须排在迁移之后——它要读写 setting 表。
 		Registry(cago.FuncComponent(func(ctx context.Context, cfg *configs.Config) error {
-			upstream_repo.RegisterUpstream(upstream_repo.NewUpstream())
+			// 上游仓储包一层进程内缓存：拉取是热路径（一次 docker pull 是几十上百
+			// 个请求），每个请求查一次库等于把镜像站的吞吐绑在 sqlite 上。缓存在
+			// 管理接口写入上游时自动失效，所以界面上改完不必重启。
+			upstream_repo.RegisterUpstream(proxy_svc.NewCachedUpstreamRepo(upstream_repo.NewUpstream()))
 			setting_repo.RegisterSetting(setting_repo.NewSetting())
 			admin := adminConfig{}
 			has, err := cfg.Has(ctx, "admin")
@@ -82,8 +86,8 @@ func main() {
 			// 没配初始密钥不阻断启动：管理接口会全量 401，拉取路径照常服务。
 			return setting_svc.Setting().EnsureAdminKey(ctx, admin.InitialKey)
 		})).
-		// SPA 必须挂在 mux 之前：它注册的是 gin 的 NoRoute，而 mux.HTTP 一旦
-		// 启动就不再接受新的中间件注册。
+		// SPA 与拉取路径共用这一个 NoRoute，必须挂在 mux 之前：它注册的是 gin 的
+		// NoRoute，而 mux.HTTP 一旦启动就不再接受新的中间件注册。
 		Registry(cago.FuncComponent(web.MountSPA)).
 		RegistryCancel(mux.HTTP(api.Router)).
 		Start()

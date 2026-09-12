@@ -8,14 +8,20 @@ import (
 	"bytes"
 	"context"
 	"embed"
+	"errors"
+	"io"
 	"io/fs"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/cago-frame/cago/configs"
+	"github.com/cago-frame/cago/pkg/logger"
 	"github.com/cago-frame/cago/server/mux"
 	"github.com/gin-gonic/gin"
+
+	"github.com/CodFrm/katch/internal/proxy/dispatch"
+	"github.com/CodFrm/katch/internal/service/proxy_svc"
 )
 
 //go:embed dist
@@ -50,16 +56,24 @@ func newNoRouteHandlerFS(sub fs.FS) gin.HandlerFunc {
 
 	return func(c *gin.Context) {
 		path := c.Request.URL.Path
-		// API 未命中就是 404，不能回落 index.html：否则客户端拿到 200 + HTML，
-		// 而 200 不会被任何监控计成失败，问题被彻底藏住。
-		if strings.HasPrefix(path, "/api/") {
+		kind, host, rest := dispatch.Classify(c.Request.URL.EscapedPath())
+		// katch 自身端点未命中就是 404，不能回落 index.html：否则调用方拿到
+		// 200 + HTML，而 200 不会被任何监控计成失败，问题被彻底藏住。
+		if kind == dispatch.KindSelf {
 			c.AbortWithStatus(http.StatusNotFound)
 			return
 		}
+		// dist 里真有这个文件就先给文件。这一步必须排在上游分发之前：
+		// /favicon.ico 这类根目录下的产物名含点，按分段规则会被当成上游主机名，
+		// 而 dist 是编译期固定的一小撮文件，让它优先才不会因为谁加了一条上游
+		// 就把界面打坏。
 		if f, ferr := sub.Open(strings.TrimPrefix(path, "/")); ferr == nil {
 			_ = f.Close()
 			setCacheHeaders(c, path)
 			fileSrv.ServeHTTP(c.Writer, c.Request)
+			return
+		}
+		if serveUpstream(c, kind, host, rest) {
 			return
 		}
 		// /assets/ 下未命中，只可能是滚动更新期间浏览器拿着新副本的 index.html
@@ -78,6 +92,80 @@ func newNoRouteHandlerFS(sub fs.FS) gin.HandlerFunc {
 		setCacheHeaders(c, path)
 		c.Writer.Header().Set("Content-Type", "text/html; charset=utf-8")
 		http.ServeContent(c.Writer, c.Request, "index.html", time.Time{}, bytes.NewReader(idx))
+	}
+}
+
+// serveUpstream 处理拉取路径，返回这次请求是否已由它接管。
+//
+// 它和 SPA 共用 NoRoute 而不是新开一条 gin 通配路由：通配路由会和 /api/v1
+// 以及将来任何一条真实路由抢同一段前缀，而 NoRoute 天然是「所有已注册路由都没
+// 命中之后」，顺序问题不存在。
+func serveUpstream(c *gin.Context, kind dispatch.Kind, host, rest string) bool {
+	switch kind {
+	case dispatch.KindRegistryPing:
+		// registry 客户端拿这个探测「对面是不是一个 v2 registry」，它固定发在
+		// /v2/ 上、不带上游主机名，所以不查白名单也无从查起。
+		c.Header("Docker-Distribution-Api-Version", "registry/2.0")
+		c.Data(http.StatusOK, "application/json; charset=utf-8", []byte("{}"))
+		return true
+	case dispatch.KindInvalid:
+		// 拿不出主机名或带着回溯段的请求，和主机不在白名单里一样 404。
+		c.AbortWithStatus(http.StatusNotFound)
+		return true
+	case dispatch.KindRegistry, dispatch.KindStatic:
+		serveProxy(c, kind, host, rest)
+		return true
+	case dispatch.KindSPA, dispatch.KindSelf:
+		return false
+	}
+	return false
+}
+
+// serveProxy 回源并把响应流式转发给客户端。
+func serveProxy(c *gin.Context, kind dispatch.Kind, host, rest string) {
+	// 镜像站只读。别的方法要么是写操作，要么是探测，一律不回源——转发一个
+	// 没有请求体的 POST 给上游，得到的结果没有任何意义。
+	if c.Request.Method != http.MethodGet && c.Request.Method != http.MethodHead {
+		c.AbortWithStatus(http.StatusMethodNotAllowed)
+		return
+	}
+	ctx := c.Request.Context()
+	body, meta, err := proxy_svc.Proxy().Fetch(ctx, &proxy_svc.Target{
+		Kind:     kind,
+		Host:     host,
+		Path:     rest,
+		RawQuery: c.Request.URL.RawQuery,
+		Method:   c.Request.Method,
+		Header:   c.Request.Header,
+	})
+	if err != nil {
+		if errors.Is(err, proxy_svc.ErrUpstreamNotAllowed) {
+			// 空响应体、不加任何头。主机名一旦出现在响应里，katch 就成了探测
+			// 内网主机是否存在的工具——能回显的就是表里有的（决策 6）。
+			c.AbortWithStatus(http.StatusNotFound)
+			return
+		}
+		// 回源失败是 502 而不是 404：404 会让客户端把「这个对象不存在」当成
+		// 结论记下来，而这只是上游此刻不可达。主机名只进日志，不进响应。
+		logger.Ctx(ctx).Sugar().Errorw("回源失败", "host", host, "path", rest, "err", err)
+		c.AbortWithStatus(http.StatusBadGateway)
+		return
+	}
+	defer func() { _ = body.Close() }()
+	// 上游的状态码原样透传，包括 4xx——那是上游对这个对象的判断，改写它只会
+	// 让客户端拿到一个和真实源站不一致的结果。
+	header := c.Writer.Header()
+	for k, values := range meta.Header {
+		for _, v := range values {
+			header.Add(k, v)
+		}
+	}
+	c.Writer.WriteHeader(meta.StatusCode)
+	// io.Copy 而不是先读进内存：一个几百 MB 的镜像层读完再发，既把首字节推迟到
+	// 整体下载完成，又让并发拉取直接把内存吃光。
+	if _, err := io.Copy(c.Writer, body); err != nil {
+		// 客户端断开也会走到这里，所以是 warn 不是 error。
+		logger.Ctx(ctx).Sugar().Warnw("转发响应体中断", "host", host, "path", rest, "err", err)
 	}
 }
 
