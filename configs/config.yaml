@@ -1,0 +1,40 @@
+env: DEV
+debug: true
+
+# source 不能省。cago 的 Config.init() 会无条件读这个键，缺失时启动直接失败
+# （"config key not found: source"）。改用 etcd 时这里填 etcd 并补上连接段。
+source: file
+
+http:
+  address:
+    - "0.0.0.0:8080"
+
+logger:
+  level: info
+  disableConsole: false
+  logFile:
+    enable: true
+    filename: ./runtime/logs/katch.log
+    # 单独收 error 及以上级别，值班时只看这一个文件即可。
+    errorFilename: ./runtime/logs/katch.err.log
+
+db:
+  # 默认 sqlite：驱动是纯 Go 的 modernc.org/sqlite，不需要 cgo，落地就是一个文件。
+  # 切 mysql 只改这一段：
+  #   driver: "mysql"
+  #   dsn: "user:pass@tcp(127.0.0.1:3306)/katch?charset=utf8mb4&parseTime=True&loc=Local"
+  driver: "sqlite"
+  # 两个 pragma 都不能省：
+  #   journal_mode(WAL)  —— 默认的 DELETE 模式下读会阻塞写，缓存元数据是读多写少，
+  #                         不开 WAL 一上并发就互相卡。
+  #   busy_timeout(5000) —— sqlite 遇到锁默认**立刻**返回 SQLITE_BUSY 而不是等待，
+  #                         不设这个值，并发写会直接报 "database is locked"。
+  dsn: "file:./data/katch.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+  prefix: "katch_"
+  debug: false
+  # sqlite 是单文件，写入本来就串行，连接数开大只会增加锁竞争。切到 mysql 时这几项
+  # 要重调（副本数 × maxOpenConns ≤ 数据库最大连接数）。
+  maxOpenConns: 8
+  maxIdleConns: 4
+  connMaxLifetime: 30m
+  connMaxIdleTime: 5m

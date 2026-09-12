@@ -1,0 +1,11 @@
+{
+  "app": {
+    "name": "katch",
+    "tagline": "多上游镜像代理"
+  },
+  "system": {
+    "version": "版本",
+    "loading": "加载中",
+    "error": "无法获取版本信息"
+  }
+}

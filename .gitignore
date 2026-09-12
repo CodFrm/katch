@@ -1,0 +1,28 @@
+# 构建产物
+/bin/
+/internal/web/dist/*
+!/internal/web/dist/.gitkeep
+
+# 运行期数据：sqlite 库文件、缓存目录、日志
+# runtime/ 对应 configs/config.yaml 里 logger.logFile 的路径，两处要一起改
+/data/
+*.db
+*.db-shm
+*.db-wal
+/runtime/
+
+# 本地配置覆盖（configs/config.yaml 是入库的默认值，本地改动走这个文件）
+/configs/config.local.yaml
+
+# 前端
+/frontend/node_modules/
+/frontend/dist/
+/frontend/*.tsbuildinfo
+
+# dev-kit 的中间产物（mockup、草稿），不入库；正式 spec 在 docs/specs/
+/.dev-kit/
+
+# 编辑器与系统
+.DS_Store
+.idea/
+.vscode/

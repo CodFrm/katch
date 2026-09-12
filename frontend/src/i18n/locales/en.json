@@ -1,0 +1,11 @@
+{
+  "app": {
+    "name": "katch",
+    "tagline": "Multi-upstream mirror proxy"
+  },
+  "system": {
+    "version": "Version",
+    "loading": "Loading",
+    "error": "Failed to load version"
+  }
+}

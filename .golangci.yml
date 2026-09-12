@@ -1,0 +1,59 @@
+version: "2"
+run:
+  timeout: 10m
+linters:
+  default: standard
+  enable:
+    - govet
+    - errcheck
+    - staticcheck
+    - unused
+    - ineffassign
+    - misspell
+    # 日志出口唯一化：见 settings.forbidigo
+    - forbidigo
+
+  settings:
+    forbidigo:
+      # 按完整包路径判定，避免项目内同名 log 包被误报
+      analyze-types: true
+      forbid:
+        - pattern: '^fmt\.Print.*$'
+          msg: >-
+            禁止 fmt.Print*：它绕过日志系统，没有级别、没有结构化字段、
+            不会写进 logFile，线上等于什么都没记。
+            请改用 logger.Ctx(ctx).Info("...", zap.String("k", v))
+            （github.com/cago-frame/cago/pkg/logger）。见 docs/observability.md#logging
+        - pattern: '^log\.(Print|Fatal|Panic).*$'
+          msg: >-
+            禁止标准库 log：同上，且 log.Fatal 会直接 os.Exit，跳过所有 defer 清理。
+            请改用 logger.Ctx(ctx)（github.com/cago-frame/cago/pkg/logger）。
+            仅启动期（logger 尚未初始化）可用，那部分已在 exclusions 里列明。
+            见 docs/observability.md#logging
+
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters: [errcheck]
+
+      # ── forbidigo 豁免：启动期 ────────────────────────────────────────
+      # cago 的 logger 要等 component.Core() 跑完才可用，在那之前只有标准库 log
+      # 能把错误说出来。这个文件是「日志系统尚未就绪」的唯一窗口。
+      # 新增豁免必须写在这里并附理由，不要就地加 //nolint。
+      - path: cmd/katch/main\.go
+        linters: [forbidigo]
+
+# golangci-lint v2 把格式化器从 linters 里拆了出来，需要单独这一段；缺了它 gofmt
+# 从来不会被执行，而 lint 照样全绿。
+formatters:
+  enable:
+    # gofmt：缩进、对齐、多余空行。
+    - gofmt
+    # goimports：在 gofmt 之上再管 import 分组。本仓既有写法就是
+    # 「标准库 / 第三方 / katch 自己」三段，local-prefixes 把这条从
+    # 「大家自觉遵守」变成机械检查。
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/CodFrm/katch
