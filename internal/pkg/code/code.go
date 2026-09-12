@@ -17,6 +17,8 @@ const (
 	UpstreamHostExists
 	// AdminKeyNotInitialized 库里没有管理密钥，配置里也没给初始密钥。
 	AdminKeyNotInitialized
+	// RuleNotFound 访问规则不存在。
+	RuleNotFound
 )
 
 func init() {
@@ -28,4 +30,5 @@ var zhCN = map[int]string{
 	UpstreamNotFound:       "上游不存在",
 	UpstreamHostExists:     "该上游主机名已存在",
 	AdminKeyNotInitialized: "尚未设置管理密钥，请在 configs/config.yaml 的 admin.initialKey 中给出初始密钥",
+	RuleNotFound:           "访问规则不存在",
 }

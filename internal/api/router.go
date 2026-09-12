@@ -8,9 +8,11 @@ import (
 	"github.com/cago-frame/cago/server/mux"
 	"github.com/gin-gonic/gin"
 
+	"github.com/CodFrm/katch/internal/controller/rule_ctr"
 	"github.com/CodFrm/katch/internal/controller/stat_ctr"
 	"github.com/CodFrm/katch/internal/controller/system_ctr"
 	"github.com/CodFrm/katch/internal/controller/upstream_ctr"
+	"github.com/CodFrm/katch/internal/proxy/rulegate"
 	"github.com/CodFrm/katch/internal/service/setting_svc"
 )
 
@@ -21,8 +23,15 @@ const bearerPrefix = "Bearer "
 //
 // 注意：这里只挂 katch 自身的管理接口，全部在 /api/ 前缀下。镜像代理走的是
 // 另一套路径（/v2/... 和 /<上游host>/...），由代理层单独接管——两者必须分开，
-// 否则上游 host 和管理接口会在同一个命名空间里抢路径。
+// 否则上游 host 和管理接口会在同一个命名空间里抢路径。唯一伸到拉取路径上的是
+// 下面那道访问规则闸：它没有自己的路由，只能挂在引擎上，理由见那里。
 func Router(_ context.Context, root *mux.Router) error {
+	// 访问规则闸挂在 gin 引擎上而不是某个路由组里：它守的是拉取路径，而拉取
+	// 路径走的是 web.MountSPA 注册的 NoRoute，没有自己的路由可挂。gin 的
+	// Engine.Use 会重建 NoRoute 的处理链，所以这里挂上去之后，先注册的那个
+	// NoRoute 一样会先过这道闸。闸自己只认拉取路径，其余一律原样通过。
+	root.Use(rulegate.Middleware())
+
 	r := root.Group("/api/v1")
 
 	sysCtr := system_ctr.NewSystem()
@@ -36,6 +45,8 @@ func Router(_ context.Context, root *mux.Router) error {
 	upstreamCtr := upstream_ctr.NewUpstream()
 	adminGroup.Bind(upstreamCtr.List, upstreamCtr.Save, upstreamCtr.Delete)
 	adminGroup.Bind(statCtr.ByUpstream)
+	ruleCtr := rule_ctr.NewRule()
+	adminGroup.Bind(ruleCtr.List, ruleCtr.Save, ruleCtr.Delete, ruleCtr.Test)
 
 	return nil
 }

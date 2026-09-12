@@ -13,6 +13,7 @@ import (
 
 	"github.com/CodFrm/katch/internal/model/entity/cache_entity"
 	"github.com/CodFrm/katch/internal/model/entity/rollup_entity"
+	"github.com/CodFrm/katch/internal/model/entity/rule_entity"
 	"github.com/CodFrm/katch/internal/model/entity/setting_entity"
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
 )
@@ -23,6 +24,7 @@ func migrationList() []*gormigrate.Migration {
 		upstreamAndSetting(),
 		cacheObject(),
 		trafficRollup(),
+		accessRule(),
 	}
 }
 
@@ -243,6 +245,59 @@ func trafficRollup() *gormigrate.Migration {
 		},
 		Rollback: func(tx *gorm.DB) error {
 			table, err := tableName(tx, &rollup_entity.TrafficRollup{})
+			if err != nil {
+				return err
+			}
+			return tx.Exec(fmt.Sprintf("DROP TABLE IF EXISTS `%s`", table)).Error
+		},
+	}
+}
+
+// accessRule 建访问规则表。
+//
+// 规则分全局与上游内两层，全局先于上游内求值（决策 14）：upstream_id 为 0 就是
+// 一条全局规则。用 0 而不是 NULL 表示全局——NULL 在索引、相等比较和 gorm 的
+// 零值语义里各有一套分支，而「全局」是一个正常取值，不是「没有值」。
+//
+// 表里**没有**排序列：同层内按具体度定序，不按人工顺序（决策 15）。存一列看起来
+// 像优先级的序号，只会让人以为拖动它能改变结果。上游的默认策略同样不在这里——
+// 它是 upstream 上的一个字段，没有 pattern，混进规则表会让具体度排序无从谈起。
+func accessRule() *gormigrate.Migration {
+	return &gormigrate.Migration{
+		ID: "20260912000004_access_rule",
+		Migrate: func(tx *gorm.DB) error {
+			table, err := tableName(tx, &rule_entity.AccessRule{})
+			if err != nil {
+				return err
+			}
+			autoPK := "BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY"
+			if tx.Name() == "sqlite" {
+				autoPK = "INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT"
+			}
+			stmts := []string{
+				// pattern 取 500，和 cache_object 的 key 同一个理由：utf8mb4 下
+				// 500 字符是 2000 字节，落在 InnoDB 3072 字节的索引键上限之内。
+				fmt.Sprintf("CREATE TABLE `%s` ("+
+					"`id` %s,"+
+					"`upstream_id` BIGINT NOT NULL DEFAULT 0,"+
+					"`action` VARCHAR(16) NOT NULL,"+
+					"`pattern` VARCHAR(500) NOT NULL,"+
+					"`note` VARCHAR(512) NOT NULL DEFAULT '',"+
+					"`createtime` BIGINT NOT NULL DEFAULT 0,"+
+					"`updatetime` BIGINT NOT NULL DEFAULT 0)", table, autoPK),
+				// 求值时读的是整张表（规则是人工维护的策略，规模是几十条），
+				// 这条索引是给管理界面按上游筛选用的。
+				fmt.Sprintf("CREATE INDEX `idx_%s_upstream` ON `%s` (`upstream_id`)", table, table),
+			}
+			for _, stmt := range stmts {
+				if err := tx.Exec(stmt).Error; err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			table, err := tableName(tx, &rule_entity.AccessRule{})
 			if err != nil {
 				return err
 			}
