@@ -11,6 +11,7 @@ import (
 	"github.com/go-gormigrate/gormigrate/v2"
 	"gorm.io/gorm"
 
+	"github.com/CodFrm/katch/internal/model/entity/cache_entity"
 	"github.com/CodFrm/katch/internal/model/entity/setting_entity"
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
 )
@@ -19,6 +20,7 @@ import (
 func migrationList() []*gormigrate.Migration {
 	return []*gormigrate.Migration{
 		upstreamAndSetting(),
+		cacheObject(),
 	}
 }
 
@@ -127,4 +129,65 @@ func tables(tx *gorm.DB) (string, string, error) {
 		return "", "", err
 	}
 	return upstream, setting, nil
+}
+
+// cacheObject 建缓存对象表。
+//
+// 表里只有「哪个上游的哪条路径对应盘上的哪一份内容」这份元数据，对象本体按内容
+// 摘要存在缓存目录里。分开的理由是同一份字节可能被多条路径引用（内容寻址，
+// 同一份内容只存一份），删记录时要先数一数还有没有别人引用它。
+func cacheObject() *gormigrate.Migration {
+	return &gormigrate.Migration{
+		ID: "20260912000002_cache_object",
+		Migrate: func(tx *gorm.DB) error {
+			table, err := tableName(tx, &cache_entity.CacheObject{})
+			if err != nil {
+				return err
+			}
+			autoPK := "BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY"
+			if tx.Name() == "sqlite" {
+				autoPK = "INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT"
+			}
+			stmts := []string{
+				// key 在 MySQL 里是保留字，建表和查询都必须带反引号；sqlite 也认。
+				// 它取 500 而不是更长：下面那条唯一索引把它和 upstream_id 一起做键，
+				// utf8mb4 下 500 字符是 2000 字节，加上 8 字节的 bigint 仍在 InnoDB
+				// 3072 字节的索引键上限之内，再长建索引就会失败。
+				fmt.Sprintf("CREATE TABLE `%s` ("+
+					"`id` %s,"+
+					"`upstream_id` BIGINT NOT NULL DEFAULT 0,"+
+					"`key` VARCHAR(500) NOT NULL,"+
+					"`digest` VARCHAR(80) NOT NULL DEFAULT '',"+
+					"`size` BIGINT NOT NULL DEFAULT 0,"+
+					"`content_type` VARCHAR(191) NOT NULL DEFAULT '',"+
+					"`immutable` BOOLEAN NOT NULL DEFAULT 0,"+
+					"`pinned` BOOLEAN NOT NULL DEFAULT 0,"+
+					"`expires_at` BIGINT NOT NULL DEFAULT 0,"+
+					"`last_access_at` BIGINT NOT NULL DEFAULT 0,"+
+					"`hit_count` BIGINT NOT NULL DEFAULT 0,"+
+					"`createtime` BIGINT NOT NULL DEFAULT 0,"+
+					"`updatetime` BIGINT NOT NULL DEFAULT 0)", table, autoPK),
+				// 一个上游内一条路径只能有一条记录：并发回源合并之后仍可能有两次写入
+				// 落到同一个 key 上（先后两轮下载），唯一索引是最后一道闸。
+				fmt.Sprintf("CREATE UNIQUE INDEX `idx_%s_upstream_key` ON `%s` (`upstream_id`, `key`)", table, table),
+				// LRU 的查询条件就是这三列：不可变、未 pin、按最久未访问排序。
+				fmt.Sprintf("CREATE INDEX `idx_%s_lru` ON `%s` (`immutable`, `pinned`, `last_access_at`)", table, table),
+				// 删记录前要数「还有几条记录引用这份内容」，那是一次按摘要的点查。
+				fmt.Sprintf("CREATE INDEX `idx_%s_digest` ON `%s` (`digest`)", table, table),
+			}
+			for _, stmt := range stmts {
+				if err := tx.Exec(stmt).Error; err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			table, err := tableName(tx, &cache_entity.CacheObject{})
+			if err != nil {
+				return err
+			}
+			return tx.Exec(fmt.Sprintf("DROP TABLE IF EXISTS `%s`", table)).Error
+		},
+	}
 }

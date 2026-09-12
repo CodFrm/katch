@@ -1,0 +1,619 @@
+// Package cache_svc 是缓存层：拉取路径在回源之前先问它一次。
+//
+// 它站在 proxy_svc 之前——命中就由磁盘服务，未命中才回源，并且一边向客户端流式
+// 转发一边写入缓存（不得先下载完整对象再开始响应）。缓存坏掉、磁盘不可用、数据库
+// 不可用时，它一律退回成纯透传：缓存是优化，它坏掉不该让拉取整体失败。
+package cache_svc
+
+import (
+	"context"
+	"errors"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/cago-frame/cago/pkg/logger"
+	"go.uber.org/zap"
+
+	"github.com/CodFrm/katch/internal/cache"
+	"github.com/CodFrm/katch/internal/model/entity/cache_entity"
+	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
+	"github.com/CodFrm/katch/internal/repository/cache_repo"
+	"github.com/CodFrm/katch/internal/service/proxy_svc"
+	"github.com/CodFrm/katch/internal/service/upstream_svc"
+)
+
+// ErrCacheUnavailable 缓存目录不可用。只有显式写缓存的接口会返回它，
+// 拉取路径遇到同样的情况是降级透传，而不是报错。
+var ErrCacheUnavailable = errors.New("缓存不可用")
+
+// ErrPurgeTargetRequired 清缓存必须指明清谁。
+var ErrPurgeTargetRequired = errors.New("请指定要清理的缓存对象或上游")
+
+// ErrPutIncomplete 写入缓存至少要有上游、键和内容。
+var ErrPutIncomplete = errors.New("缓存写入缺少上游、键或内容")
+
+const (
+	// cacheStatusHeader 让调用方（以及运维）看得见这次响应是不是缓存命中。
+	cacheStatusHeader = "X-Katch-Cache"
+	cacheStatusHit    = "HIT"
+	cacheStatusMiss   = "MISS"
+)
+
+const (
+	defaultQuota          = int64(10) << 30
+	defaultReclaimPercent = 90
+	defaultMutableTTL     = int64(300)
+	// evictBatch 一次取多少条淘汰候选。取太小会把一次超配额拆成很多轮查询，
+	// 取太大则在缓存很满时一次拉回一大片记录。
+	evictBatch = 64
+	// copyBufferSize 回源转发的缓冲区。镜像层动辄几百 MB，缓冲太小会把一次拷贝
+	// 变成几百万次系统调用。
+	copyBufferSize = 64 << 10
+)
+
+// Options 缓存层的运行参数。
+//
+// 这里只有「进程跑起来之后才有意义」的参数，缓存目录不在其中——目录是启动时就要
+// 定下来的东西，由 main 从配置文件读出来交给 cache.NewStore。
+type Options struct {
+	// Quota 缓存总容量上限（字节），超过就按最近最少使用淘汰。
+	Quota int64
+	// ReclaimPercent 回收水位：超配额后一直淘汰到配额的这个百分比。
+	// 不淘汰到刚好等于配额，否则每写一个对象都要触发一次淘汰。
+	ReclaimPercent int
+	// MutableTTLSeconds 可变对象的默认存活时长，上游没单独配时用它。
+	MutableTTLSeconds int64
+}
+
+// PutRequest 直接写入一个缓存对象。
+type PutRequest struct {
+	UpstreamID  int64
+	Key         string
+	Content     io.Reader
+	ContentType string
+	// Immutable 内容寻址的对象长期缓存，只由 LRU 淘汰；否则按 TTL 过期。
+	Immutable  bool
+	TTLSeconds int64
+}
+
+// SearchRequest 管理界面的对象搜索条件。
+type SearchRequest struct {
+	UpstreamID int64
+	Keyword    string
+	Page       int
+	Size       int
+}
+
+// SearchResponse 搜索结果。
+type SearchResponse struct {
+	List  []*cache_entity.CacheObject `json:"list"`
+	Total int64                       `json:"total"`
+}
+
+// PurgeRequest 清缓存：给 ID 清一条，给 UpstreamID 清整个上游。
+type PurgeRequest struct {
+	ID         int64
+	UpstreamID int64
+}
+
+// PurgeResponse 清掉了几条。
+type PurgeResponse struct {
+	Removed int64 `json:"removed"`
+}
+
+// PinRequest 把一个对象钉住/放开。钉住的对象不参与淘汰。
+type PinRequest struct {
+	ID     int64
+	Pinned bool
+}
+
+// CacheSvc 缓存层的业务操作。
+type CacheSvc interface {
+	// Get 取一个对象：命中由磁盘服务，未命中回源并边转发边写入缓存。
+	// 与 proxy_svc.Fetch 的返回约定一致，上游的 4xx/5xx 是正常返回值。
+	Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCloser, *proxy_svc.Meta, error)
+	Put(ctx context.Context, req *PutRequest) error
+	Search(ctx context.Context, req *SearchRequest) (*SearchResponse, error)
+	Purge(ctx context.Context, req *PurgeRequest) (*PurgeResponse, error)
+	Pin(ctx context.Context, req *PinRequest) error
+}
+
+type cacheSvc struct {
+	store *cache.Store
+	opt   Options
+	// mu 只护 inflight 这张表。
+	mu       sync.Mutex
+	inflight map[string]*flight
+	// evictMu 把淘汰串起来：几个下载同时收尾时各淘汰各的，会把缓存削过头。
+	evictMu sync.Mutex
+}
+
+// New 构造缓存层。store 为 nil 表示磁盘不可用——此时它是一个纯透传的实现，
+// 拉取照常，只是不命中也不写入。
+func New(store *cache.Store, opt Options) CacheSvc {
+	if opt.Quota <= 0 {
+		opt.Quota = defaultQuota
+	}
+	if opt.ReclaimPercent <= 0 || opt.ReclaimPercent > 100 {
+		opt.ReclaimPercent = defaultReclaimPercent
+	}
+	if opt.MutableTTLSeconds <= 0 {
+		opt.MutableTTLSeconds = defaultMutableTTL
+	}
+	return &cacheSvc{store: store, opt: opt, inflight: map[string]*flight{}}
+}
+
+// defaultCache 在 main 装配之前就是纯透传：拉取路径不该依赖装配顺序。
+var defaultCache = New(nil, Options{})
+
+// Cache 返回缓存层。
+func Cache() CacheSvc {
+	return defaultCache
+}
+
+// Register 注册实现，由 main 装配。
+func Register(svc CacheSvc) {
+	defaultCache = svc
+}
+
+func (c *cacheSvc) Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCloser, *proxy_svc.Meta, error) {
+	if !c.usable() || !cacheableRequest(target) {
+		return proxy_svc.Proxy().Fetch(ctx, target)
+	}
+	upstream, err := upstream_svc.Upstream().FindByHost(ctx, target.Host)
+	if err != nil || upstream == nil {
+		// 查不到上游、或者库不可用，都交回代理层：白名单这道闸和它给出的统一
+		// 404 只能有一个出处，在这里复述一遍迟早会和那边走偏。
+		return proxy_svc.Proxy().Fetch(ctx, target)
+	}
+	key := cacheKey(target)
+	if body, meta, ok := c.serveFromDisk(ctx, upstream, key); ok {
+		return body, meta, nil
+	}
+	return c.fetchAndCache(ctx, target, upstream, key)
+}
+
+func (c *cacheSvc) usable() bool {
+	return c.store != nil && cache_repo.CacheObject() != nil
+}
+
+// cacheableRequest 只有「要一份完整对象」的 GET 才走缓存。
+//
+// HEAD 没有响应体；带 Range 或条件头的请求拿到的是半截或 304，把它们写进缓存
+// 就是把半截当整份。这类请求直接透传给上游，由上游自己回答。
+func cacheableRequest(target *proxy_svc.Target) bool {
+	if target.Method != http.MethodGet {
+		return false
+	}
+	for _, h := range []string{"Range", "If-Range", "If-None-Match", "If-Modified-Since"} {
+		if target.Header.Get(h) != "" {
+			return false
+		}
+	}
+	return true
+}
+
+// cacheableResponse 哪些响应可以留下来。
+func cacheableResponse(meta *proxy_svc.Meta) bool {
+	// 只缓存 200：4xx/5xx 原样透传但不缓存，否则上游的一次抖动会被固化下来；
+	// 206 是半截内容；304 没有响应体。
+	if meta.StatusCode != http.StatusOK {
+		return false
+	}
+	if meta.Header.Get("Content-Range") != "" {
+		return false
+	}
+	// 传输编码过的响应体不能存：命中时我们只按 Content-Type 回放，缺了
+	// Content-Encoding，客户端会把一份 gzip 字节当成原文解析。
+	if enc := meta.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
+		return false
+	}
+	cc := strings.ToLower(meta.Header.Get("Cache-Control"))
+	return !strings.Contains(cc, "no-store") && !strings.Contains(cc, "private")
+}
+
+// cacheKey 缓存键：上游内路径加查询串。
+//
+// 带上查询串是因为它会改变返回的内容；上游 ID 不进键里，它是表上的另一列。
+func cacheKey(target *proxy_svc.Target) string {
+	if target.RawQuery == "" {
+		return target.Path
+	}
+	return target.Path + "?" + target.RawQuery
+}
+
+// serveFromDisk 命中则由磁盘服务，返回的第三个值表示这次是不是命中。
+func (c *cacheSvc) serveFromDisk(ctx context.Context, upstream *upstream_entity.Upstream, key string) (io.ReadCloser, *proxy_svc.Meta, bool) {
+	repo := cache_repo.CacheObject()
+	object, err := repo.FindByKey(ctx, upstream.ID, key)
+	if err != nil {
+		// 库不可用不该让拉取停摆：当成未命中，回源照常。
+		logger.Ctx(ctx).Error("读缓存记录失败", zap.String("key", key), zap.Error(err))
+		return nil, nil, false
+	}
+	if object == nil || object.Expired(time.Now().Unix()) {
+		return nil, nil, false
+	}
+	file, size, err := c.store.Open(object.Digest)
+	if err != nil {
+		// 记录还在、文件没了：这是磁盘或写入路径出了问题，不能静默自愈了事。
+		logger.Ctx(ctx).Error("缓存副本丢失", zap.String("key", key),
+			zap.String("digest", object.Digest), zap.Error(err))
+		c.dropRecord(ctx, object)
+		return nil, nil, false
+	}
+	if size != object.Size {
+		_ = file.Close()
+		logger.Ctx(ctx).Error("缓存副本大小与记录不符", zap.String("key", key),
+			zap.Int64("want", object.Size), zap.Int64("got", size))
+		c.dropRecord(ctx, object)
+		return nil, nil, false
+	}
+	if err := repo.Touch(ctx, object.ID, time.Now().Unix()); err != nil {
+		// 命中已经成立了，访问时间没更新上只影响淘汰顺序，不该让这次拉取失败。
+		logger.Ctx(ctx).Warn("更新缓存访问时间失败", zap.Int64("id", object.ID), zap.Error(err))
+	}
+	header := make(http.Header, 3)
+	if object.ContentType != "" {
+		header.Set("Content-Type", object.ContentType)
+	}
+	header.Set("Content-Length", strconv.FormatInt(object.Size, 10))
+	header.Set(cacheStatusHeader, cacheStatusHit)
+	return newVerifyReader(ctx, c, file, object), &proxy_svc.Meta{
+		StatusCode:    http.StatusOK,
+		Header:        header,
+		ContentLength: object.Size,
+	}, true
+}
+
+// dropRecord 丢掉一条坏记录，连同它独占的那份内容。
+func (c *cacheSvc) dropRecord(ctx context.Context, object *cache_entity.CacheObject) {
+	if err := cache_repo.CacheObject().Delete(ctx, object.ID); err != nil {
+		logger.Ctx(ctx).Error("删除缓存记录失败", zap.Int64("id", object.ID), zap.Error(err))
+		return
+	}
+	c.removeIfUnreferenced(ctx, object.Digest)
+}
+
+// removeIfUnreferenced 没有别的记录引用这份内容时才删文件。
+//
+// 内容寻址意味着一份字节可能被多条路径共用，不问一声就删，会把别人的缓存
+// 变成一条指向空文件的坏记录。
+func (c *cacheSvc) removeIfUnreferenced(ctx context.Context, digest string) {
+	if digest == "" {
+		return
+	}
+	count, err := cache_repo.CacheObject().CountByDigest(ctx, digest)
+	if err != nil {
+		logger.Ctx(ctx).Error("统计内容引用失败", zap.String("digest", digest), zap.Error(err))
+		return
+	}
+	if count > 0 {
+		return
+	}
+	if err := c.store.Remove(digest); err != nil {
+		logger.Ctx(ctx).Error("删除缓存文件失败", zap.String("digest", digest), zap.Error(err))
+	}
+}
+
+// fetchAndCache 未命中：回源，同一对象的并发请求合并成一次（决策 9）。
+func (c *cacheSvc) fetchAndCache(ctx context.Context, target *proxy_svc.Target,
+	upstream *upstream_entity.Upstream, key string) (io.ReadCloser, *proxy_svc.Meta, error) {
+	flightKey := strconv.FormatInt(upstream.ID, 10) + "\x00" + key
+
+	c.mu.Lock()
+	if running, ok := c.inflight[flightKey]; ok {
+		c.mu.Unlock()
+		return c.attachOrFetch(ctx, running, target)
+	}
+	current := newFlight(c.store)
+	c.inflight[flightKey] = current
+	c.mu.Unlock()
+
+	// 回源用脱离客户端取消的 context：客户端断开时下载要继续跑完，已下载的部分
+	// 仍要写完缓存——下一个请求就能命中，否则一次断线就白白浪费整趟回源。
+	fetchCtx := context.WithoutCancel(ctx)
+	body, meta, err := proxy_svc.Proxy().Fetch(fetchCtx, target)
+	if err != nil {
+		c.forget(flightKey)
+		current.startFailed(err)
+		return nil, nil, err
+	}
+	if !cacheableResponse(meta) {
+		c.forget(flightKey)
+		current.startUncacheable()
+		return body, meta, nil
+	}
+	writer, err := c.store.Create()
+	if err != nil {
+		// 盘写不了就降级为纯透传：这次拉取照常完成，只是不留缓存。
+		logger.Ctx(ctx).Error("缓存写入不可用，本次降级为纯透传",
+			zap.String("key", key), zap.Error(err))
+		c.forget(flightKey)
+		current.startUncacheable()
+		return body, meta, nil
+	}
+	current.start(meta, writer.Name())
+	go c.pump(fetchCtx, flightKey, current, body, writer, upstream, key, meta)
+	return c.attachOrFetch(ctx, current, target)
+}
+
+// attachOrFetch 搭上一次正在进行的下载；搭不上就自己回源。
+func (c *cacheSvc) attachOrFetch(ctx context.Context, current *flight,
+	target *proxy_svc.Target) (io.ReadCloser, *proxy_svc.Meta, error) {
+	body, meta, err := current.attach(ctx)
+	if err == nil {
+		return body, meta, nil
+	}
+	if errors.Is(err, errNotCoalescable) {
+		return proxy_svc.Proxy().Fetch(ctx, target)
+	}
+	return nil, nil, err
+}
+
+func (c *cacheSvc) forget(flightKey string) {
+	c.mu.Lock()
+	delete(c.inflight, flightKey)
+	c.mu.Unlock()
+}
+
+// pump 把回源的响应体搬进临时文件，读者跟在后面读。
+//
+// 它不由任何一个客户端驱动：谁断开都不影响这趟下载跑完（失败与降级一节），
+// 而写进去的字节一出现就能被读者看见（首字节不必等整份下载完成）。
+func (c *cacheSvc) pump(ctx context.Context, flightKey string, current *flight,
+	body io.ReadCloser, writer *cache.Writer, upstream *upstream_entity.Upstream,
+	key string, meta *proxy_svc.Meta) {
+	defer func() {
+		_ = body.Close()
+		_ = writer.Close()
+	}()
+
+	failure := c.copyToCache(current, body, writer)
+	digest := ""
+	if failure == nil {
+		var size int64
+		var err error
+		// 提交与落库都在 finish 之前完成：读者读到 EOF 时，这个对象已经在缓存里，
+		// 紧接着的下一次拉取才不会看见一个写了一半的缓存。
+		digest, size, err = writer.Commit()
+		if err != nil {
+			logger.Ctx(ctx).Error("提交缓存文件失败", zap.String("key", key), zap.Error(err))
+			digest = ""
+		} else if err := c.saveRecord(ctx, &recordInput{
+			UpstreamID:  upstream.ID,
+			Key:         key,
+			Digest:      digest,
+			Size:        size,
+			ContentType: meta.Header.Get("Content-Type"),
+			Immutable:   cache.IsImmutable(upstream.ImmutablePatterns, key),
+			TTLSeconds:  int64(upstream.MutableTTLSeconds),
+		}); err != nil {
+			logger.Ctx(ctx).Error("写缓存记录失败", zap.String("key", key), zap.Error(err))
+		}
+	} else {
+		// 回源中断或盘写不下去：这次不留缓存，下一次重新来过。
+		logger.Ctx(ctx).Error("缓存写入中断", zap.String("key", key), zap.Error(failure))
+	}
+	current.finish(digest, failure)
+	c.forget(flightKey)
+	if failure == nil && digest != "" {
+		c.enforceQuota(ctx)
+	}
+}
+
+// copyToCache 搬字节，每写进去一段就让读者可见。
+func (c *cacheSvc) copyToCache(current *flight, body io.Reader, writer *cache.Writer) error {
+	buf := make([]byte, copyBufferSize)
+	for {
+		n, readErr := body.Read(buf)
+		if n > 0 {
+			if _, err := writer.Write(buf[:n]); err != nil {
+				return err
+			}
+			current.publish(int64(n))
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return nil
+			}
+			return readErr
+		}
+	}
+}
+
+// recordInput 一条缓存记录要写进去的内容。
+type recordInput struct {
+	UpstreamID  int64
+	Key         string
+	Digest      string
+	Size        int64
+	ContentType string
+	Immutable   bool
+	// TTLSeconds 可变对象的存活时长，0 表示用全局默认值。
+	TTLSeconds int64
+}
+
+// saveRecord 写入或更新一条缓存记录。
+//
+// 同一条路径只会有一条记录：重取（可变对象过期、或坏副本重下）要覆盖原来那条，
+// 否则表里会为同一个 key 越堆越多，而唯一索引会在第二次写入时直接报错。
+func (c *cacheSvc) saveRecord(ctx context.Context, in *recordInput) error {
+	repo := cache_repo.CacheObject()
+	now := time.Now().Unix()
+	object, err := repo.FindByKey(ctx, in.UpstreamID, in.Key)
+	if err != nil {
+		return err
+	}
+	previousDigest := ""
+	if object == nil {
+		object = &cache_entity.CacheObject{UpstreamID: in.UpstreamID, Key: in.Key, Createtime: now}
+	} else {
+		previousDigest = object.Digest
+	}
+	object.Digest = in.Digest
+	object.Size = in.Size
+	object.ContentType = in.ContentType
+	object.Immutable = in.Immutable
+	object.ExpiresAt = 0
+	if !in.Immutable {
+		ttl := in.TTLSeconds
+		if ttl <= 0 {
+			ttl = c.opt.MutableTTLSeconds
+		}
+		object.ExpiresAt = now + ttl
+	}
+	object.LastAccessAt = now
+	object.Updatetime = now
+	if err := repo.Save(ctx, object); err != nil {
+		return err
+	}
+	if previousDigest != "" && previousDigest != in.Digest {
+		c.removeIfUnreferenced(ctx, previousDigest)
+	}
+	return nil
+}
+
+// enforceQuota 超配额就按最近最少使用淘汰，直到回到回收水位。
+//
+// 淘汰只落在不可变且未被 pin 的对象上（由 EvictCandidates 保证）：可变对象由 TTL
+// 自行过期，pin 的对象是人明确要求留下的。
+func (c *cacheSvc) enforceQuota(ctx context.Context) {
+	c.evictMu.Lock()
+	defer c.evictMu.Unlock()
+
+	repo := cache_repo.CacheObject()
+	total, err := repo.TotalSize(ctx)
+	if err != nil {
+		logger.Ctx(ctx).Error("统计缓存占用失败", zap.Error(err))
+		return
+	}
+	if total <= c.opt.Quota {
+		return
+	}
+	// 淘汰到回收水位而不是刚好等于配额，否则之后每写一个对象都要再淘汰一次。
+	waterline := c.opt.Quota * int64(c.opt.ReclaimPercent) / 100
+	for total > waterline {
+		candidates, err := repo.EvictCandidates(ctx, evictBatch)
+		if err != nil {
+			logger.Ctx(ctx).Error("查询淘汰候选失败", zap.Error(err))
+			return
+		}
+		if len(candidates) == 0 {
+			// 剩下的全是 pin 的或可变的：这不是可以静默忽略的状态，配额已经守不住了。
+			logger.Ctx(ctx).Error("缓存超配额但没有可淘汰的对象",
+				zap.Int64("total", total), zap.Int64("quota", c.opt.Quota))
+			return
+		}
+		for _, object := range candidates {
+			if err := repo.Delete(ctx, object.ID); err != nil {
+				logger.Ctx(ctx).Error("淘汰缓存记录失败", zap.Int64("id", object.ID), zap.Error(err))
+				return
+			}
+			c.removeIfUnreferenced(ctx, object.Digest)
+			total -= object.Size
+			if total <= waterline {
+				return
+			}
+		}
+	}
+}
+
+func (c *cacheSvc) Put(ctx context.Context, req *PutRequest) error {
+	// 少了任何一样都会写出一条指不到任何东西的记录：键为空的记录之后既查不到
+	// 也淘汰不掉，内容为空则直接在拷贝时崩掉。
+	if req.UpstreamID <= 0 || req.Key == "" || req.Content == nil {
+		return ErrPutIncomplete
+	}
+	if !c.usable() {
+		return ErrCacheUnavailable
+	}
+	writer, err := c.store.Create()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = writer.Close() }()
+	if _, err := io.Copy(writer, req.Content); err != nil {
+		return err
+	}
+	digest, size, err := writer.Commit()
+	if err != nil {
+		return err
+	}
+	if err := c.saveRecord(ctx, &recordInput{
+		UpstreamID:  req.UpstreamID,
+		Key:         req.Key,
+		Digest:      digest,
+		Size:        size,
+		ContentType: req.ContentType,
+		Immutable:   req.Immutable,
+		TTLSeconds:  req.TTLSeconds,
+	}); err != nil {
+		return err
+	}
+	c.enforceQuota(ctx)
+	return nil
+}
+
+func (c *cacheSvc) Search(ctx context.Context, req *SearchRequest) (*SearchResponse, error) {
+	page, size := req.Page, req.Size
+	if page <= 0 {
+		page = 1
+	}
+	if size <= 0 || size > 200 {
+		size = 20
+	}
+	list, total, err := cache_repo.CacheObject().Search(ctx, &cache_entity.SearchOption{
+		UpstreamID: req.UpstreamID,
+		Keyword:    req.Keyword,
+		Offset:     (page - 1) * size,
+		Limit:      size,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &SearchResponse{List: list, Total: total}, nil
+}
+
+func (c *cacheSvc) Purge(ctx context.Context, req *PurgeRequest) (*PurgeResponse, error) {
+	repo := cache_repo.CacheObject()
+	var objects []*cache_entity.CacheObject
+	switch {
+	case req.ID > 0:
+		object, err := repo.Find(ctx, req.ID)
+		if err != nil {
+			return nil, err
+		}
+		if object != nil {
+			objects = append(objects, object)
+		}
+	case req.UpstreamID > 0:
+		list, err := repo.ListByUpstream(ctx, req.UpstreamID)
+		if err != nil {
+			return nil, err
+		}
+		objects = list
+	default:
+		// 不给「清空一切」留一个不写参数就能触发的形态。
+		return nil, ErrPurgeTargetRequired
+	}
+	removed := int64(0)
+	for _, object := range objects {
+		if err := repo.Delete(ctx, object.ID); err != nil {
+			return nil, err
+		}
+		if c.store != nil {
+			c.removeIfUnreferenced(ctx, object.Digest)
+		}
+		removed++
+	}
+	return &PurgeResponse{Removed: removed}, nil
+}
+
+func (c *cacheSvc) Pin(ctx context.Context, req *PinRequest) error {
+	return cache_repo.CacheObject().SetPinned(ctx, req.ID, req.Pinned)
+}

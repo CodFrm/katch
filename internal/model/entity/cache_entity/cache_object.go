@@ -1,0 +1,52 @@
+// Package cache_entity 定义缓存对象的实体。
+package cache_entity
+
+// CacheObject 一条缓存记录：某个上游的某条路径对应盘上的哪一份内容。
+//
+// 记录和内容是分开的：文件本体按内容摘要存放，同一份字节只存一份，因此多条记录
+// 可能指向同一个 Digest（一个对象在两个上游各被拉过、或同一份内容有多个别名）。
+// 删记录之前必须先问「还有没有别的记录引用这份内容」，否则会把另一条记录变成
+// 指向空文件的坏缓存。
+type CacheObject struct {
+	ID         int64 `gorm:"column:id;primary_key" json:"id"`
+	UpstreamID int64 `gorm:"column:upstream_id" json:"upstream_id"`
+	// Key 上游内路径（含查询串），与 UpstreamID 一起唯一确定一个对象。
+	Key string `gorm:"column:key" json:"key"`
+	// Digest 内容摘要 sha256:<hex>，同时就是文件在缓存目录里的位置。
+	Digest string `gorm:"column:digest" json:"digest"`
+	Size   int64  `gorm:"column:size" json:"size"`
+	// ContentType 回源时的内容类型。缓存命中要和回源给出同样的响应，
+	// 少了它客户端会按别的类型解析同一份字节。
+	ContentType string `gorm:"column:content_type" json:"content_type"`
+	// Immutable 内容寻址的对象：内容永不改写，长期缓存，只由 LRU 淘汰（决策 7）。
+	Immutable bool `gorm:"column:immutable" json:"immutable"`
+	// Pinned 人工要求常驻，不参与淘汰。
+	Pinned bool `gorm:"column:pinned" json:"pinned"`
+	// ExpiresAt 可变对象的过期时刻（秒）。不可变对象是 0，表示不按时间过期。
+	ExpiresAt    int64 `gorm:"column:expires_at" json:"expires_at"`
+	LastAccessAt int64 `gorm:"column:last_access_at" json:"last_access_at"`
+	HitCount     int64 `gorm:"column:hit_count" json:"hit_count"`
+	Createtime   int64 `gorm:"column:createtime" json:"createtime"`
+	Updatetime   int64 `gorm:"column:updatetime" json:"updatetime"`
+}
+
+// Expired 判断这条记录在 now（秒）是否已经过期。
+//
+// 不可变对象永不过期（决策 7）：它的内容按摘要寻址，改不了，也就没有「过期」
+// 这回事；可变对象到点即失效，宁可多回一次源，也不能发出过期的 tag 或 InRelease。
+func (c *CacheObject) Expired(now int64) bool {
+	if c.Immutable || c.ExpiresAt == 0 {
+		return false
+	}
+	return now >= c.ExpiresAt
+}
+
+// SearchOption 缓存对象的搜索条件，供管理界面的对象搜索用。
+//
+// UpstreamID 为 0 表示不限上游，Keyword 为空表示不限路径。
+type SearchOption struct {
+	UpstreamID int64
+	Keyword    string
+	Offset     int
+	Limit      int
+}

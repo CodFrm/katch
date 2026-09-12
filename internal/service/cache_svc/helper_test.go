@@ -1,0 +1,318 @@
+package cache_svc
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"go.uber.org/mock/gomock"
+
+	"github.com/CodFrm/katch/internal/cache"
+	"github.com/CodFrm/katch/internal/model/entity/cache_entity"
+	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
+	"github.com/CodFrm/katch/internal/proxy/dispatch"
+	"github.com/CodFrm/katch/internal/repository/cache_repo"
+	mock_cache_repo "github.com/CodFrm/katch/internal/repository/cache_repo/mock"
+	"github.com/CodFrm/katch/internal/repository/upstream_repo"
+	mock_upstream_repo "github.com/CodFrm/katch/internal/repository/upstream_repo/mock"
+	"github.com/CodFrm/katch/internal/service/proxy_svc"
+)
+
+// 假源站用 httptest，不打任何真实网络；缓存记录用 mockgen 生成的 mock，
+// 但让它背一个内存表——LRU、过期、并发合并这些行为要的是「记录之间的先后」，
+// 逐次 EXPECT 断言写不出这种状态。
+
+// fakeRepo 给 mock 背的内存表。
+//
+// last_access_at 由它自己盖一个单调递增的序号，而不是用真实秒级时间戳：
+// 同一秒内写进去的几条记录在真时间戳下分不出先后，LRU 的顺序就成了掷骰子。
+type fakeRepo struct {
+	mu     sync.Mutex
+	seq    int64
+	nextID int64
+	rows   map[int64]*cache_entity.CacheObject
+	// stampAccess 为真时由内存表接管 last_access_at，见上。
+	stampAccess bool
+}
+
+func newFakeRepo(t *testing.T, stampAccess bool) *fakeRepo {
+	t.Helper()
+	f := &fakeRepo{nextID: 1, rows: map[int64]*cache_entity.CacheObject{}, stampAccess: stampAccess}
+	m := mock_cache_repo.NewMockCacheObjectRepo(gomock.NewController(t))
+	m.EXPECT().Find(gomock.Any(), gomock.Any()).AnyTimes().
+		DoAndReturn(func(_ any, id int64) (*cache_entity.CacheObject, error) {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			return clone(f.rows[id]), nil
+		})
+	m.EXPECT().FindByKey(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().
+		DoAndReturn(func(_ any, upstreamID int64, key string) (*cache_entity.CacheObject, error) {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			for _, row := range f.rows {
+				if row.UpstreamID == upstreamID && row.Key == key {
+					return clone(row), nil
+				}
+			}
+			return nil, nil
+		})
+	m.EXPECT().Save(gomock.Any(), gomock.Any()).AnyTimes().
+		DoAndReturn(func(_ any, obj *cache_entity.CacheObject) error {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if obj.ID == 0 {
+				obj.ID = f.nextID
+				f.nextID++
+			}
+			if f.stampAccess {
+				f.seq++
+				obj.LastAccessAt = f.seq
+			}
+			f.rows[obj.ID] = clone(obj)
+			return nil
+		})
+	m.EXPECT().Delete(gomock.Any(), gomock.Any()).AnyTimes().
+		DoAndReturn(func(_ any, id int64) error {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			delete(f.rows, id)
+			return nil
+		})
+	m.EXPECT().Touch(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().
+		DoAndReturn(func(_ any, id int64, at int64) error {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			row, ok := f.rows[id]
+			if !ok {
+				return nil
+			}
+			row.HitCount++
+			row.LastAccessAt = at
+			if f.stampAccess {
+				f.seq++
+				row.LastAccessAt = f.seq
+			}
+			return nil
+		})
+	m.EXPECT().SetPinned(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().
+		DoAndReturn(func(_ any, id int64, pinned bool) error {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if row, ok := f.rows[id]; ok {
+				row.Pinned = pinned
+			}
+			return nil
+		})
+	m.EXPECT().TotalSize(gomock.Any()).AnyTimes().DoAndReturn(func(_ any) (int64, error) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		total := int64(0)
+		for _, row := range f.rows {
+			total += row.Size
+		}
+		return total, nil
+	})
+	m.EXPECT().EvictCandidates(gomock.Any(), gomock.Any()).AnyTimes().
+		DoAndReturn(func(_ any, limit int) ([]*cache_entity.CacheObject, error) {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			list := make([]*cache_entity.CacheObject, 0, limit)
+			for _, row := range f.rows {
+				if row.Immutable && !row.Pinned {
+					list = append(list, clone(row))
+				}
+			}
+			sortByAccess(list)
+			if len(list) > limit {
+				list = list[:limit]
+			}
+			return list, nil
+		})
+	m.EXPECT().CountByDigest(gomock.Any(), gomock.Any()).AnyTimes().
+		DoAndReturn(func(_ any, digest string) (int64, error) {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			n := int64(0)
+			for _, row := range f.rows {
+				if row.Digest == digest {
+					n++
+				}
+			}
+			return n, nil
+		})
+	m.EXPECT().Search(gomock.Any(), gomock.Any()).AnyTimes().
+		DoAndReturn(func(_ any, opt *cache_entity.SearchOption) ([]*cache_entity.CacheObject, int64, error) {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			list := make([]*cache_entity.CacheObject, 0, len(f.rows))
+			for _, row := range f.rows {
+				if opt.UpstreamID > 0 && row.UpstreamID != opt.UpstreamID {
+					continue
+				}
+				list = append(list, clone(row))
+			}
+			sortByAccess(list)
+			return list, int64(len(list)), nil
+		})
+	m.EXPECT().ListByUpstream(gomock.Any(), gomock.Any()).AnyTimes().
+		DoAndReturn(func(_ any, upstreamID int64) ([]*cache_entity.CacheObject, error) {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			list := make([]*cache_entity.CacheObject, 0)
+			for _, row := range f.rows {
+				if row.UpstreamID == upstreamID {
+					list = append(list, clone(row))
+				}
+			}
+			return list, nil
+		})
+	cache_repo.RegisterCacheObject(m)
+	return f
+}
+
+func sortByAccess(list []*cache_entity.CacheObject) {
+	for i := 1; i < len(list); i++ {
+		for j := i; j > 0 && list[j].LastAccessAt < list[j-1].LastAccessAt; j-- {
+			list[j], list[j-1] = list[j-1], list[j]
+		}
+	}
+}
+
+func clone(src *cache_entity.CacheObject) *cache_entity.CacheObject {
+	if src == nil {
+		return nil
+	}
+	dst := *src
+	return &dst
+}
+
+func (f *fakeRepo) all() []*cache_entity.CacheObject {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	list := make([]*cache_entity.CacheObject, 0, len(f.rows))
+	for _, row := range f.rows {
+		list = append(list, clone(row))
+	}
+	sortByAccess(list)
+	return list
+}
+
+// expire 把一条可变记录的过期时刻拨到过去，免得用例真的去睡一个 TTL。
+func (f *fakeRepo) expire(key string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, row := range f.rows {
+		if row.Key == key {
+			row.ExpiresAt = time.Now().Unix() - 1
+		}
+	}
+}
+
+func (f *fakeRepo) byKey(key string) *cache_entity.CacheObject {
+	for _, row := range f.all() {
+		if row.Key == key {
+			return row
+		}
+	}
+	return nil
+}
+
+// originStub 假源站，记下被打了几次。
+type originStub struct {
+	srv  *httptest.Server
+	hits atomic.Int64
+}
+
+func newOrigin(t *testing.T, handler http.HandlerFunc) *originStub {
+	t.Helper()
+	o := &originStub{}
+	o.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		o.hits.Add(1)
+		handler(w, r)
+	}))
+	t.Cleanup(o.srv.Close)
+	return o
+}
+
+// setupSvc 装一套完整的缓存层：假源站 + 一条上游 + 内存缓存表 + 真磁盘目录。
+func setupSvc(t *testing.T, o *originStub, up *upstream_entity.Upstream, opt Options) (CacheSvc, *fakeRepo, *cache.Store) {
+	t.Helper()
+	repo := newFakeRepo(t, true)
+	upRepo := mock_upstream_repo.NewMockUpstreamRepo(gomock.NewController(t))
+	up.Origin = o.srv.URL
+	up.Enabled = true
+	// 装配形态与 main 一致：读路径走带进程内缓存的那一层。
+	upstream_repo.RegisterUpstream(proxy_svc.NewCachedUpstreamRepo(upRepo))
+	upRepo.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{up}, nil).AnyTimes()
+
+	store, err := cache.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("建缓存目录失败：%v", err)
+	}
+	return New(store, opt), repo, store
+}
+
+func staticUpstream(host string) *upstream_entity.Upstream {
+	return &upstream_entity.Upstream{
+		ID: 7, Host: host, Kind: upstream_entity.KindStatic,
+		ImmutablePatterns: upstream_entity.PatternList{"/pool/"},
+		MutableTTLSeconds: 60,
+	}
+}
+
+func target(host, path string) *proxy_svc.Target {
+	return &proxy_svc.Target{
+		Kind: dispatch.KindStatic, Host: host, Path: path,
+		Method: http.MethodGet, Header: http.Header{},
+	}
+}
+
+// truncateBlob 把盘上的副本截短，模拟「记录说有 N 字节、文件却只剩几字节」的坏副本。
+func truncateBlob(t *testing.T, store *cache.Store, repo *fakeRepo, key string, size int64) {
+	t.Helper()
+	row := repo.byKey(key)
+	if row == nil {
+		t.Fatalf("没有 %s 的缓存记录", key)
+	}
+	f, _, err := store.Open(row.Digest)
+	if err != nil {
+		t.Fatalf("打开副本失败：%v", err)
+	}
+	name := f.Name()
+	_ = f.Close()
+	if err := os.Truncate(name, size); err != nil {
+		t.Fatalf("截断副本失败：%v", err)
+	}
+}
+
+// digestOfString 用例侧算内容摘要，用来直接问磁盘「这份内容还在不在」。
+func digestOfString(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// corruptBlob 原地改写盘上的副本，但**保持字节数不变**：这类损坏躲得过大小比对，
+// 只有按内容摘要校验才认得出来。
+func corruptBlob(t *testing.T, store *cache.Store, repo *fakeRepo, key string) {
+	t.Helper()
+	row := repo.byKey(key)
+	if row == nil {
+		t.Fatalf("没有 %s 的缓存记录", key)
+	}
+	f, size, err := store.Open(row.Digest)
+	if err != nil {
+		t.Fatalf("打开副本失败：%v", err)
+	}
+	name := f.Name()
+	_ = f.Close()
+	if err := os.WriteFile(name, []byte(strings.Repeat("X", int(size))), 0o600); err != nil {
+		t.Fatalf("改写副本失败：%v", err)
+	}
+}
