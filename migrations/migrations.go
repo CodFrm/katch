@@ -12,6 +12,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/CodFrm/katch/internal/model/entity/cache_entity"
+	"github.com/CodFrm/katch/internal/model/entity/rollup_entity"
 	"github.com/CodFrm/katch/internal/model/entity/setting_entity"
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
 )
@@ -21,6 +22,7 @@ func migrationList() []*gormigrate.Migration {
 	return []*gormigrate.Migration{
 		upstreamAndSetting(),
 		cacheObject(),
+		trafficRollup(),
 	}
 }
 
@@ -184,6 +186,63 @@ func cacheObject() *gormigrate.Migration {
 		},
 		Rollback: func(tx *gorm.DB) error {
 			table, err := tableName(tx, &cache_entity.CacheObject{})
+			if err != nil {
+				return err
+			}
+			return tx.Exec(fmt.Sprintf("DROP TABLE IF EXISTS `%s`", table)).Error
+		},
+	}
+}
+
+// trafficRollup 建流量分钟桶表。
+//
+// 界面上的请求量、命中率、省下的流量都从这张表聚合（决策 16）：每请求写一次库
+// 会把拉取热路径拖进事务，而进程内计数器一重启就没了。折中是每分钟落一行，
+// 保留 90 天。
+func trafficRollup() *gormigrate.Migration {
+	return &gormigrate.Migration{
+		ID: "20260912000003_traffic_rollup",
+		Migrate: func(tx *gorm.DB) error {
+			table, err := tableName(tx, &rollup_entity.TrafficRollup{})
+			if err != nil {
+				return err
+			}
+			autoPK := "BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY"
+			if tx.Name() == "sqlite" {
+				autoPK = "INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT"
+			}
+			stmts := []string{
+				// 没有 misses 列：未命中数是 requests 减去其余三项。多存一列，
+				// 就多一处会和总数对不上的地方（可观测性一节：比值与冗余量都由
+				// 读取方推导）。
+				fmt.Sprintf("CREATE TABLE `%s` ("+
+					"`id` %s,"+
+					"`upstream_id` BIGINT NOT NULL DEFAULT 0,"+
+					"`bucket` BIGINT NOT NULL DEFAULT 0,"+
+					"`requests` BIGINT NOT NULL DEFAULT 0,"+
+					"`hits` BIGINT NOT NULL DEFAULT 0,"+
+					"`denied` BIGINT NOT NULL DEFAULT 0,"+
+					"`origin_errors` BIGINT NOT NULL DEFAULT 0,"+
+					"`bytes_served` BIGINT NOT NULL DEFAULT 0,"+
+					"`bytes_origin` BIGINT NOT NULL DEFAULT 0,"+
+					"`createtime` BIGINT NOT NULL DEFAULT 0,"+
+					"`updatetime` BIGINT NOT NULL DEFAULT 0)", table, autoPK),
+				// 一个上游的一整分钟只能有一行：落库是「读出来加上去再写回」，
+				// 同一分钟落两次要落到同一行上，唯一索引是最后一道闸。
+				fmt.Sprintf("CREATE UNIQUE INDEX `idx_%s_upstream_bucket` ON `%s` (`upstream_id`, `bucket`)",
+					table, table),
+				// 区间聚合与保留期裁剪都只按 bucket 过滤，跨全部上游。
+				fmt.Sprintf("CREATE INDEX `idx_%s_bucket` ON `%s` (`bucket`)", table, table),
+			}
+			for _, stmt := range stmts {
+				if err := tx.Exec(stmt).Error; err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			table, err := tableName(tx, &rollup_entity.TrafficRollup{})
 			if err != nil {
 				return err
 			}

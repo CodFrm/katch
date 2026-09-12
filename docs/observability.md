@@ -75,6 +75,63 @@ exporter 创建两次、双双注册进 prometheus 的默认 registry，于是 `
 指标命名沿用 Prometheus 惯例：`katch_<子系统>_<名称>_<单位>`，
 计数器以 `_total` 结尾。
 
+### 拉取路径的指标
+
+`internal/metrics` 把 katch 自己的指标注册进 **prometheus 的默认 registry**——
+`component.Core()` 暴露的 `/metrics` 就是从那里收集的，另起一个 registry 的指标
+在那个端点上根本看不见。
+
+| 指标 | 标签 | 含义 |
+| --- | --- | --- |
+| `katch_requests_total` | `upstream`、`kind`、`result` | 拉取请求数。`result` ∈ `hit` / `miss` / `denied` / `origin_error` |
+| `katch_request_duration_seconds` | `upstream`、`kind` | 拉取耗时直方图 |
+| `katch_bytes_served_total` | `upstream`、`source` | 发给客户端的字节数，`source` ∈ `cache` / `origin` |
+| `katch_origin_backoff` | `upstream` | 上游是否处于回源退避（降级）状态 |
+
+计数发生在一个 gin 中间件里，它排在 SPA 与拉取共用的 NoRoute 之前，按响应本身
+判定结果：502 是回源失败、403 是规则拒绝、带 `X-Katch-Cache: HIT` 的是命中、
+其余算回源取回（包括上游自己的 404——那是上游对这个对象的判断，不是 katch 拒绝了谁）。
+好处是埋点只有一处，不必在缓存层和代理层各插一次。
+
+`upstream` 标签只取**上游表里有的**主机名，其余一律折叠成 `unknown`：拉取路径是
+公开的，把请求里的主机名原样当标签，等于给任何人开了一条不需要密码的时间序列
+放大路径。
+
+**不导出命中率这类比值。** 它由 `hit / (hit + miss)` 推导，导出成 gauge 只会在
+采样窗口不一致时给出两个互相矛盾的数字。界面上的命中率同样是推导值，
+`traffic_rollup` 里也没有 `misses` 列——它是 `requests` 减去其余三项。
+
+以下指标在 spec 的可观测性一节里列出，但它们的埋点在别的缝上（回源客户端、
+缓存淘汰、规则求值、token 交换），由对应的任务补齐，这里不先占名字：
+`katch_origin_requests_total`、`katch_origin_duration_seconds`、
+`katch_origin_inflight`、`katch_cache_objects`、`katch_cache_bytes`、
+`katch_cache_evictions_total`、`katch_cache_integrity_failures_total`、
+`katch_rule_decisions_total`、`katch_token_exchanges_total`。
+
+### 界面上的统计不走 Prometheus
+
+`/metrics` 是给外部采集用的标准端点；界面上的请求量、命中率、省下的流量来自
+**同一批进程内计数器**的分钟级快照（决策 16）：`stat_svc` 每分钟把计数器取走一次，
+按上游累加成 `traffic_rollup` 的一行，保留 90 天，24 小时 / 7 天 / 30 天都从这张表
+聚合。一个自部署的镜像站不该为了看自己的命中率就要先搭一套监控，而每请求写一次库
+会把拉取热路径拖进事务。
+
+- 公开：`GET /api/v1/stats/overview?range=24h`，只给全站合计；
+- 要密钥：`GET /api/v1/admin/stats/upstreams?range=24h`，按上游一行，附带降级标记。
+
+### 上游降级
+
+`internal/proxy/backoff` 按上游记连续的回源失败，达到阈值后进入指数退避。状态
+**只在内存里**（决策 17）：退避说的是「此刻」，落库只会把一段早已过期的状态带到
+下一个进程。它同时出现在 `katch_origin_backoff` 和上面那个管理接口的 `degraded`
+字段上。
+
+计数中间件只负责把回源的成败喂给它（命中不算——命中根本没碰上游，拿它当恢复的
+证据会让一个还在挂的上游刚出退避就被全量打回去）。**`Tracker.Allow` 这道快速失败
+的闸还没有接到拉取路径上**：它该问在回源那一步（`proxy_svc.Fetch` 里调
+`origin.Do` 之前），接在更外层的中间件上会连缓存命中一起拒掉——上游挂了还能把
+缓存发出去，正是这个镜像站存在的理由。
+
 ## Traces
 
 暂未接入。cago 的 trace 组件需要配置文件里有 `trace` 段，缺失时直接注册会让服务

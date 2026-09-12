@@ -7,6 +7,7 @@ require (
 	github.com/cago-frame/cago v0.0.0-20260904093313-91f5dd45559c
 	github.com/gin-gonic/gin v1.12.0
 	github.com/go-gormigrate/gormigrate/v2 v2.1.6
+	github.com/prometheus/client_golang v1.23.2
 	github.com/smartystreets/goconvey v1.8.1
 	go.uber.org/mock v0.6.0
 	go.uber.org/zap v1.28.0
@@ -87,7 +88,6 @@ require (
 	github.com/paulmach/orb v0.13.0 // indirect
 	github.com/pelletier/go-toml/v2 v2.4.3 // indirect
 	github.com/pierrec/lz4/v4 v4.1.27 // indirect
-	github.com/prometheus/client_golang v1.23.2 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.70.0 // indirect
 	github.com/prometheus/otlptranslator v1.0.0 // indirect

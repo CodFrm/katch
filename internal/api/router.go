@@ -8,6 +8,7 @@ import (
 	"github.com/cago-frame/cago/server/mux"
 	"github.com/gin-gonic/gin"
 
+	"github.com/CodFrm/katch/internal/controller/stat_ctr"
 	"github.com/CodFrm/katch/internal/controller/system_ctr"
 	"github.com/CodFrm/katch/internal/controller/upstream_ctr"
 	"github.com/CodFrm/katch/internal/service/setting_svc"
@@ -25,12 +26,16 @@ func Router(_ context.Context, root *mux.Router) error {
 	r := root.Group("/api/v1")
 
 	sysCtr := system_ctr.NewSystem()
-	r.Group("/").Bind(sysCtr.Version)
+	statCtr := stat_ctr.NewStat()
+	// 站点总览是公开的：首页要展示这个镜像站替使用者省下了多少流量，
+	// 它只给全站合计，不暴露单条路径、单个调用方或单个上游的量。
+	r.Group("/").Bind(sysCtr.Version, statCtr.Overview)
 
 	// /api/v1/admin/* 一律要密钥；拉取路径与其余公开接口不经过这个中间件。
 	adminGroup := r.Group("/", requireAdminKey)
 	upstreamCtr := upstream_ctr.NewUpstream()
 	adminGroup.Bind(upstreamCtr.List, upstreamCtr.Save, upstreamCtr.Delete)
+	adminGroup.Bind(statCtr.ByUpstream)
 
 	return nil
 }

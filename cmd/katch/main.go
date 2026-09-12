@@ -14,6 +14,7 @@ import (
 	// 这个驱动是纯 Go 的 modernc.org/sqlite，不引入 cgo。
 	_ "github.com/cago-frame/cago/database/db/sqlite"
 	"github.com/cago-frame/cago/pkg/component"
+	"github.com/cago-frame/cago/pkg/gogo"
 	"github.com/cago-frame/cago/pkg/logger"
 	"github.com/cago-frame/cago/server/mux"
 	"go.uber.org/zap"
@@ -22,12 +23,17 @@ import (
 	"github.com/CodFrm/katch/internal/bootstrap"
 	"github.com/CodFrm/katch/internal/buildinfo"
 	"github.com/CodFrm/katch/internal/cache"
+	"github.com/CodFrm/katch/internal/metrics"
+	"github.com/CodFrm/katch/internal/proxy/backoff"
 	"github.com/CodFrm/katch/internal/repository/cache_repo"
+	"github.com/CodFrm/katch/internal/repository/rollup_repo"
 	"github.com/CodFrm/katch/internal/repository/setting_repo"
 	"github.com/CodFrm/katch/internal/repository/upstream_repo"
 	"github.com/CodFrm/katch/internal/service/cache_svc"
 	"github.com/CodFrm/katch/internal/service/proxy_svc"
 	"github.com/CodFrm/katch/internal/service/setting_svc"
+	"github.com/CodFrm/katch/internal/service/stat_svc"
+	"github.com/CodFrm/katch/internal/service/upstream_svc"
 	"github.com/CodFrm/katch/internal/web"
 	"github.com/CodFrm/katch/migrations"
 )
@@ -58,6 +64,10 @@ func main() {
 
 	configPath := flag.String("config", "./configs/config.yaml", "配置文件路径")
 	flag.Parse()
+
+	// 上游退避状态，进程内唯一一份（决策 17，不落库）：计数中间件往里喂回源的
+	// 成败，管理接口从里面读出「这个上游正在降级」。
+	backoffTracker := backoff.New(backoff.Options{})
 
 	ctx := context.Background()
 	// 自己装配配置源，而不是让 cago 用默认的文件源：默认那个在读到配置里没写的
@@ -90,6 +100,7 @@ func main() {
 			upstream_repo.RegisterUpstream(proxy_svc.NewCachedUpstreamRepo(upstream_repo.NewUpstream()))
 			setting_repo.RegisterSetting(setting_repo.NewSetting())
 			cache_repo.RegisterCacheObject(cache_repo.NewCacheObject())
+			rollup_repo.RegisterTrafficRollup(rollup_repo.NewTrafficRollup())
 			admin := adminConfig{}
 			has, err := cfg.Has(ctx, "admin")
 			if err != nil {
@@ -128,6 +139,27 @@ func main() {
 			}
 			cache_svc.Register(cache_svc.New(store, cache_svc.Options{}))
 			return nil
+		})).
+		// 统计：拉取路径的计数中间件 + 每分钟把进程内计数器落成分钟桶。
+		// 必须排在仓储装配之后（要写 traffic_rollup），也必须排在 mux 之前
+		// （它注册的是 gin 中间件）。
+		Registry(cago.FuncComponent(func(ctx context.Context, _ *configs.Config) error {
+			stat_svc.Register(stat_svc.New(stat_svc.Options{Degraded: backoffTracker}))
+			gogo.Go(func() error {
+				// ctx 由框架在停止时取消，这个循环随之退出并补落最后一批计数。
+				stat_svc.Stat().Run(ctx)
+				return nil
+			})
+			return nil
+		})).
+		Registry(metrics.Mount(metrics.Hooks{
+			Gate: backoffTracker,
+			// 只用来判定「这个主机名该不该有自己的标签」，不是白名单那道闸——
+			// 判定仍然只有 proxy_svc 一个出处。
+			Lookup: func(ctx context.Context, host string) bool {
+				upstream, err := upstream_svc.Upstream().FindByHost(ctx, host)
+				return err == nil && upstream != nil
+			},
 		})).
 		// SPA 与拉取路径共用这一个 NoRoute，必须挂在 mux 之前：它注册的是 gin 的
 		// NoRoute，而 mux.HTTP 一旦启动就不再接受新的中间件注册。
