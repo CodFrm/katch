@@ -2,6 +2,7 @@ package setting_svc
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
 
@@ -106,6 +107,56 @@ func TestVerifyAdminKey(t *testing.T) {
 			status, c := statusAndCode(t, Setting().VerifyAdminKey(ctx, "anything"))
 			convey.So(status, convey.ShouldEqual, http.StatusUnauthorized)
 			convey.So(c, convey.ShouldEqual, code.AdminKeyNotInitialized)
+		})
+	})
+}
+
+// TestPublicHomepage 覆盖「是否公开上游列表与命中率由设置控制」：
+// 默认是公开的——一台镜像站默认就该答得出自己代理了什么。
+func TestPublicHomepage(t *testing.T) {
+	convey.Convey("首页是否公开", t, func() {
+		repo := setupSettingTest(t)
+		ctx := context.Background()
+
+		convey.Convey("库里没有这个键时默认公开", func() {
+			// 默认值只能是公开：默认私有会让一台刚装好的镜像站首页空着，
+			// 而部署者根本不知道有个开关需要打开。
+			repo.EXPECT().Find(gomock.Any(), PublicHomepageSetting).Return(nil, nil)
+			public, err := Setting().PublicHomepage(ctx)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(public, convey.ShouldBeTrue)
+		})
+
+		convey.Convey("值为 false 时不公开", func() {
+			repo.EXPECT().Find(gomock.Any(), PublicHomepageSetting).Return(
+				&setting_entity.Setting{Key: PublicHomepageSetting, Value: "false"}, nil)
+			public, err := Setting().PublicHomepage(ctx)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(public, convey.ShouldBeFalse)
+		})
+
+		convey.Convey("值为 true 时公开", func() {
+			repo.EXPECT().Find(gomock.Any(), PublicHomepageSetting).Return(
+				&setting_entity.Setting{Key: PublicHomepageSetting, Value: "true"}, nil)
+			public, err := Setting().PublicHomepage(ctx)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(public, convey.ShouldBeTrue)
+		})
+
+		convey.Convey("值是读不懂的内容时按公开处理", func() {
+			// 存坏了的一行不该悄悄把首页关掉：那看起来会像是功能丢了，
+			// 而不是像一处配置错误。
+			repo.EXPECT().Find(gomock.Any(), PublicHomepageSetting).Return(
+				&setting_entity.Setting{Key: PublicHomepageSetting, Value: "yes"}, nil)
+			public, err := Setting().PublicHomepage(ctx)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(public, convey.ShouldBeTrue)
+		})
+
+		convey.Convey("读库失败时把错误交出去，而不是替调用方猜", func() {
+			repo.EXPECT().Find(gomock.Any(), PublicHomepageSetting).Return(nil, errors.New("库挂了"))
+			_, err := Setting().PublicHomepage(ctx)
+			convey.So(err, convey.ShouldNotBeNil)
 		})
 	})
 }

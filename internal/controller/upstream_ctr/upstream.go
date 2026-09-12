@@ -5,6 +5,7 @@ import (
 	"context"
 
 	"github.com/CodFrm/katch/internal/api/admin"
+	api_upstream "github.com/CodFrm/katch/internal/api/upstream"
 	"github.com/CodFrm/katch/internal/service/upstream_svc"
 )
 
@@ -19,6 +20,12 @@ func NewUpstream() *Upstream {
 // List 列出全部上游。
 func (u *Upstream) List(ctx context.Context, req *admin.ListUpstreamsRequest) (*admin.ListUpstreamsResponse, error) {
 	return upstream_svc.Upstream().List(ctx, req)
+}
+
+// PublicList 列出公开的上游。不要密钥，是否可见由「公开首页」设置决定，
+// 那道闸在路由层，见 internal/api/router.go。
+func (u *Upstream) PublicList(ctx context.Context, req *api_upstream.ListRequest) (*api_upstream.ListResponse, error) {
+	return upstream_svc.Upstream().PublicList(ctx, req)
 }
 
 // Save 新增或更新一条上游。

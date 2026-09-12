@@ -4,6 +4,7 @@ package upstream_ctr_test
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -29,7 +30,7 @@ import (
 const adminKey = "correct-admin-key"
 
 // setupAdminTest 装配一套「repo 是 mock、路由与中间件是生产那套」的测试环境。
-func setupAdminTest(t *testing.T) (*mock_upstream_repo.MockUpstreamRepo, *muxtest.TestMux, *gin.Engine) {
+func setupAdminTest(t *testing.T) (*mock_upstream_repo.MockUpstreamRepo, *mock_setting_repo.MockSettingRepo, *muxtest.TestMux, *gin.Engine) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	ctrl := gomock.NewController(t)
@@ -54,7 +55,7 @@ func setupAdminTest(t *testing.T) (*mock_upstream_repo.MockUpstreamRepo, *muxtes
 	if !ok {
 		t.Fatal("muxtest 的 IRouter 不再是 *gin.Engine")
 	}
-	return upRepo, testMux, engine
+	return upRepo, setRepo, testMux, engine
 }
 
 func adminHeader(key string) muxclient.ClientDoOption {
@@ -64,7 +65,7 @@ func adminHeader(key string) muxclient.ClientDoOption {
 // TestUpstreamSaveAndList 覆盖任务目标 (a)：带正确密钥创建的上游能被 GET 读回，
 // 且每个字段都原样穿过 controller → service → repository 的映射。
 func TestUpstreamSaveAndList(t *testing.T) {
-	upRepo, testMux, _ := setupAdminTest(t)
+	upRepo, _, testMux, _ := setupAdminTest(t)
 	convey.Convey("带正确密钥创建的上游能被列表读到", t, func() {
 		var stored *upstream_entity.Upstream
 		upRepo.EXPECT().FindByHost(gomock.Any(), "deb.debian.org").Return(nil, nil)
@@ -113,7 +114,7 @@ func TestUpstreamSaveAndList(t *testing.T) {
 // 否则探测者能靠响应差异确认「这个密钥名对了、只是值不对」。
 // upRepo 上一个 EXPECT 都没有：一旦鉴权放行进 service，mock 会当场让用例失败。
 func TestUpstreamAdminAuth(t *testing.T) {
-	_, testMux, engine := setupAdminTest(t)
+	_, _, testMux, engine := setupAdminTest(t)
 	convey.Convey("管理接口的密钥校验", t, func() {
 		do := func(header http.Header) *httptest.ResponseRecorder {
 			opts := []muxclient.ClientDoOption{}
@@ -150,7 +151,7 @@ func TestUpstreamAdminAuth(t *testing.T) {
 // TestUpstreamSaveDuplicateHost host 是白名单的 key，重复注册必须被挡住，
 // 否则同一个 host 会有两条记录，分发时命中哪条取决于查询顺序。
 func TestUpstreamSaveDuplicateHost(t *testing.T) {
-	upRepo, testMux, _ := setupAdminTest(t)
+	upRepo, _, testMux, _ := setupAdminTest(t)
 	convey.Convey("host 已存在时拒绝创建", t, func() {
 		upRepo.EXPECT().FindByHost(gomock.Any(), "docker.io").Return(
 			&upstream_entity.Upstream{ID: 3, Host: "docker.io"}, nil)
@@ -163,7 +164,7 @@ func TestUpstreamSaveDuplicateHost(t *testing.T) {
 
 // TestUpstreamDelete 删除走的是 id，且不存在的 id 不能被当作删除成功。
 func TestUpstreamDelete(t *testing.T) {
-	upRepo, testMux, _ := setupAdminTest(t)
+	upRepo, _, testMux, _ := setupAdminTest(t)
 	convey.Convey("删除上游", t, func() {
 		convey.Convey("存在时删除成功", func() {
 			upRepo.EXPECT().Find(gomock.Any(), int64(7)).Return(&upstream_entity.Upstream{ID: 7}, nil)
@@ -175,6 +176,93 @@ func TestUpstreamDelete(t *testing.T) {
 			upRepo.EXPECT().Find(gomock.Any(), int64(404)).Return(nil, nil)
 			convey.So(testMux.Do(context.Background(), &admin.DeleteUpstreamRequest{ID: 404},
 				&admin.DeleteUpstreamResponse{}, adminHeader(adminKey)), convey.ShouldNotBeNil)
+		})
+	})
+}
+
+// TestPublicUpstreamList 覆盖「首页要答得出支持哪些上游」：这个列表不要密钥，
+// 但它是站点名片而不是运维台账——回源地址、默认策略、不可变模式都是运营数据，
+// 泄漏出去等于把这台镜像站的内部配置摊开给任何人。
+func TestPublicUpstreamList(t *testing.T) {
+	upRepo, setRepo, _, engine := setupAdminTest(t)
+	convey.Convey("匿名请求公开上游列表", t, func() {
+		setRepo.EXPECT().Find(gomock.Any(), setting_svc.PublicHomepageSetting).Return(nil, nil)
+		upRepo.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{
+			{
+				ID: 7, Host: "deb.debian.org", Kind: "static", Origin: "https://deb.debian.org",
+				Enabled: true, ImmutablePatterns: upstream_entity.PatternList{"pool/"},
+				MutableTTLSeconds: 300, DefaultPolicy: "deny_unless_matched", Note: "内部备注",
+			},
+			{
+				ID: 8, Host: "docker.io", Kind: "registry", Origin: "https://registry-1.docker.io",
+				Enabled: true, LibraryCompletion: true,
+			},
+			{ID: 9, Host: "paused.example.com", Kind: "static", Origin: "https://paused.example.com"},
+		}, nil)
+
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/upstreams", nil))
+		convey.So(w.Code, convey.ShouldEqual, http.StatusOK)
+
+		var resp struct {
+			Data struct {
+				List []map[string]any `json:"list"`
+			} `json:"data"`
+		}
+		convey.So(json.Unmarshal(w.Body.Bytes(), &resp), convey.ShouldBeNil)
+
+		convey.Convey("只列启用中的上游", func() {
+			convey.So(len(resp.Data.List), convey.ShouldEqual, 2)
+			convey.So(resp.Data.List[0]["host"], convey.ShouldEqual, "deb.debian.org")
+			convey.So(resp.Data.List[0]["kind"], convey.ShouldEqual, "static")
+			convey.So(resp.Data.List[1]["host"], convey.ShouldEqual, "docker.io")
+			convey.So(resp.Data.List[1]["library_completion"], convey.ShouldBeTrue)
+			convey.So(w.Body.String(), convey.ShouldNotContainSubstring, "paused.example.com")
+		})
+
+		convey.Convey("运营字段一个都不出现在响应里", func() {
+			// 断在整个响应体上而不是逐个字段比对：日后谁往这个结构上加一个
+			// origin/default_policy/immutable_patterns 字段，这里就会红。
+			body := w.Body.String()
+			convey.So(body, convey.ShouldNotContainSubstring, "origin")
+			convey.So(body, convey.ShouldNotContainSubstring, "default_policy")
+			convey.So(body, convey.ShouldNotContainSubstring, "immutable_patterns")
+			convey.So(body, convey.ShouldNotContainSubstring, "内部备注")
+		})
+	})
+}
+
+// TestPublicUpstreamListHidden 覆盖「是否公开上游列表由设置控制」：关掉之后
+// 匿名调用方看不到这个端点，而带管理密钥的调用方照常读得到。
+func TestPublicUpstreamListHidden(t *testing.T) {
+	convey.Convey("关掉公开首页之后的上游列表", t, func() {
+		convey.Convey("匿名请求看不到这个端点", func() {
+			// 上游 repo 上一个 EXPECT 都没有：闸一旦漏放行进 service，mock 会当场失败。
+			_, setRepo, _, engine := setupAdminTest(t)
+			setRepo.EXPECT().Find(gomock.Any(), setting_svc.PublicHomepageSetting).Return(
+				&setting_entity.Setting{Key: setting_svc.PublicHomepageSetting, Value: "false"}, nil)
+
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/upstreams", nil))
+			// 404 而不是 401：401 等于承认这个端点存在，而这道开关要的正是
+			// 「这台站点看起来不提供这个信息」。
+			convey.So(w.Code, convey.ShouldEqual, http.StatusNotFound)
+		})
+
+		convey.Convey("带管理密钥仍然读得到", func() {
+			upRepo, setRepo, _, engine := setupAdminTest(t)
+			setRepo.EXPECT().Find(gomock.Any(), setting_svc.PublicHomepageSetting).Return(
+				&setting_entity.Setting{Key: setting_svc.PublicHomepageSetting, Value: "false"}, nil)
+			upRepo.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{
+				{ID: 7, Host: "deb.debian.org", Kind: "static", Enabled: true},
+			}, nil)
+
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/upstreams", nil)
+			req.Header.Set("Authorization", "Bearer "+adminKey)
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, req)
+			convey.So(w.Code, convey.ShouldEqual, http.StatusOK)
+			convey.So(w.Body.String(), convey.ShouldContainSubstring, "deb.debian.org")
 		})
 	})
 }

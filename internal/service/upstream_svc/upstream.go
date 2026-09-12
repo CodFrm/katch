@@ -8,6 +8,7 @@ import (
 	"github.com/cago-frame/cago/pkg/i18n"
 
 	"github.com/CodFrm/katch/internal/api/admin"
+	api_upstream "github.com/CodFrm/katch/internal/api/upstream"
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
 	"github.com/CodFrm/katch/internal/pkg/code"
 	"github.com/CodFrm/katch/internal/repository/upstream_repo"
@@ -19,6 +20,9 @@ type UpstreamSvc interface {
 	// 调用方无需再自己看 Enabled——「停用」和「没有这条记录」对外必须是同一件事。
 	FindByHost(ctx context.Context, host string) (*upstream_entity.Upstream, error)
 	List(ctx context.Context, req *admin.ListUpstreamsRequest) (*admin.ListUpstreamsResponse, error)
+	// PublicList 供首页用：只给启用中的上游，且只给站点名片级的字段。
+	// 过滤放在业务层而不是交给调用方：让每个调用方各筛一次，迟早有一个忘了筛。
+	PublicList(ctx context.Context, req *api_upstream.ListRequest) (*api_upstream.ListResponse, error)
 	Save(ctx context.Context, req *admin.SaveUpstreamRequest) (*admin.SaveUpstreamResponse, error)
 	Delete(ctx context.Context, req *admin.DeleteUpstreamRequest) (*admin.DeleteUpstreamResponse, error)
 }
@@ -51,6 +55,25 @@ func (u *upstreamSvc) List(ctx context.Context, _ *admin.ListUpstreamsRequest) (
 	resp := &admin.ListUpstreamsResponse{List: make([]*admin.UpstreamItem, 0, len(list))}
 	for _, v := range list {
 		resp.List = append(resp.List, toItem(v))
+	}
+	return resp, nil
+}
+
+func (u *upstreamSvc) PublicList(ctx context.Context, _ *api_upstream.ListRequest) (*api_upstream.ListResponse, error) {
+	list, err := upstream_repo.Upstream().List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	resp := &api_upstream.ListResponse{List: make([]*api_upstream.Item, 0, len(list))}
+	for _, v := range list {
+		if !v.Enabled {
+			continue
+		}
+		resp.List = append(resp.List, &api_upstream.Item{
+			Host:              v.Host,
+			Kind:              v.Kind,
+			LibraryCompletion: v.LibraryCompletion,
+		})
 	}
 	return resp, nil
 }

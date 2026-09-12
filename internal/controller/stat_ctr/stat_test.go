@@ -40,6 +40,7 @@ const testNow = int64(1700000000)
 type statEnv struct {
 	rollup   *mock_rollup_repo.MockTrafficRollupRepo
 	upstream *mock_upstream_repo.MockUpstreamRepo
+	setting  *mock_setting_repo.MockSettingRepo
 	mux      *muxtest.TestMux
 	engine   *gin.Engine
 }
@@ -56,6 +57,7 @@ func setupStatTest(t *testing.T, degraded stat_svc.DegradeReporter) *statEnv {
 	upstream_repo.RegisterUpstream(env.upstream)
 	setRepo := mock_setting_repo.NewMockSettingRepo(ctrl)
 	setting_repo.RegisterSetting(setRepo)
+	env.setting = setRepo
 	hash, err := bcrypt.GenerateFromPassword([]byte(adminKey), bcrypt.MinCost)
 	if err != nil {
 		t.Fatal(err)
@@ -84,6 +86,7 @@ func setupStatTest(t *testing.T, degraded stat_svc.DegradeReporter) *statEnv {
 func TestStatOverviewIsPublic(t *testing.T) {
 	env := setupStatTest(t, nil)
 	convey.Convey("不带密钥也能查到 24 小时总览", t, func() {
+		env.setting.EXPECT().Find(gomock.Any(), setting_svc.PublicHomepageSetting).Return(nil, nil)
 		env.rollup.EXPECT().Sum(gomock.Any(), testNow-24*3600, testNow).
 			Return(&rollup_entity.Totals{
 				Requests: 100, Hits: 60, Denied: 5, OriginErrors: 3,
@@ -146,5 +149,37 @@ func TestStatByUpstreamDegraded(t *testing.T) {
 		convey.So(resp.List[0].Degraded, convey.ShouldBeTrue)
 		convey.So(resp.List[0].RetryAt, convey.ShouldEqual, testNow+30)
 		convey.So(resp.List[1].Degraded, convey.ShouldBeFalse)
+	})
+}
+
+// TestStatOverviewHidden 覆盖「是否公开命中率由设置控制」：和上游列表同一道闸，
+// 关掉之后匿名调用方看不到总览，带管理密钥的调用方照常读得到。
+func TestStatOverviewHidden(t *testing.T) {
+	convey.Convey("关掉公开首页之后的站点总览", t, func() {
+		convey.Convey("匿名请求看不到这个端点", func() {
+			env := setupStatTest(t, nil)
+			// rollup 上一个 EXPECT 都没有：闸一旦漏放行进 service，mock 会当场失败。
+			env.setting.EXPECT().Find(gomock.Any(), setting_svc.PublicHomepageSetting).Return(
+				&setting_entity.Setting{Key: setting_svc.PublicHomepageSetting, Value: "false"}, nil)
+
+			w := httptest.NewRecorder()
+			env.engine.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/stats/overview", nil))
+			convey.So(w.Code, convey.ShouldEqual, http.StatusNotFound)
+		})
+
+		convey.Convey("带管理密钥仍然读得到", func() {
+			env := setupStatTest(t, nil)
+			env.setting.EXPECT().Find(gomock.Any(), setting_svc.PublicHomepageSetting).Return(
+				&setting_entity.Setting{Key: setting_svc.PublicHomepageSetting, Value: "false"}, nil)
+			env.rollup.EXPECT().Sum(gomock.Any(), testNow-24*3600, testNow).
+				Return(&rollup_entity.Totals{Requests: 100, Hits: 60}, nil)
+
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/stats/overview", nil)
+			req.Header.Set("Authorization", "Bearer "+adminKey)
+			w := httptest.NewRecorder()
+			env.engine.ServeHTTP(w, req)
+			convey.So(w.Code, convey.ShouldEqual, http.StatusOK)
+			convey.So(w.Body.String(), convey.ShouldContainSubstring, `"requests":100`)
+		})
 	})
 }
