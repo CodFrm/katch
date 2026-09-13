@@ -5,6 +5,8 @@ package upstream_ctr_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -28,6 +30,8 @@ import (
 	mock_cache_repo "github.com/CodFrm/katch/internal/repository/cache_repo/mock"
 	"github.com/CodFrm/katch/internal/repository/rollup_repo"
 	mock_rollup_repo "github.com/CodFrm/katch/internal/repository/rollup_repo/mock"
+	"github.com/CodFrm/katch/internal/repository/rule_repo"
+	mock_rule_repo "github.com/CodFrm/katch/internal/repository/rule_repo/mock"
 	"github.com/CodFrm/katch/internal/repository/setting_repo"
 	mock_setting_repo "github.com/CodFrm/katch/internal/repository/setting_repo/mock"
 	"github.com/CodFrm/katch/internal/repository/upstream_repo"
@@ -57,6 +61,11 @@ func setupTest(t *testing.T, degraded stat_svc.DegradeReporter) (
 	ctrl := gomock.NewController(t)
 	upRepo := mock_upstream_repo.NewMockUpstreamRepo(ctrl)
 	upstream_repo.RegisterUpstream(upRepo)
+	// 删除上游会连带删掉它名下的规则，所以这条路径也要把规则仓储换成 mock，
+	// 否则删除用例会穿到真库上去。级联本身在 upstream_svc 的用例里断言。
+	ruleRepo := mock_rule_repo.NewMockAccessRuleRepo(ctrl)
+	ruleRepo.EXPECT().DeleteByUpstream(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+	rule_repo.RegisterAccessRule(ruleRepo)
 	public := &publicDeps{
 		rollup: mock_rollup_repo.NewMockTrafficRollupRepo(ctrl),
 		cache:  mock_cache_repo.NewMockCacheObjectRepo(ctrl),
@@ -336,6 +345,61 @@ func TestPublicUpstreamListHidden(t *testing.T) {
 			convey.So(w.Body.String(), convey.ShouldContainSubstring, `"hit_rate":0.75`)
 			convey.So(w.Body.String(), convey.ShouldContainSubstring, `"status":"normal"`)
 			convey.So(w.Body.String(), convey.ShouldContainSubstring, `"cache_bytes":512`)
+		})
+	})
+}
+
+// adminDo 拿管理密钥打一次原始 HTTP 请求。
+//
+// 这一组用例断的是状态码本身，而 muxtest.Do 只把非 2xx 翻成一个 error，看不见
+// 是 500 还是 503——要分辨这两者只能走 engine。
+func adminDo(engine *gin.Engine, method, path string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, nil)
+	req.Header.Set("Authorization", "Bearer "+adminKey)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+	return w
+}
+
+// TestAdminStorageUnavailable 覆盖「失败与降级」那条：数据库不可用时管理接口
+// 返回 503。
+//
+// 503 和 500 不是同一句话：503 告诉运维（以及前面的反向代理和监控）「存储临时
+// 挂了，待会儿再来」，500 说的却是「katch 自己坏了」。规格把这条和「拉取不该因为
+// 管理面的存储故障而中断」写在一起，正是要让这台站点在库挂掉时仍然是「只有后台
+// 暂时用不了」的样子。
+//
+// 后两支是这道映射的边界：它只认存储故障，不是把管理接口的 5xx 一律改写成 503。
+func TestAdminStorageUnavailable(t *testing.T) {
+	convey.Convey("管理接口遇到错误", t, func() {
+		convey.Convey("数据库连不上时返回 503", func() {
+			upRepo, _, _, engine := setupAdminTest(t)
+			// 这是 MySQL 挂掉时 gorm 一路透上来的那种错误：拨号失败。
+			upRepo.EXPECT().List(gomock.Any()).Return(nil, &net.OpError{
+				Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused"),
+			})
+
+			w := adminDo(engine, http.MethodGet, "/api/v1/admin/upstreams")
+			convey.So(w.Code, convey.ShouldEqual, http.StatusServiceUnavailable)
+			// 不是那句兜底的「系统错误」：这次是一句说得出原因的回答。
+			convey.So(w.Body.String(), convey.ShouldNotContainSubstring, "系统错误")
+		})
+
+		convey.Convey("处理器自己出错仍然是 500", func() {
+			upRepo, _, _, engine := setupAdminTest(t)
+			upRepo.EXPECT().List(gomock.Any()).Return(nil, errors.New("这一支是代码自己的 bug"))
+
+			w := adminDo(engine, http.MethodGet, "/api/v1/admin/upstreams")
+			convey.So(w.Code, convey.ShouldEqual, http.StatusInternalServerError)
+		})
+
+		convey.Convey("业务上的不存在仍然是 404", func() {
+			upRepo, _, _, engine := setupAdminTest(t)
+			upRepo.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{}, nil).AnyTimes()
+			upRepo.EXPECT().Find(gomock.Any(), int64(404)).Return(nil, nil)
+
+			w := adminDo(engine, http.MethodDelete, "/api/v1/admin/upstreams/404")
+			convey.So(w.Code, convey.ShouldEqual, http.StatusNotFound)
 		})
 	})
 }

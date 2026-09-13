@@ -2,7 +2,6 @@ package cache_svc
 
 import (
 	"context"
-	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -277,22 +276,29 @@ func TestGet_CorruptedCopyIsDiscardedAndRefetched(t *testing.T) {
 		convey.So(o.hits.Load(), convey.ShouldEqual, 2)
 
 		convey.Convey("字节数没变、内容被改写的副本靠摘要认出来", func() {
-			// 这一类损坏躲得过大小比对：读的时候一路算摘要，到末尾才发现不对。
-			// 发现之后要丢掉这条记录，下一次拉取才会回源，而不是反复发出坏字节。
+			// 这一类损坏躲得过大小比对，只有摘要认得出。规格要的是
+			// 「校验失败时丢弃该副本并回源」——回源必须发生在**这一次**请求上，
+			// 而不是等客户端自己重试：一边把坏字节发出去一边在背后丢记录，
+			// 客户端拿到的是一个 200、Content-Length 还对得上的完整坏响应，
+			// 它没有任何理由去重试。
 			corruptBlob(t, store, repo, key)
-			bad, _, err := svc.Get(ctx, target("deb.debian.org", key))
-			convey.So(err, convey.ShouldBeNil)
-			_, err = io.ReadAll(bad)
-			convey.So(errors.Is(err, ErrCacheCorrupted), convey.ShouldBeTrue)
-			convey.So(bad.Close(), convey.ShouldBeNil)
-			convey.So(repo.byKey(key), convey.ShouldBeNil)
+			before := o.hits.Load()
 
-			fresh, _, err := svc.Get(ctx, target("deb.debian.org", key))
+			r3, meta3, err := svc.Get(ctx, target("deb.debian.org", key))
 			convey.So(err, convey.ShouldBeNil)
-			got, err := io.ReadAll(fresh)
+			got, err := io.ReadAll(r3)
 			convey.So(err, convey.ShouldBeNil)
-			convey.So(fresh.Close(), convey.ShouldBeNil)
+			convey.So(r3.Close(), convey.ShouldBeNil)
+
+			// 客户端拿到的是好内容，且它来自上游而不是那份坏副本。
 			convey.So(string(got), convey.ShouldEqual, "full content")
+			convey.So(meta3.StatusCode, convey.ShouldEqual, http.StatusOK)
+			convey.So(o.hits.Load(), convey.ShouldEqual, before+1)
+			// 坏副本被丢掉之后又按回源的结果重新写了一条，所以记录还在，
+			// 但盘上那份坏字节已经不是它指向的内容了。
+			fixed := repo.byKey(key)
+			convey.So(fixed, convey.ShouldNotBeNil)
+			convey.So(fixed.Digest, convey.ShouldEqual, digestOfString("full content"))
 		})
 	})
 }

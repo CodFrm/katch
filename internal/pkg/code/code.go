@@ -27,6 +27,11 @@ const (
 	SettingKeyUnknown
 	// SettingValueInvalid 设置项的值不合法（类型不对或超出取值范围）。
 	SettingValueInvalid
+	// StorageUnavailable 数据库连不上，管理面暂时不可用。
+	//
+	// 它和「系统错误」分开是有意的：这一条说的是存储临时挂了、待会儿再来，
+	// 而拉取仍然在用进程内的快照继续服务（失败与降级一节）。
+	StorageUnavailable
 )
 
 func init() {
@@ -43,4 +48,5 @@ var zhCN = map[int]string{
 	PurgeTargetRequired:    "请指定要清理的缓存对象或上游",
 	SettingKeyUnknown:      "没有 %s 这个设置项",
 	SettingValueInvalid:    "设置项 %s 的值不合法：%s",
+	StorageUnavailable:     "数据库暂时不可用，管理功能稍后恢复；镜像拉取不受影响",
 }

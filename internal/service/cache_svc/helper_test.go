@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -164,6 +165,33 @@ func newFakeRepo(t *testing.T, stampAccess bool) *fakeRepo {
 				list = list[:limit]
 			}
 			return list, nil
+		})
+	m.EXPECT().ExpiredBefore(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().
+		DoAndReturn(func(_ any, before int64, limit int) ([]*cache_entity.CacheObject, error) {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			list := make([]*cache_entity.CacheObject, 0, limit)
+			for _, row := range f.rows {
+				// 和 SQL 一样：expires_at=0 是「不过期」，pin 的留下。
+				if row.ExpiresAt > 0 && row.ExpiresAt <= before && !row.Pinned {
+					list = append(list, clone(row))
+				}
+			}
+			sort.Slice(list, func(i, j int) bool { return list[i].ExpiresAt < list[j].ExpiresAt })
+			if len(list) > limit {
+				list = list[:limit]
+			}
+			return list, nil
+		})
+	m.EXPECT().CountByUpstream(gomock.Any()).AnyTimes().
+		DoAndReturn(func(_ any) (map[int64]int64, error) {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			ret := map[int64]int64{}
+			for _, row := range f.rows {
+				ret[row.UpstreamID]++
+			}
+			return ret, nil
 		})
 	m.EXPECT().CountByDigest(gomock.Any(), gomock.Any()).AnyTimes().
 		DoAndReturn(func(_ any, digest string) (int64, error) {

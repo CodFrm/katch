@@ -111,6 +111,25 @@ func sortRules(rules []*rule_entity.AccessRule) []*rule_entity.AccessRule {
 	return sorted
 }
 
+// OrderForDisplay 把整表排成管理界面上那张表的顺序：全局层整层在前，其后每个
+// 上游各成一层，层内按具体度定序。复制一份再排，理由同 sortRules。
+//
+// 显示顺序和求值顺序共用 MoreSpecific，这是决策 15 的全部意义：规则没有人工
+// 顺序，那么界面上「谁排在前面」就必须真的等于「谁先说了算」，否则运维者按
+// 表上的先后去推断结果，推出来的是另一套判定。
+func OrderForDisplay(rules []*rule_entity.AccessRule) []*rule_entity.AccessRule {
+	sorted := make([]*rule_entity.AccessRule, len(rules))
+	copy(sorted, rules)
+	sort.Slice(sorted, func(i, j int) bool {
+		// 全局规则的 upstream_id 是 0，于是全局层天然排在最前面。
+		if sorted[i].UpstreamID != sorted[j].UpstreamID {
+			return sorted[i].UpstreamID < sorted[j].UpstreamID
+		}
+		return MoreSpecific(sorted[i], sorted[j])
+	})
+	return sorted
+}
+
 // MoreSpecific 报告规则 a 是否比 b 更该说了算，纯函数（决策 15 的定序规则）：
 // 字面前缀长者优先，前缀等长时通配符少者优先，仍相等时 deny 优先。
 //

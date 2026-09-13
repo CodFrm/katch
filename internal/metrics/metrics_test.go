@@ -250,3 +250,88 @@ func scrape(reg *prometheus.Registry) string {
 		ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	return w.Body.String()
 }
+
+// TestRecorder_SpecMetricFamilies 可观测性一节点名的每一个 katch_* 指标都要在
+// /metrics 上看得见。
+//
+// 按「名字 + 标签」而不是按数值断言：这一条守的是「这个族有没有被导出」，
+// 数值由各自的用例去验。族名写死成字面量而不是引用常量——常量改名时这里应该
+// 红，因为 /metrics 是对外契约，改名就是破坏采集方。
+func TestRecorder_SpecMetricFamilies(t *testing.T) {
+	convey.Convey("spec 可观测性一节列出的指标族全部出现在 /metrics 上", t, func() {
+		reg := prometheus.NewRegistry()
+		rec := New(Options{Registerer: reg})
+
+		// 拉取路径那三族由中间件产出。
+		hooks := Hooks{Lookup: knownUpstreams("deb.debian.org")}
+		get(newTestEngine(rec, hooks, &upstreamResponse{
+			status: http.StatusOK, cache: "HIT", body: "cached",
+		}), "/deb.debian.org/pool/main/a.deb")
+
+		// 回源侧：一次成功的回源，外加一个还没结束的在途请求。
+		done := rec.OriginStarted("deb.debian.org")
+		rec.RecordOrigin("deb.debian.org", http.StatusOK, 120*time.Millisecond)
+		rec.SetBackoff("deb.debian.org", false)
+
+		// 缓存侧。
+		rec.SetCacheUsage([]CacheUsage{{Upstream: "deb.debian.org", Objects: 3, Bytes: 4096}})
+		rec.RecordEviction(EvictionLRU, 2)
+		rec.RecordEviction(EvictionTTL, 1)
+		rec.RecordEviction(EvictionManual, 5)
+		rec.RecordIntegrityFailure("deb.debian.org")
+
+		// 规则与 token。
+		rec.RecordRuleDecision("global", "deny")
+		rec.RecordTokenExchange("docker.io", "success")
+
+		body := scrape(reg)
+		for _, want := range []string{
+			`katch_requests_total{kind="static",result="hit",upstream="deb.debian.org"} 1`,
+			`katch_request_duration_seconds_count{kind="static",upstream="deb.debian.org"} 1`,
+			`katch_bytes_served_total{source="cache",upstream="deb.debian.org"} 6`,
+			`katch_origin_requests_total{status="200",upstream="deb.debian.org"} 1`,
+			`katch_origin_duration_seconds_count{upstream="deb.debian.org"} 1`,
+			`katch_origin_inflight{upstream="deb.debian.org"} 1`,
+			`katch_origin_backoff{upstream="deb.debian.org"} 0`,
+			`katch_cache_objects{upstream="deb.debian.org"} 3`,
+			`katch_cache_bytes{upstream="deb.debian.org"} 4096`,
+			`katch_cache_evictions_total{reason="lru"} 2`,
+			`katch_cache_evictions_total{reason="ttl"} 1`,
+			`katch_cache_evictions_total{reason="manual"} 5`,
+			`katch_cache_integrity_failures_total{upstream="deb.debian.org"} 1`,
+			`katch_rule_decisions_total{decision="deny",scope="global"} 1`,
+			`katch_token_exchanges_total{result="success",upstream="docker.io"} 1`,
+		} {
+			convey.So(body, convey.ShouldContainSubstring, want)
+		}
+
+		convey.Convey("在途请求结束后 inflight 回到零", func() {
+			done()
+			convey.So(scrape(reg), convey.ShouldContainSubstring,
+				`katch_origin_inflight{upstream="deb.debian.org"} 0`)
+		})
+	})
+}
+
+// TestRecorder_CacheUsageReplacesPreviousSnapshot 缓存占用是 gauge，不是累加量。
+//
+// 每轮刷新必须覆盖上一轮，而且要把这一轮不再出现的上游清零：一个被清空缓存的
+// 上游若留着上一轮的数字，界面和采集方都会一直看到一份早已不存在的占用。
+func TestRecorder_CacheUsageReplacesPreviousSnapshot(t *testing.T) {
+	convey.Convey("缓存占用按快照覆盖，消失的上游归零", t, func() {
+		reg := prometheus.NewRegistry()
+		rec := New(Options{Registerer: reg})
+
+		rec.SetCacheUsage([]CacheUsage{
+			{Upstream: "deb.debian.org", Objects: 3, Bytes: 4096},
+			{Upstream: "docker.io", Objects: 9, Bytes: 8192},
+		})
+		rec.SetCacheUsage([]CacheUsage{{Upstream: "deb.debian.org", Objects: 1, Bytes: 512}})
+
+		body := scrape(reg)
+		convey.So(body, convey.ShouldContainSubstring, `katch_cache_objects{upstream="deb.debian.org"} 1`)
+		convey.So(body, convey.ShouldContainSubstring, `katch_cache_bytes{upstream="deb.debian.org"} 512`)
+		convey.So(body, convey.ShouldContainSubstring, `katch_cache_objects{upstream="docker.io"} 0`)
+		convey.So(body, convey.ShouldContainSubstring, `katch_cache_bytes{upstream="docker.io"} 0`)
+	})
+}

@@ -207,3 +207,36 @@ func TestCacheObjectRepo_SizeByUpstream(t *testing.T) {
 		})
 	})
 }
+
+func TestCacheObjectRepo_ExpiredBefore(t *testing.T) {
+	convey.Convey("过期清理只挑真的过期了的可变对象", t, func() {
+		ctx, _, mock := testutils.Database(t)
+		// expires_at>0 这一条不能少：不可变对象存的就是 0，漏掉它这条查询会把
+		// 整个缓存当成「1970 年就过期了」一次清空。
+		mock.ExpectQuery("SELECT \\* FROM `cache_objects` WHERE expires_at>0 AND expires_at<=\\? AND pinned=\\? ORDER BY expires_at asc LIMIT \\?").
+			WithArgs(int64(1000), false, 2).
+			WillReturnRows(sqlmock.NewRows([]string{"id", "size", "expires_at"}).
+				AddRow(9, 300, 500).AddRow(10, 400, 900))
+
+		got, err := NewCacheObject().ExpiredBefore(ctx, 1000, 2)
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(len(got), convey.ShouldEqual, 2)
+		convey.So(got[0].ID, convey.ShouldEqual, 9)
+		convey.So(mock.ExpectationsWereMet(), convey.ShouldBeNil)
+	})
+}
+
+func TestCacheObjectRepo_CountByUpstream(t *testing.T) {
+	convey.Convey("按上游统计缓存对象数", t, func() {
+		ctx, _, mock := testutils.Database(t)
+		mock.ExpectQuery("SELECT upstream_id,COUNT\\(\\*\\) AS count FROM `cache_objects` GROUP BY `upstream_id`").
+			WillReturnRows(sqlmock.NewRows([]string{"upstream_id", "count"}).
+				AddRow(1, 3).AddRow(2, 7))
+
+		got, err := NewCacheObject().CountByUpstream(ctx)
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(got[1], convey.ShouldEqual, 3)
+		convey.So(got[2], convey.ShouldEqual, 7)
+		convey.So(mock.ExpectationsWereMet(), convey.ShouldBeNil)
+	})
+}

@@ -14,6 +14,7 @@ import (
 	"github.com/cago-frame/cago/pkg/logger"
 	"go.uber.org/zap"
 
+	"github.com/CodFrm/katch/internal/metrics"
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
 	"github.com/CodFrm/katch/internal/proxy/dispatch"
 	"github.com/CodFrm/katch/internal/proxy/origin"
@@ -80,6 +81,11 @@ type Options struct {
 	// 回源并发上限、上游超时与重试次数都从这里现读，不在构造时抄成字段：
 	// 它们是 setting 表里的运行时项，改完必须在下一次回源上就生效（决策 3/4）。
 	Runtime setting_svc.RuntimeSource
+	// Metrics 回源侧指标的去处，nil 表示进程级那一个。
+	//
+	// 可注入是为了让用例各自拿一个干净的 registry：指标是进程级单例，
+	// 用例之间共用会让「这次回源记了几条」取决于前面跑过哪些用例。
+	Metrics *metrics.Recorder
 }
 
 type proxySvc struct {
@@ -94,6 +100,17 @@ type proxySvc struct {
 	// slots 回源并发闸，进程内唯一一份：上限是「这台 katch 同时压给上游多少个
 	// 请求」，按 service 实例各算各的就限不住。
 	slots originSlots
+	// recorder 回源侧指标的去处。
+	recorder *metrics.Recorder
+}
+
+// metrics 取指标去处。延迟到调用时才取进程级那一个：包初始化时就去碰全局
+// registry 会让「导入这个包」变成一次注册指标的副作用。
+func (p *proxySvc) metrics() *metrics.Recorder {
+	if p.recorder != nil {
+		return p.recorder
+	}
+	return metrics.Default()
 }
 
 // New 构造拉取路径的业务层。
@@ -104,9 +121,10 @@ func New(opt Options) ProxySvc {
 	}
 	return &proxySvc{
 		origin:   client,
-		registry: registry.New(registry.Options{Origin: client}),
+		registry: registry.New(registry.Options{Origin: client, Metrics: opt.Metrics}),
 		gate:     opt.Gate,
 		runtime:  opt.Runtime,
+		recorder: opt.Metrics,
 	}
 }
 
@@ -146,14 +164,19 @@ func (p *proxySvc) Fetch(ctx context.Context, target *Target) (io.ReadCloser, *M
 	if err != nil {
 		return nil, nil, err
 	}
+	// 在途数从这里一直记到响应体被关闭：它量的是「此刻压在上游那一侧多少个
+	// 请求」，拿到响应头就减掉等于把一次大对象的下载当成已经结束。
+	inflightDone := p.metrics().OriginStarted(target.Host)
 	resp, stop, err := p.fetchWithRetry(ctx, target, upstream, rt)
 	if err != nil {
+		inflightDone()
 		release()
 		return nil, nil, err
 	}
-	// 名额与超时用的 context 一直留到响应体被关闭，见 guardedBody。
+	// 名额、在途数与超时用的 context 一直留到响应体被关闭，见 guardedBody。
 	body := &guardedBody{ReadCloser: resp.Body, done: func() {
 		stop()
+		inflightDone()
 		release()
 	}}
 	return body, &Meta{
@@ -198,10 +221,19 @@ func (p *proxySvc) fetchWithRetry(ctx context.Context, target *Target,
 		if timeout > 0 {
 			timer = time.AfterFunc(timeout, cancel)
 		}
+		started := time.Now()
 		resp, err := p.fetchUpstream(attemptCtx, target, upstream)
 		if timer != nil {
 			timer.Stop()
 		}
+		// 每一次尝试都记一条：重试是真的又打了上游一次，合并成一条会让
+		// 「katch 给上游添了多少负载」这个问题答错，而那正是限流时要看的数。
+		// 拿不到响应记成 status=0——它同样是一次真实发生的回源。
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		p.metrics().RecordOrigin(target.Host, status, time.Since(started))
 		if err == nil {
 			return resp, cancel, nil
 		}

@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"github.com/CodFrm/katch/internal/metrics"
 	"github.com/CodFrm/katch/internal/proxy/dispatch"
 	"github.com/CodFrm/katch/internal/service/rule_svc"
 	"github.com/CodFrm/katch/internal/service/upstream_svc"
@@ -60,6 +61,10 @@ func Middleware() gin.HandlerFunc {
 			c.AbortWithStatus(http.StatusBadGateway)
 			return
 		}
+		// 判定数按「落在哪一层、判成什么」记（可观测性一节）。放行也记：
+		// 只记拒绝的话，这一族回答不了「策略整体在放行还是在拦」——而那正是
+		// 改完一条规则之后要看的第一个数。
+		metrics.RecordRuleDecision(string(decision.Scope), decisionLabel(decision.Allowed))
 		if decision.Allowed {
 			c.Next()
 			return
@@ -79,4 +84,12 @@ func ruleID(decision *rule_svc.Decision) int64 {
 		return 0
 	}
 	return decision.MatchedRule.ID
+}
+
+// decisionLabel 判定结果的标签值，和访问规则里 action 的取值对齐。
+func decisionLabel(allowed bool) string {
+	if allowed {
+		return "allow"
+	}
+	return "deny"
 }

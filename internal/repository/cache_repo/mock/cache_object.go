@@ -56,6 +56,21 @@ func (mr *MockCacheObjectRepoMockRecorder) CountByDigest(ctx, digest any) *gomoc
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CountByDigest", reflect.TypeOf((*MockCacheObjectRepo)(nil).CountByDigest), ctx, digest)
 }
 
+// CountByUpstream mocks base method.
+func (m *MockCacheObjectRepo) CountByUpstream(ctx context.Context) (map[int64]int64, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "CountByUpstream", ctx)
+	ret0, _ := ret[0].(map[int64]int64)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// CountByUpstream indicates an expected call of CountByUpstream.
+func (mr *MockCacheObjectRepoMockRecorder) CountByUpstream(ctx any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CountByUpstream", reflect.TypeOf((*MockCacheObjectRepo)(nil).CountByUpstream), ctx)
+}
+
 // Delete mocks base method.
 func (m *MockCacheObjectRepo) Delete(ctx context.Context, id int64) error {
 	m.ctrl.T.Helper()
@@ -83,6 +98,21 @@ func (m *MockCacheObjectRepo) EvictCandidates(ctx context.Context, limit int) ([
 func (mr *MockCacheObjectRepoMockRecorder) EvictCandidates(ctx, limit any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "EvictCandidates", reflect.TypeOf((*MockCacheObjectRepo)(nil).EvictCandidates), ctx, limit)
+}
+
+// ExpiredBefore mocks base method.
+func (m *MockCacheObjectRepo) ExpiredBefore(ctx context.Context, before int64, limit int) ([]*cache_entity.CacheObject, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ExpiredBefore", ctx, before, limit)
+	ret0, _ := ret[0].([]*cache_entity.CacheObject)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ExpiredBefore indicates an expected call of ExpiredBefore.
+func (mr *MockCacheObjectRepoMockRecorder) ExpiredBefore(ctx, before, limit any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ExpiredBefore", reflect.TypeOf((*MockCacheObjectRepo)(nil).ExpiredBefore), ctx, before, limit)
 }
 
 // Find mocks base method.

@@ -33,8 +33,20 @@ type CacheObjectRepo interface {
 	// 在 SQL 里求和而不是把记录捞回去加：首页页脚那张表是匿名就能打的，
 	// 每打一次就把整张 cache_object 扫进内存，等于给自己开了一条放大路径。
 	SizeByUpstream(ctx context.Context) (map[int64]int64, error)
+	// CountByUpstream 按上游分组的缓存对象数，键是 upstream_id。
+	//
+	// 和 SizeByUpstream 分开而不是一次查两个聚合：/metrics 上的
+	// katch_cache_objects 与 katch_cache_bytes 是两族，而这两个数的口径必须
+	// 各自说得清——合在一个结构里迟早有人只更新其中一半。
+	CountByUpstream(ctx context.Context) (map[int64]int64, error)
 	// EvictCandidates 按最久未访问给出淘汰候选，只含不可变且未被 pin 的对象。
 	EvictCandidates(ctx context.Context, limit int) ([]*cache_entity.CacheObject, error)
+	// ExpiredBefore 给出已经过期的可变对象，供 TTL 清理用。
+	//
+	// 可变对象不进 EvictCandidates（那条只挑不可变的），所以过期之后没有任何
+	// 一条路径会把它们清掉：记录和盘上的字节都留着，还一直算进配额，于是
+	// 「缓存总容量有上限」这条会被一批再也没人来取的对象慢慢顶穿。
+	ExpiredBefore(ctx context.Context, before int64, limit int) ([]*cache_entity.CacheObject, error)
 	// CountByDigest 还有多少条记录引用同一份内容，删文件之前要问一次。
 	CountByDigest(ctx context.Context, digest string) (int64, error)
 	Search(ctx context.Context, opt *cache_entity.SearchOption) ([]*cache_entity.CacheObject, int64, error)
@@ -134,6 +146,37 @@ func (c *cacheObjectRepo) SizeByUpstream(ctx context.Context) (map[int64]int64, 
 		ret[row.UpstreamID] = row.Size
 	}
 	return ret, nil
+}
+
+func (c *cacheObjectRepo) CountByUpstream(ctx context.Context) (map[int64]int64, error) {
+	rows := make([]struct {
+		UpstreamID int64 `gorm:"column:upstream_id"`
+		Count      int64 `gorm:"column:count"`
+	}, 0)
+	if err := db.Ctx(ctx).Model(&cache_entity.CacheObject{}).
+		Select("upstream_id,COUNT(*) AS count").
+		Group("upstream_id").
+		Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	ret := make(map[int64]int64, len(rows))
+	for _, row := range rows {
+		ret[row.UpstreamID] = row.Count
+	}
+	return ret, nil
+}
+
+func (c *cacheObjectRepo) ExpiredBefore(ctx context.Context, before int64, limit int) ([]*cache_entity.CacheObject, error) {
+	list := make([]*cache_entity.CacheObject, 0, limit)
+	// expires_at=0 是「不过期」而不是「1970 年就过期了」：不可变对象存的就是 0，
+	// 漏掉这个条件会把整个缓存当成过期的一次清空。
+	// pin 的对象留下：人明确要求常驻的东西不该被一次例行清理带走。
+	if err := db.Ctx(ctx).
+		Where("expires_at>0 AND expires_at<=? AND pinned=?", before, false).
+		Order("expires_at asc").Limit(limit).Find(&list).Error; err != nil {
+		return nil, err
+	}
+	return list, nil
 }
 
 func (c *cacheObjectRepo) EvictCandidates(ctx context.Context, limit int) ([]*cache_entity.CacheObject, error) {

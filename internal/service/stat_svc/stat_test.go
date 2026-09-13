@@ -3,9 +3,12 @@ package stat_svc
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/smartystreets/goconvey/convey"
 	"go.uber.org/mock/gomock"
 
@@ -75,6 +78,12 @@ func TestStat_Flush(t *testing.T) {
 	convey.Convey("每分钟把进程内计数器落成一行分钟桶", t, func() {
 		deps := setup(t, nil)
 		ctx := context.Background()
+		// Flush 顺带把缓存占用刷成 /metrics 上的两个 gauge（可观测性一节）。
+		// 这一组用例验的是分钟桶，所以这里只把那条路放行。
+		deps.cache.EXPECT().SizeByUpstream(gomock.Any()).AnyTimes().Return(map[int64]int64{}, nil)
+		deps.cache.EXPECT().CountByUpstream(gomock.Any()).AnyTimes().Return(map[int64]int64{}, nil)
+		deps.upstream.EXPECT().List(gomock.Any()).AnyTimes().
+			Return([]*upstream_entity.Upstream{}, nil)
 
 		convey.Convey("这一分钟还没有行就新建一行", func() {
 			deps.drained = []metrics.Bucket{{
@@ -404,4 +413,43 @@ func TestStat_UpstreamSeries(t *testing.T) {
 			convey.So(err, convey.ShouldNotBeNil)
 		})
 	})
+}
+
+// TestStat_FlushRefreshesCacheGauges 缓存占用要按**主机名**出现在 /metrics 上。
+//
+// 标签是主机名而不是 upstream_id：/metrics 是给人和采集方看的，一串数字 id
+// 在那里没人认得。没缓存过的上游也要给一行 0——缺行会在图上变成断点，而
+// 「这个上游此刻一个对象都没缓存」本身就是要看的事实。
+func TestStat_FlushRefreshesCacheGauges(t *testing.T) {
+	convey.Convey("落分钟桶时顺带刷新缓存占用指标", t, func() {
+		deps := setup(t, nil)
+		deps.cache.EXPECT().SizeByUpstream(gomock.Any()).
+			Return(map[int64]int64{7: 4096}, nil)
+		deps.cache.EXPECT().CountByUpstream(gomock.Any()).
+			Return(map[int64]int64{7: 3}, nil)
+		deps.upstream.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{
+			{ID: 7, Host: "deb.debian.org", Kind: upstream_entity.KindStatic, Enabled: true},
+			{ID: 8, Host: "quiet.example.com", Kind: upstream_entity.KindStatic, Enabled: true},
+		}, nil)
+
+		convey.So(deps.svc.Flush(context.Background()), convey.ShouldBeNil)
+
+		got := scrapeDefault()
+		convey.So(got, convey.ShouldContainSubstring,
+			`katch_cache_objects{upstream="deb.debian.org"} 3`)
+		convey.So(got, convey.ShouldContainSubstring,
+			`katch_cache_bytes{upstream="deb.debian.org"} 4096`)
+		convey.So(got, convey.ShouldContainSubstring,
+			`katch_cache_objects{upstream="quiet.example.com"} 0`)
+	})
+}
+
+// scrapeDefault 按 Prometheus 抓取端点的形态取一次进程级指标。
+//
+// 走默认 registry 而不是另起一个：stat_svc 刷的就是进程级那一份计数器
+// （metrics.SetCacheUsage），而 component.Core() 暴露的 /metrics 正是从那里收集的。
+func scrapeDefault() string {
+	w := httptest.NewRecorder()
+	promhttp.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	return w.Body.String()
 }

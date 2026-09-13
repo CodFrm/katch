@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/CodFrm/katch/internal/metrics"
 	"github.com/CodFrm/katch/internal/proxy/origin"
 )
 
@@ -64,6 +65,8 @@ type Options struct {
 	TokenClient *http.Client
 	// Now 取当前时间，测试里可以拨动它来验证 token 过期。
 	Now func() time.Time
+	// Metrics token 交换计数的去处，nil 表示进程级那一个。
+	Metrics *metrics.Recorder
 }
 
 // Adapter registry 上游适配器。
@@ -72,8 +75,19 @@ type Adapter struct {
 	tokenClient *http.Client
 	now         func() time.Time
 
+	recorder *metrics.Recorder
+
 	mu     sync.Mutex
 	tokens map[string]cachedToken
+}
+
+// metrics 取指标去处。延迟到调用时才取进程级那一个：包初始化时就去碰全局
+// registry 会让「导入这个包」变成一次注册指标的副作用。
+func (a *Adapter) metrics() *metrics.Recorder {
+	if a.recorder != nil {
+		return a.recorder
+	}
+	return metrics.Default()
 }
 
 type cachedToken struct {
@@ -110,6 +124,7 @@ func New(opt Options) *Adapter {
 		origin:      opt.Origin,
 		tokenClient: opt.TokenClient,
 		now:         opt.Now,
+		recorder:    opt.Metrics,
 		tokens:      make(map[string]cachedToken),
 	}
 }
@@ -139,10 +154,14 @@ func (a *Adapter) Do(ctx context.Context, req *Request) (*origin.Response, error
 	}
 	token, err := a.exchange(ctx, challenge, scope)
 	if err != nil {
+		// 计在这里而不是 exchange 里：那一层不知道自己在为哪个上游换 token，
+		// 而这一族的标签就是上游（可观测性一节）。
+		a.metrics().RecordTokenExchange(req.Host, metrics.TokenFailure)
 		// 换不到 token 是一次回源失败（502），不是「这个对象不存在」：把它说成
 		// 404 会让客户端把结论记下来。
 		return nil, err
 	}
+	a.metrics().RecordTokenExchange(req.Host, metrics.TokenSuccess)
 	a.remember(key, token)
 
 	retried, err := a.send(ctx, req, path, token.value)

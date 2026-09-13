@@ -109,3 +109,30 @@ func TestAccessRuleRepo_Delete(t *testing.T) {
 		convey.So(mock.ExpectationsWereMet(), convey.ShouldBeNil)
 	})
 }
+
+func TestAccessRuleRepo_DeleteByUpstream(t *testing.T) {
+	convey.Convey("按上游删除它名下的全部规则", t, func() {
+		repo := NewAccessRule()
+
+		convey.Convey("发的是一条按 upstream_id 的删除", func() {
+			ctx, _, mock := testutils.Database(t)
+			mock.ExpectBegin()
+			mock.ExpectExec("DELETE FROM `access_rules` WHERE upstream_id=\\?").
+				WithArgs(int64(7)).
+				WillReturnResult(sqlmock.NewResult(0, 2))
+			mock.ExpectCommit()
+
+			convey.So(repo.DeleteByUpstream(ctx, 7), convey.ShouldBeNil)
+			convey.So(mock.ExpectationsWereMet(), convey.ShouldBeNil)
+		})
+
+		convey.Convey("upstream_id 为 0 时一条语句都不发", func() {
+			// 0 是「全局规则」这个正常取值，不是「没有上游」。真把它拼进
+			// WHERE 就会把全站的全局规则一次删光，所以这一层直接挡住。
+			ctx, _, mock := testutils.Database(t)
+
+			convey.So(repo.DeleteByUpstream(ctx, 0), convey.ShouldBeNil)
+			convey.So(mock.ExpectationsWereMet(), convey.ShouldBeNil)
+		})
+	})
+}

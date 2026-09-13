@@ -11,6 +11,7 @@ import (
 	api_upstream "github.com/CodFrm/katch/internal/api/upstream"
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
 	"github.com/CodFrm/katch/internal/pkg/code"
+	"github.com/CodFrm/katch/internal/repository/rule_repo"
 	"github.com/CodFrm/katch/internal/repository/upstream_repo"
 )
 
@@ -131,6 +132,19 @@ func (u *upstreamSvc) Delete(ctx context.Context, req *admin.DeleteUpstreamReque
 		// 不存在的 id 不能当成删除成功：界面上「删掉了」和「这条根本不在」是
 		// 两件事，后者通常意味着调用方拿的是一份过期的列表。
 		return nil, i18n.NewNotFoundError(ctx, code.UpstreamNotFound)
+	}
+	// 先连带删掉这个上游名下的规则，再删上游本身。
+	//
+	// 留着的孤儿规则不会立刻出事——求值只看全局那层和当前上游那层，id 不在表里
+	// 时谁都匹配不到。出事的是自增 id 被复用之后：下一个拿到这个 id 的上游会
+	// 毫无征兆地继承一批本该消失的规则。写入侧已经有对称的一半（rule_svc.Save
+	// 拒绝把规则挂到不存在的上游上），删除侧不能缺这一半。
+	//
+	// 顺序不能反：先删上游再删规则的话，规则那步一失败就正好落成上面那个缺陷，
+	// 而且上游已经不在了，重试都找不到该清哪一批。级联做在这一层而不是数据库的
+	// ON DELETE CASCADE：迁移只追加不修改，且要同时对 sqlite 和 MySQL 成立。
+	if err := rule_repo.AccessRule().DeleteByUpstream(ctx, req.ID); err != nil {
+		return nil, err
 	}
 	if err := upstream_repo.Upstream().Delete(ctx, req.ID); err != nil {
 		return nil, err

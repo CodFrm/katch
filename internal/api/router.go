@@ -58,20 +58,28 @@ func Router(_ context.Context, root *mux.Router) error {
 	homeGroup.Bind(statCtr.Overview, upstreamCtr.PublicList)
 
 	// /api/v1/admin/* 一律要密钥；拉取路径与其余公开接口不经过这个中间件。
+	//
+	// 每个处理器都过一层 storageAware：库连不上时管理接口要答 503 而不是 500
+	// （失败与降级一节）。包在这里是因为 cago 的 Bind 直接把 error 交给
+	// httputils.HandleError，中间没有别的钩子可挂，见 storage.go。
 	adminGroup := r.Group("/", requireAdminKey)
-	adminGroup.Bind(upstreamCtr.List, upstreamCtr.Save, upstreamCtr.Delete)
-	adminGroup.Bind(statCtr.ByUpstream, statCtr.UpstreamSeries)
+	adminGroup.Bind(storageAware(upstreamCtr.List), storageAware(upstreamCtr.Save),
+		storageAware(upstreamCtr.Delete))
+	adminGroup.Bind(storageAware(statCtr.ByUpstream), storageAware(statCtr.UpstreamSeries))
 	ruleCtr := rule_ctr.NewRule()
-	adminGroup.Bind(ruleCtr.List, ruleCtr.Save, ruleCtr.Delete, ruleCtr.Test)
+	adminGroup.Bind(storageAware(ruleCtr.List), storageAware(ruleCtr.Save),
+		storageAware(ruleCtr.Delete), storageAware(ruleCtr.Test))
 	cacheCtr := cache_ctr.NewCache()
-	adminGroup.Bind(cacheCtr.Search, cacheCtr.Purge, cacheCtr.Pin)
+	adminGroup.Bind(storageAware(cacheCtr.Search), storageAware(cacheCtr.Purge),
+		storageAware(cacheCtr.Pin))
 	// 设置读写与密钥轮换和其余管理接口同一道闸：轮换尤其不能另开一套入口，
 	// 一个不要当前密钥就能换密钥的端点等于把后台直接送出去。
 	settingCtr := setting_ctr.NewSetting()
-	adminGroup.Bind(settingCtr.List, settingCtr.Save, settingCtr.RotateAdminKey)
+	adminGroup.Bind(storageAware(settingCtr.List), storageAware(settingCtr.Save),
+		storageAware(settingCtr.RotateAdminKey))
 	// 事件流同一道闸：里面是主机名、规则模式和设置键的变更史，是运营数据。
 	eventCtr := event_ctr.NewEvent()
-	adminGroup.Bind(eventCtr.List)
+	adminGroup.Bind(storageAware(eventCtr.List))
 
 	return nil
 }

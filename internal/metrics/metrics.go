@@ -124,9 +124,28 @@ type Recorder struct {
 	bytes    *prometheus.CounterVec
 	backoff  *prometheus.GaugeVec
 
+	// 回源侧：这三族记的是 katch 与上游之间那一跳，和上面按响应判定的拉取计数
+	// 不是一回事——一次命中根本没有回源，一次回源也可能服务多个等待者。
+	originRequests *prometheus.CounterVec
+	originDuration *prometheus.HistogramVec
+	originInflight *prometheus.GaugeVec
+
+	// 缓存侧。objects/bytes 是快照式的 gauge，由统计层每分钟刷一次；
+	// evictions/integrity 是发生即加的计数器。
+	cacheObjects   *prometheus.GaugeVec
+	cacheBytes     *prometheus.GaugeVec
+	evictions      *prometheus.CounterVec
+	integrityFails *prometheus.CounterVec
+
+	ruleDecisions  *prometheus.CounterVec
+	tokenExchanges *prometheus.CounterVec
+
 	// mu 护住分钟桶。
 	mu      sync.Mutex
 	buckets map[bucketKey]*Bucket
+	// usageMu 护住上一轮缓存占用快照，见 SetCacheUsage。
+	usageMu   sync.Mutex
+	lastUsage map[string]struct{}
 }
 
 type bucketKey struct {
@@ -162,7 +181,45 @@ func New(opt Options) *Recorder {
 			Name: "katch_origin_backoff",
 			Help: "上游是否处于回源退避（降级）状态。",
 		}, []string{"upstream"}),
-		buckets: map[bucketKey]*Bucket{},
+		originRequests: factory.NewCounterVec(prometheus.CounterOpts{
+			Name: "katch_origin_requests_total",
+			Help: "向上游发起的回源请求数，按上游与上游给出的状态码分。",
+		}, []string{"upstream", "status"}),
+		originDuration: factory.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "katch_origin_duration_seconds",
+			Help:    "回源耗时，量到拿着响应头为止。",
+			Buckets: prometheus.DefBuckets,
+		}, []string{"upstream"}),
+		originInflight: factory.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "katch_origin_inflight",
+			Help: "此刻正压在上游那一侧的回源数。",
+		}, []string{"upstream"}),
+		cacheObjects: factory.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "katch_cache_objects",
+			Help: "缓存里的对象数。",
+		}, []string{"upstream"}),
+		cacheBytes: factory.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "katch_cache_bytes",
+			Help: "缓存占用的字节数。",
+		}, []string{"upstream"}),
+		evictions: factory.NewCounterVec(prometheus.CounterOpts{
+			Name: "katch_cache_evictions_total",
+			Help: "被淘汰的缓存对象数，按淘汰原因分。",
+		}, []string{"reason"}),
+		integrityFails: factory.NewCounterVec(prometheus.CounterOpts{
+			Name: "katch_cache_integrity_failures_total",
+			Help: "读缓存时校验失败的次数——磁盘或写入路径出了问题。",
+		}, []string{"upstream"}),
+		ruleDecisions: factory.NewCounterVec(prometheus.CounterOpts{
+			Name: "katch_rule_decisions_total",
+			Help: "访问规则的判定数，按判定发生在哪一层与判定结果分。",
+		}, []string{"scope", "decision"}),
+		tokenExchanges: factory.NewCounterVec(prometheus.CounterOpts{
+			Name: "katch_token_exchanges_total",
+			Help: "registry 上游的 token 交换次数。",
+		}, []string{"upstream", "result"}),
+		buckets:   map[bucketKey]*Bucket{},
+		lastUsage: map[string]struct{}{},
 	}
 }
 
@@ -321,11 +378,7 @@ func (r *Recorder) feedGate(gate Gate, host string, result Result) {
 	case ResultHit, ResultDenied:
 		return
 	}
-	degraded := float64(0)
-	if gate.Degraded(host) {
-		degraded = 1
-	}
-	r.backoff.WithLabelValues(host).Set(degraded)
+	r.SetBackoff(host, gate.Degraded(host))
 }
 
 // classify 按响应判定这次拉取的结果。

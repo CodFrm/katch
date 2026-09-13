@@ -20,6 +20,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/CodFrm/katch/internal/cache"
+	"github.com/CodFrm/katch/internal/metrics"
 	"github.com/CodFrm/katch/internal/model/entity/cache_entity"
 	"github.com/CodFrm/katch/internal/model/entity/event_entity"
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
@@ -126,6 +127,16 @@ type CacheSvc interface {
 	Search(ctx context.Context, req *SearchRequest) (*SearchResponse, error)
 	Purge(ctx context.Context, req *PurgeRequest) (*PurgeResponse, error)
 	Pin(ctx context.Context, req *PinRequest) error
+	// Sweep 收走已经过期的可变对象，返回收走了几条，然后按当下的配额回收一次。
+	//
+	// 「可变对象由 TTL 自行过期」（缓存一节）在读路径上只做到了「过期的不再命中」；
+	// 一个再也没人来取的过期对象，记录和盘上的字节会一直留着，还一直算进配额，
+	// 而它又进不了 LRU 的候选（那条只挑不可变的）。没有这一趟，配额就会被一批
+	// 死对象慢慢顶穿，表现成「缓存超配额但没有可淘汰的对象」那条日志。
+	//
+	// 顺带在这里再跑一次配额回收：原先只有「写进一个新对象」才会触发，于是站长
+	// 在设置页把配额改小之后，要等到下一次回源才开始削——决策 3/4 说的是改完立刻生效。
+	Sweep(ctx context.Context) (int64, error)
 }
 
 type cacheSvc struct {
@@ -263,6 +274,18 @@ func (c *cacheSvc) serveFromDisk(ctx context.Context, upstream *upstream_entity.
 		_ = file.Close()
 		logger.Ctx(ctx).Error("缓存副本大小与记录不符", zap.String("key", key),
 			zap.Int64("want", object.Size), zap.Int64("got", size))
+		metrics.RecordIntegrityFailure(upstream.Host)
+		c.dropRecord(ctx, object)
+		return nil, nil, false
+	}
+	// 校验在发字节之前做完：失败时这一次请求还回得了源（缓存一节）。
+	if err := verifyCopy(file, object); err != nil {
+		_ = file.Close()
+		// 记 error 而不是 warn：大小一样、内容却变了，说明磁盘或写入路径出了
+		// 问题，不能静默自愈了事。
+		logger.Ctx(ctx).Error("缓存副本校验失败", zap.String("key", key),
+			zap.String("digest", object.Digest), zap.Error(err))
+		metrics.RecordIntegrityFailure(upstream.Host)
 		c.dropRecord(ctx, object)
 		return nil, nil, false
 	}
@@ -276,7 +299,7 @@ func (c *cacheSvc) serveFromDisk(ctx context.Context, upstream *upstream_entity.
 	}
 	header.Set("Content-Length", strconv.FormatInt(object.Size, 10))
 	header.Set(cacheStatusHeader, cacheStatusHit)
-	return newVerifyReader(ctx, c, file, object), &proxy_svc.Meta{
+	return file, &proxy_svc.Meta{
 		StatusCode:    http.StatusOK,
 		Header:        header,
 		ContentLength: object.Size,
@@ -526,6 +549,7 @@ func (c *cacheSvc) enforceQuota(ctx context.Context) {
 		// 日志，而时间线上记一条「回收了 0 个对象」只是噪声。
 		return
 	}
+	metrics.RecordEviction(metrics.EvictionLRU, removed)
 	event_svc.Event().Record(ctx, &event_svc.RecordInput{
 		Kind: event_entity.KindCacheReclaimed, Actor: event_entity.ActorSystem,
 		Detail: map[string]any{
@@ -569,6 +593,47 @@ func (c *cacheSvc) reclaim(ctx context.Context, repo cache_repo.CacheObjectRepo,
 		}
 	}
 	return removed, freed
+}
+
+// sweepBatch 一趟清理最多收多少条。和淘汰用同一个批量：它们面对的是同一张表。
+const sweepBatch = evictBatch
+
+func (c *cacheSvc) Sweep(ctx context.Context) (int64, error) {
+	if !c.usable() {
+		return 0, nil
+	}
+	repo := cache_repo.CacheObject()
+	now := time.Now().Unix()
+	var removed int64
+	for {
+		expired, err := repo.ExpiredBefore(ctx, now, sweepBatch)
+		if err != nil {
+			logger.Ctx(ctx).Error("查询过期缓存对象失败", zap.Error(err))
+			// 带着已经收掉的数量返回：那部分清理已经发生了，报成 0 会让调用方
+			// 以为什么都没做。
+			return removed, err
+		}
+		if len(expired) == 0 {
+			break
+		}
+		for _, object := range expired {
+			if err := repo.Delete(ctx, object.ID); err != nil {
+				logger.Ctx(ctx).Error("删除过期缓存记录失败",
+					zap.Int64("id", object.ID), zap.Error(err))
+				return removed, err
+			}
+			c.removeIfUnreferenced(ctx, object.Digest)
+			removed++
+		}
+		if len(expired) < sweepBatch {
+			break
+		}
+	}
+	metrics.RecordEviction(metrics.EvictionTTL, removed)
+	// 回收放在清理之后：过期对象刚腾出来的空间要先算进去，否则会多削一批
+	// 本来不必动的不可变对象。
+	c.enforceQuota(ctx)
+	return removed, nil
 }
 
 func (c *cacheSvc) Put(ctx context.Context, req *PutRequest) error {
@@ -673,6 +738,7 @@ func (c *cacheSvc) Purge(ctx context.Context, req *PurgeRequest) (*PurgeResponse
 		}
 		removed++
 	}
+	metrics.RecordEviction(metrics.EvictionManual, removed)
 	return &PurgeResponse{Removed: removed, Skipped: skipped}, nil
 }
 

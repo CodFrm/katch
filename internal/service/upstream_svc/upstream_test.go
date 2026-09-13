@@ -2,6 +2,7 @@ package upstream_svc
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/smartystreets/goconvey/convey"
@@ -9,6 +10,8 @@ import (
 
 	"github.com/CodFrm/katch/internal/api/admin"
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
+	"github.com/CodFrm/katch/internal/repository/rule_repo"
+	mock_rule_repo "github.com/CodFrm/katch/internal/repository/rule_repo/mock"
 	"github.com/CodFrm/katch/internal/repository/upstream_repo"
 	mock_upstream_repo "github.com/CodFrm/katch/internal/repository/upstream_repo/mock"
 )
@@ -127,5 +130,48 @@ func TestSaveDefaultPolicy(t *testing.T) {
 		})
 		convey.So(err, convey.ShouldBeNil)
 		convey.So(saved.DefaultPolicy, convey.ShouldEqual, upstream_entity.PolicyAllowAll)
+	})
+}
+
+// TestDeleteCascadesRules 删掉一个上游，它名下的规则必须跟着走。
+//
+// 留着的孤儿规则不会马上出事——求值只看全局那层和当前上游那层，id 不在表里时
+// 谁都匹配不到它们。真正的问题是自增 id 会被复用：等到下一个上游拿到这个 id，
+// 那批本该消失的规则会毫无征兆地在一个完全不相干的上游上生效。写入侧已经有
+// 对称的一半（rule_svc.Save 拒绝挂到不存在的上游上），删除侧不能缺。
+func TestDeleteCascadesRules(t *testing.T) {
+	convey.Convey("删除上游时连带删掉它的规则", t, func() {
+		upRepo := setupUpstreamTest(t)
+		ruleRepo := mock_rule_repo.NewMockAccessRuleRepo(gomock.NewController(t))
+		rule_repo.RegisterAccessRule(ruleRepo)
+		ctx := context.Background()
+
+		convey.Convey("规则按这个上游的 id 删，上游本身照删", func() {
+			upRepo.EXPECT().Find(gomock.Any(), int64(7)).Return(
+				&upstream_entity.Upstream{ID: 7, Host: "deb.debian.org"}, nil)
+			ruleRepo.EXPECT().DeleteByUpstream(gomock.Any(), int64(7)).Return(nil)
+			upRepo.EXPECT().Delete(gomock.Any(), int64(7)).Return(nil)
+
+			_, err := Upstream().Delete(ctx, &admin.DeleteUpstreamRequest{ID: 7})
+			convey.So(err, convey.ShouldBeNil)
+		})
+
+		convey.Convey("规则删不掉时不删上游，免得留下一批孤儿", func() {
+			// 顺序是刻意的：先删规则再删上游。反过来的话，规则这一步失败就正好
+			// 制造出这个缺陷本身，而且重试时上游已经不在了，再也补不回来。
+			upRepo.EXPECT().Find(gomock.Any(), int64(7)).Return(
+				&upstream_entity.Upstream{ID: 7, Host: "deb.debian.org"}, nil)
+			ruleRepo.EXPECT().DeleteByUpstream(gomock.Any(), int64(7)).Return(errors.New("db down"))
+
+			_, err := Upstream().Delete(ctx, &admin.DeleteUpstreamRequest{ID: 7})
+			convey.So(err, convey.ShouldNotBeNil)
+		})
+
+		convey.Convey("上游不存在时一条规则都不碰", func() {
+			upRepo.EXPECT().Find(gomock.Any(), int64(404)).Return(nil, nil)
+
+			_, err := Upstream().Delete(ctx, &admin.DeleteUpstreamRequest{ID: 404})
+			convey.So(err, convey.ShouldNotBeNil)
+		})
 	})
 }

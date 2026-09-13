@@ -90,7 +90,9 @@ func (r *ruleSvc) List(
 		return nil, err
 	}
 	resp := &admin.ListRulesResponse{List: make([]*admin.RuleItem, 0, len(list))}
-	for _, v := range list {
+	// 排序在这一层做而不是在仓储的 ORDER BY 或前端里：具体度定序是一段业务规则，
+	// 它已经在求值路径上了，界面再实现一遍就会有两套会分家的顺序。
+	for _, v := range OrderForDisplay(list) {
 		resp.List = append(resp.List, toItem(v))
 	}
 	return resp, nil

@@ -93,6 +93,9 @@ func setupEventTest(t *testing.T, failCreate error) (
 	ctrl := gomock.NewController(t)
 	newFakeEventRepo(t, failCreate)
 	ruleRepo := mock_rule_repo.NewMockAccessRuleRepo(ctrl)
+	// 删除上游会连带删掉它名下的规则；这里只是让它别挡路，级联本身在
+	// upstream_svc 的用例里断言。
+	ruleRepo.EXPECT().DeleteByUpstream(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 	rule_repo.RegisterAccessRule(ruleRepo)
 	upRepo := mock_upstream_repo.NewMockUpstreamRepo(ctrl)
 	upRepo.EXPECT().Find(gomock.Any(), int64(7)).Return(

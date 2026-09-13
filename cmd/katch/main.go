@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"log"
+	"time"
 
 	"github.com/cago-frame/cago"
 	"github.com/cago-frame/cago/configs"
@@ -159,6 +160,13 @@ func main() {
 			// 配额、回收水位、可变对象 TTL 不在这里给：它们是 setting 表里的
 			// 运行时项，由缓存层每次用到时现读（决策 3/4）。
 			cache_svc.Register(cache_svc.New(store, cache_svc.Options{}))
+			gogo.Go(func() error {
+				// 定期收走过期的可变对象并按当下的配额回收一次。
+				// 没有这一趟，一个再也没人来取的过期对象会连记录带字节一直留着，
+				// 还一直算进配额，而它又进不了 LRU 的候选（只挑不可变的）。
+				runCacheSweep(ctx)
+				return nil
+			})
 			return nil
 		})).
 		// 统计：拉取路径的计数中间件 + 每分钟把进程内计数器落成分钟桶。
@@ -189,5 +197,32 @@ func main() {
 		Start()
 	if err != nil {
 		log.Fatalf("server start: %v", err)
+	}
+}
+
+// cacheSweepInterval 多久收一次过期的缓存对象。
+//
+// 比分钟桶疏得多：过期对象晚几分钟被收走没有任何坏处，而每分钟扫一次
+// cache_object 只是在给库添活。
+const cacheSweepInterval = 10 * time.Minute
+
+// runCacheSweep 跑定时的过期清理，直到 ctx 结束。
+//
+// 启动后先跑一次再进循环：进程可能已经停了几天，重启那一刻盘上大概率躺着
+// 一批早就过期的对象，等十分钟才动手没有道理。
+func runCacheSweep(ctx context.Context) {
+	ticker := time.NewTicker(cacheSweepInterval)
+	defer ticker.Stop()
+	for {
+		if removed, err := cache_svc.Cache().Sweep(ctx); err != nil {
+			logger.Ctx(ctx).Error("清理过期缓存对象失败", zap.Error(err))
+		} else if removed > 0 {
+			logger.Ctx(ctx).Info("清理过期缓存对象", zap.Int64("removed", removed))
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 	}
 }

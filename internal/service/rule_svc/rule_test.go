@@ -244,3 +244,29 @@ func TestListRules(t *testing.T) {
 		convey.So(resp.List[0].Note, convey.ShouldEqual, "禁 latest")
 	})
 }
+
+// TestListRules_OrderedBySpecificity 管理界面上那张表是「按具体度排序的规则表」：
+// 库里那个 pattern 字典序只是个稳定的底序，真按它显示，界面上的先后和求值时的
+// 先后就是两回事了。两边必须出自同一个 MoreSpecific（决策 15）。
+func TestListRules_OrderedBySpecificity(t *testing.T) {
+	convey.Convey("规则表按层分组、层内按具体度排序", t, func() {
+		ruleRepo, _ := setupRuleTest(t)
+		// 这是仓储那条 ORDER BY upstream_id asc,pattern asc 给出的顺序，
+		// 它和具体度顺序恰好相反。
+		ruleRepo.EXPECT().List(gomock.Any()).Return([]*rule_entity.AccessRule{
+			{ID: 1, UpstreamID: 0, Action: rule_entity.ActionDeny, Pattern: "*:latest"},
+			{ID: 2, UpstreamID: 0, Action: rule_entity.ActionAllow, Pattern: "library/alpine:*"},
+			{ID: 3, UpstreamID: 7, Action: rule_entity.ActionDeny, Pattern: "dists/*"},
+			{ID: 4, UpstreamID: 7, Action: rule_entity.ActionAllow, Pattern: "dists/stable/InRelease"},
+		}, nil)
+
+		resp, err := Rule().List(context.Background(), &admin.ListRulesRequest{})
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(len(resp.List), convey.ShouldEqual, 4)
+		// 全局层整层在前（决策 14），层内字面前缀长者先说了算。
+		convey.So(resp.List[0].ID, convey.ShouldEqual, 2)
+		convey.So(resp.List[1].ID, convey.ShouldEqual, 1)
+		convey.So(resp.List[2].ID, convey.ShouldEqual, 4)
+		convey.So(resp.List[3].ID, convey.ShouldEqual, 3)
+	})
+}

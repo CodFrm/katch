@@ -23,6 +23,9 @@ type AccessRuleRepo interface {
 	List(ctx context.Context) ([]*rule_entity.AccessRule, error)
 	Save(ctx context.Context, rule *rule_entity.AccessRule) error
 	Delete(ctx context.Context, id int64) error
+	// DeleteByUpstream 删掉一个上游名下的全部规则，供上游被删除时连带清理。
+	// upstreamID 为 0 时什么都不做，见实现里的说明。
+	DeleteByUpstream(ctx context.Context, upstreamID int64) error
 }
 
 // defaultAccessRule 出厂就是基于 gorm 的那份实现。
@@ -80,4 +83,18 @@ func (a *accessRuleRepo) Save(ctx context.Context, rule *rule_entity.AccessRule)
 
 func (a *accessRuleRepo) Delete(ctx context.Context, id int64) error {
 	return db.Ctx(ctx).Where("id=?", id).Delete(&rule_entity.AccessRule{}).Error
+}
+
+// DeleteByUpstream 删掉一个上游名下的全部规则。
+//
+// upstreamID 为 0 时直接返回：0 在这张表里是「全局规则」这个正常取值，不是
+// 「没有上游」。真把它拼进 WHERE，一次误传就会把全站的全局规则一起删光，而那
+// 批规则正是站点最要紧的那道闸。挡在这一层而不是只靠调用方自觉：这个方法删的
+// 是一整批行，代价和「少删一次」完全不对称。
+func (a *accessRuleRepo) DeleteByUpstream(ctx context.Context, upstreamID int64) error {
+	if upstreamID == 0 {
+		return nil
+	}
+	return db.Ctx(ctx).Where("upstream_id=?", upstreamID).
+		Delete(&rule_entity.AccessRule{}).Error
 }

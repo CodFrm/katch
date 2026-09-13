@@ -55,6 +55,20 @@ func (mr *MockAccessRuleRepoMockRecorder) Delete(ctx, id any) *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Delete", reflect.TypeOf((*MockAccessRuleRepo)(nil).Delete), ctx, id)
 }
 
+// DeleteByUpstream mocks base method.
+func (m *MockAccessRuleRepo) DeleteByUpstream(ctx context.Context, upstreamID int64) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "DeleteByUpstream", ctx, upstreamID)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// DeleteByUpstream indicates an expected call of DeleteByUpstream.
+func (mr *MockAccessRuleRepoMockRecorder) DeleteByUpstream(ctx, upstreamID any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeleteByUpstream", reflect.TypeOf((*MockAccessRuleRepo)(nil).DeleteByUpstream), ctx, upstreamID)
+}
+
 // Find mocks base method.
 func (m *MockAccessRuleRepo) Find(ctx context.Context, id int64) (*rule_entity.AccessRule, error) {
 	m.ctrl.T.Helper()

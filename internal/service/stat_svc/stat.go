@@ -142,6 +142,10 @@ func (s *statSvc) drainer() Drainer {
 
 func (s *statSvc) Flush(ctx context.Context) error {
 	now := s.opt.Now().Unix()
+	// 顺带把缓存占用刷到 /metrics 上：katch_cache_objects 与 katch_cache_bytes
+	// 是「此刻有多少」，只能按快照给。搭这趟车而不是另起一个定时器，是因为
+	// 这里本来就每分钟醒一次，而这两个数的新鲜度要求和分钟桶完全一样。
+	s.refreshCacheGauges(ctx)
 	var failures []error
 	for _, bucket := range s.drainer().Drain() {
 		if err := s.saveBucket(ctx, now, bucket); err != nil {
@@ -186,6 +190,45 @@ func (s *statSvc) saveBucket(ctx context.Context, now int64, bucket metrics.Buck
 	row.BytesOrigin += bucket.BytesOrigin
 	row.Updatetime = now
 	return rollup_repo.TrafficRollup().Save(ctx, row)
+}
+
+// refreshCacheGauges 把按上游的缓存对象数与字节数刷成 /metrics 上的两个 gauge。
+//
+// 查不出来就不刷：留着上一轮的数字，比换成一排 0 更接近事实——0 会让人以为
+// 缓存被清空了，而实际上只是这一次没读到。
+func (s *statSvc) refreshCacheGauges(ctx context.Context) {
+	repo := cache_repo.CacheObject()
+	if repo == nil {
+		// 缓存目录不可用时 main 根本不装这个仓储，此时没有占用可言。
+		return
+	}
+	sizes, err := repo.SizeByUpstream(ctx)
+	if err != nil {
+		logger.Ctx(ctx).Error("统计按上游的缓存占用失败", zap.Error(err))
+		return
+	}
+	counts, err := repo.CountByUpstream(ctx)
+	if err != nil {
+		logger.Ctx(ctx).Error("统计按上游的缓存对象数失败", zap.Error(err))
+		return
+	}
+	list, err := upstream_svc.Upstream().List(ctx, &admin.ListUpstreamsRequest{})
+	if err != nil {
+		// 指标的标签是主机名，翻不出来就不刷：按 upstream_id 打标签会让
+		// /metrics 上出现一串没人认得的数字。
+		logger.Ctx(ctx).Error("读取上游列表失败，本轮不刷缓存占用指标", zap.Error(err))
+		return
+	}
+	usage := make([]metrics.CacheUsage, 0, len(list.List))
+	for _, item := range list.List {
+		// 没缓存过的上游也要给一行 0：它同样是要看的事实，缺行会在图上变成断点。
+		usage = append(usage, metrics.CacheUsage{
+			Upstream: item.Host,
+			Objects:  counts[item.ID],
+			Bytes:    sizes[item.ID],
+		})
+	}
+	metrics.SetCacheUsage(usage)
 }
 
 func (s *statSvc) Prune(ctx context.Context) (int64, error) {
