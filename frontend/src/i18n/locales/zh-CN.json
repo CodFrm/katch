@@ -147,6 +147,22 @@
           "changed": "上游 digest 变更"
         }
       },
+      "recent": {
+        "title": "最近请求",
+        "columns": {
+          "at": "时间",
+          "object": "对象",
+          "result": "结果",
+          "bytes": "大小",
+          "duration": "耗时"
+        },
+        "result": {
+          "hit": "命中",
+          "miss": "回源",
+          "denied": "规则拒绝",
+          "origin_error": "回源失败"
+        }
+      },
       "tab": {
         "overview": "概况",
         "rules": "访问规则"

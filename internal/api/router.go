@@ -13,6 +13,7 @@ import (
 
 	"github.com/CodFrm/katch/internal/controller/cache_ctr"
 	"github.com/CodFrm/katch/internal/controller/event_ctr"
+	"github.com/CodFrm/katch/internal/controller/log_ctr"
 	"github.com/CodFrm/katch/internal/controller/rule_ctr"
 	"github.com/CodFrm/katch/internal/controller/setting_ctr"
 	"github.com/CodFrm/katch/internal/controller/site_ctr"
@@ -80,6 +81,10 @@ func Router(_ context.Context, root *mux.Router) error {
 	// 事件流同一道闸：里面是主机名、规则模式和设置键的变更史，是运营数据。
 	eventCtr := event_ctr.NewEvent()
 	adminGroup.Bind(storageAware(eventCtr.List))
+	// 最近请求读的是结构化日志的有界尾部，不是一张表（决策 16 否掉了每请求写库）。
+	// 端点上没有文件名这个参数：读哪个文件只由 configs 里的 logger.logFile 决定。
+	logCtr := log_ctr.NewLog()
+	adminGroup.Bind(storageAware(logCtr.RecentRequests))
 
 	return nil
 }

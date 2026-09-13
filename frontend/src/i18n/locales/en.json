@@ -147,6 +147,22 @@
           "changed": "Upstream digest changed"
         }
       },
+      "recent": {
+        "title": "Recent requests",
+        "columns": {
+          "at": "Time",
+          "object": "Object",
+          "result": "Result",
+          "bytes": "Size",
+          "duration": "Latency"
+        },
+        "result": {
+          "hit": "Hit",
+          "miss": "Origin",
+          "denied": "Denied",
+          "origin_error": "Origin failed"
+        }
+      },
       "tab": {
         "overview": "Overview",
         "rules": "Access rules"

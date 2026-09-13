@@ -24,10 +24,12 @@ import (
 
 	"github.com/cago-frame/cago"
 	"github.com/cago-frame/cago/configs"
+	"github.com/cago-frame/cago/pkg/logger"
 	"github.com/cago-frame/cago/server/mux"
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"go.uber.org/zap"
 
 	"github.com/CodFrm/katch/internal/proxy/dispatch"
 )
@@ -377,10 +379,16 @@ func (r *Recorder) Drain() []Bucket {
 	return list
 }
 
+// PullLogMessage 每次拉取写进结构化日志的那一行的 msg。
+//
+// 上游详情上的「最近请求」读的就是这些行（log_svc 按这个 msg 把它们从同一个文件
+// 里的别的日志中挑出来），两边一起改。
+const PullLogMessage = "拉取"
+
 // Middleware 构造拉取路径的计数中间件。
 func (r *Recorder) Middleware(hooks Hooks) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		kind, host, _ := dispatch.Classify(c.Request.URL.EscapedPath())
+		kind, host, object := dispatch.Classify(c.Request.URL.EscapedPath())
 		if hooks.Lookup == nil || (kind != dispatch.KindRegistry && kind != dispatch.KindStatic) {
 			// 界面、静态产物和 katch 自身的端点不是拉取，计进来只会把命中率冲淡。
 			c.Next()
@@ -411,8 +419,36 @@ func (r *Recorder) Middleware(hooks Hooks) gin.HandlerFunc {
 			}
 		}
 		r.RecordRequest(ev)
+		r.logPull(c.Request.Context(), object, ev)
 		r.feedGate(hooks.Gate, host, ev.Result)
 	}
+}
+
+// logPull 把这次拉取写成结构化日志的一行。
+//
+// 它和计数共用这一个缝，而不是另起一处埋点：两者要的是同一批事实，分开记迟早会
+// 出现「指标上有、日志里没有」的那一类对不上。界面上的「最近请求」读的就是这些
+// 行的有界尾部——它本来就是日志，不为它另建每请求的表（决策 16）。
+//
+// info 而不是 debug：默认级别看不见的话，那块面板在一台没人调过日志级别的机器上
+// 永远是空的。一行只有这几个字段，既不记请求头也不记 token（可观测性一节）。
+//
+// 只记上游表里有的主机：拉取路径是公开的，把没见过的主机名也写进去，等于让任何
+// 人都能往这台机器的磁盘上写字符串。它们的计数仍然照记，只是折在 unknown 上。
+func (r *Recorder) logPull(ctx context.Context, object string, ev Event) {
+	if ev.Upstream == "" {
+		return
+	}
+	logger.Ctx(ctx).Info(PullLogMessage,
+		// at 是这次拉取**结束**的时刻：日志按结束顺序落盘，用开始时刻会让
+		// 尾部的行在时间上不再单调，而面板就是按文件顺序从新到旧排的。
+		zap.Int64("at", r.now().Unix()),
+		zap.String("upstream", ev.Upstream),
+		zap.String("object", object),
+		zap.String("result", string(ev.Result)),
+		zap.Int64("bytes", ev.BytesServed),
+		zap.Int64("duration_ms", ev.Duration.Milliseconds()),
+	)
 }
 
 // feedGate 把这次回源的成败喂给退避，并把降级状态标到指标上。

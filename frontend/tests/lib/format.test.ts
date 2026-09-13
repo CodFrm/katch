@@ -2,8 +2,10 @@ import { describe, expect, it } from 'vitest'
 
 import {
   formatBytes,
+  formatClock,
   formatCount,
   formatDuration,
+  formatLatency,
   formatPercent,
   formatStamp,
   parseBytes,
@@ -142,4 +144,34 @@ describe('formatDuration / parseDuration', () => {
     expect(parseDuration('')).toBeNull()
     expect(parseDuration('-5s')).toBeNull()
   })
+})
+
+describe('formatClock', () => {
+  it('精确到秒，按本地时区', () => {
+    const at = new Date(2025, 8, 12, 14, 32, 7)
+    expect(formatClock(at.getTime() / 1000)).toBe('14:32:07')
+  })
+
+  it('个位数补零，读起来才对得齐', () => {
+    const at = new Date(2025, 8, 12, 9, 5, 3)
+    expect(formatClock(at.getTime() / 1000)).toBe('09:05:03')
+  })
+})
+
+describe('formatLatency', () => {
+  // 不到一秒的写毫秒：命中一份小文件是几毫秒的事，写成 0.0 s 就把「快得看不见」
+  // 和「量到了零」说成了同一句话。
+  const cases: [number, string][] = [
+    [4, '4 ms'],
+    [120, '120 ms'],
+    [999, '999 ms'],
+    [1000, '1.0 s'],
+    [3200, '3.2 s'],
+    [65400, '65.4 s'],
+  ]
+  for (const [ms, text] of cases) {
+    it(`${ms} 毫秒写成 ${text}`, () => {
+      expect(formatLatency(ms)).toBe(text)
+    })
+  }
 })

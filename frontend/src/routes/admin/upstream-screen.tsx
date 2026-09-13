@@ -6,6 +6,7 @@ import { ScreenHeader } from '@/components/admin/admin-shell'
 import { HourlyChart } from '@/components/admin/hourly-chart'
 import { MetricBar, type Metric } from '@/components/admin/metric-bar'
 import { MissReasons } from '@/components/admin/miss-reasons'
+import { RecentRequests } from '@/components/admin/recent-requests'
 import { useAdminAction } from '@/hooks/use-admin-action'
 import { useUpstreamSeries } from '@/hooks/use-admin-data'
 import {
@@ -163,6 +164,13 @@ export function UpstreamScreen({
                 <MissReasons points={points} />
               </div>
             )}
+            {/* 上面两块答的是「这段时间总共怎么样」，这张表答「刚刚发生了什么」——
+                它读的是结构化日志的尾部，读不到时自己整块消失。 */}
+            <RecentRequests
+              adminKey={adminKey}
+              upstreamID={upstreamID}
+              onUnauthorized={onUnauthorized}
+            />
           </div>
         </>
       ) : (

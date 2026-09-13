@@ -1,4 +1,4 @@
-import { render, screen, within } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -177,6 +177,27 @@ const events = {
   ],
 }
 
+/**
+ * 最近请求：后端从结构化日志的尾部读回来的几行，最近的在最前。
+ *
+ * 它不是一张表（决策 16 否掉了每请求写库），所以「读不到」是这块面板的常态之一：
+ * 没开日志落盘、文件刚被轮转走，后端都给一个空列表。
+ */
+const recent = {
+  list: [
+    { at: TO - 5, object: 'library/redis:7', result: 'hit', bytes: 43200000, duration_ms: 900 },
+    {
+      at: TO - 17,
+      object: 'library/nginx:1.27',
+      result: 'miss',
+      bytes: 71700000,
+      duration_ms: 3200,
+    },
+    { at: TO - 60, object: 'library/alpine:3.21', result: 'denied', bytes: 0, duration_ms: 0 },
+    { at: TO - 90, object: 'library/mysql:8', result: 'origin_error', bytes: 0, duration_ms: 120 },
+  ],
+}
+
 /** 后端的 401：cago 的信封 + 一句英文串，界面一个字都不该贴出来。 */
 const unauthorized = {
   ok: false,
@@ -190,7 +211,9 @@ function envelope(data: unknown) {
 
 let requests: { url: string; key: string | null }[] = []
 
-function stubFetch(options: { key?: string; series?: (id: number) => unknown } = {}) {
+function stubFetch(
+  options: { key?: string; series?: (id: number) => unknown; recent?: (id: number) => unknown } = {}
+) {
   const good = options.key ?? KEY
   const seriesOf = options.series ?? series
   vi.stubGlobal(
@@ -203,6 +226,11 @@ function stubFetch(options: { key?: string; series?: (id: number) => unknown } =
       }
       if (header !== `Bearer ${good}`) {
         return unauthorized
+      }
+      if (url.startsWith('/api/v1/admin/logs/requests')) {
+        const id = Number(new URLSearchParams(url.split('?')[1]).get('upstream_id'))
+        // 没给就当日志读不到：后端在没开落盘、文件被轮转走时给的就是空列表。
+        return envelope(options.recent?.(id) ?? { list: [] })
       }
       if (url.startsWith('/api/v1/admin/stats/upstreams/series')) {
         const id = Number(new URLSearchParams(url.split('?')[1]).get('upstream_id'))
@@ -458,6 +486,76 @@ describe('后台上游详情', () => {
     const panel = await screen.findByRole('group', { name: '回源原因' })
     expect(panel.querySelectorAll('[data-slot="miss-reason"]')).toHaveLength(0)
     expect(within(panel).getByText('这段时间没有回源')).toBeInTheDocument()
+  })
+
+  it('最近请求读的是日志的尾部：时间、对象、结果、大小、耗时', async () => {
+    // 这块面板答的是「刚刚发生了什么」——分钟级的 rollup 答不了它，所以它读的是
+    // 结构化日志而不是一张每请求的表（决策 16）。
+    stubFetch({ recent: () => recent })
+    renderAdmin('/admin/upstreams/1')
+
+    const table = await screen.findByRole('table', { name: '最近请求' })
+    const rows = within(table).getAllByRole('row').slice(1)
+    expect(rows).toHaveLength(4)
+
+    const first = within(rows[0])
+      .getAllByRole('cell')
+      .map((cell) => cell.textContent)
+    expect(first[1]).toBe('library/redis:7')
+    expect(first[2]).toBe('命中')
+    expect(first[3]).toBe('41 MB')
+    expect(first[4]).toBe('900 ms')
+    // 时刻精确到秒：同一分钟里的几次拉取要分得出先后。
+    expect(first[0]).toMatch(/^\d{2}:\d{2}:\d{2}$/)
+
+    // 到了一秒就写秒：毫秒数在这个量级上没人读。
+    expect(within(rows[1]).getAllByRole('cell')[4]).toHaveTextContent('3.2 s')
+    expect(within(rows[1]).getAllByRole('cell')[2]).toHaveTextContent('回源')
+    expect(within(rows[3]).getAllByRole('cell')[2]).toHaveTextContent('回源失败')
+
+    // 规则拒绝那一行没有字节也没有耗时，占位用破折号而不是 0 B / 0 ms——
+    // 后者是「量到了，是零」，而这里根本没量。
+    const denied = within(rows[2])
+      .getAllByRole('cell')
+      .map((cell) => cell.textContent)
+    expect(denied[2]).toBe('规则拒绝')
+    expect(denied[3]).toBe('—')
+    expect(denied[4]).toBe('—')
+
+    const call = requests.find((r) => r.url.startsWith('/api/v1/admin/logs/requests'))
+    expect(call?.url).toContain('upstream_id=1')
+    expect(call?.key).toBe(`Bearer ${KEY}`)
+    // 读哪个文件只由 configs 里的 logger.logFile 决定，界面不带文件名。
+    expect(call?.url).not.toMatch(/file|filename|path|log=/)
+  })
+
+  it('日志读不到时这一块整个消失，而不是挂一句打不开文件', async () => {
+    // 后端在日志没开、被轮转走、权限变了时给空列表；界面据此让面板消失。
+    // 排障的辅助块消失，好过让整屏管理界面挂在一句错误上。
+    stubFetch({ recent: () => ({ list: [] }) })
+    renderAdmin('/admin/upstreams/1')
+
+    expect(await screen.findByRole('group', { name: '回源原因' })).toBeInTheDocument()
+    expect(screen.queryByRole('table', { name: '最近请求' })).not.toBeInTheDocument()
+    expect(screen.queryByText('最近请求')).not.toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('切到另一个上游时不把上一个的最近请求留在屏幕上', async () => {
+    // 手里那份行属于上一个上游。换一个上游之后它们还挂在屏幕上的话，看的人会把
+    // 别人的拉取记在这个上游头上——而这块面板本来就是拿来回答「它怎么了」的。
+    stubFetch({ recent: (id) => (id === 1 ? recent : { list: [] }) })
+    renderAdmin('/admin/upstreams/1')
+    expect(await screen.findByRole('table', { name: '最近请求' })).toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole('link', { name: /pypi\.org/ }))
+
+    expect(await screen.findByRole('heading', { name: 'pypi.org' })).toBeInTheDocument()
+    await waitFor(() =>
+      expect(screen.queryByRole('table', { name: '最近请求' })).not.toBeInTheDocument()
+    )
+    const calls = requests.filter((r) => r.url.startsWith('/api/v1/admin/logs/requests'))
+    expect(calls.some((r) => r.url.includes('upstream_id=2'))).toBe(true)
   })
 
   it('详情头给的是这个上游的登记信息，不是别人的', async () => {

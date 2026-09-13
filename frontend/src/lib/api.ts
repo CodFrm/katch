@@ -245,6 +245,35 @@ export function fetchUpstreamSeries(
   )
 }
 
+/**
+ * 一次拉取在结构化日志里留下的那一行，取值与后端 api/admin.RecentRequest 一致。
+ *
+ * 它不来自数据库：每请求写库会把拉取热路径拖进事务（决策 16），这几个字段本来
+ * 就是日志已经记着的东西。`result` 与 katch_requests_total 的 result 同一套取值。
+ */
+export interface RecentRequestItem {
+  at: number
+  object: string
+  result: 'hit' | 'miss' | 'denied' | 'origin_error'
+  bytes: number
+  duration_ms: number
+}
+
+/**
+ * 某个上游最近的若干次拉取。
+ *
+ * 参数里只有 upstream_id：读哪个日志文件由后端的 configs 决定，界面**不给文件名**
+ * ——让调用方指定路径等于把管理接口变成一条任意文件读取的路。条数的上限也在后端，
+ * 这里不传 limit，用它的默认值。
+ */
+export function fetchRecentRequests(key: string, upstreamID: number, signal?: AbortSignal) {
+  return adminGet<{ list: RecentRequestItem[] }>(
+    `/api/v1/admin/logs/requests?upstream_id=${upstreamID}`,
+    key,
+    signal
+  )
+}
+
 export function fetchAdminEvents(key: string, limit: number, signal?: AbortSignal) {
   return adminGet<{ list: EventItem[] }>(`/api/v1/admin/events?limit=${limit}`, key, signal)
 }

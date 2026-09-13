@@ -135,3 +135,30 @@ export function parseDuration(text: string): number | null {
   const scale = { '': 1, s: 1, m: 60, h: 3600 }[matched[2]] ?? 1
   return Math.round(Number(matched[1]) * scale)
 }
+
+/**
+ * 秒级时间戳写成本地的 `HH:MM:SS`。
+ *
+ * 最近请求要精确到秒：同一分钟里拉十几次是常态，只到分钟就看不出先后，而这块
+ * 面板的全部用处就是「刚刚按什么顺序发生了什么」。
+ */
+export function formatClock(seconds: number): string {
+  const at = new Date(seconds * 1000)
+  return `${pad(at.getHours())}:${pad(at.getMinutes())}:${pad(at.getSeconds())}`
+}
+
+/**
+ * 一次拉取的耗时：不到一秒的写毫秒，到了一秒的写一位小数的秒。
+ *
+ * 不统一成秒：命中一份小文件是几毫秒的事，写成 `0.0 s` 等于把「快得看不见」
+ * 和「量到了零」说成同一句话，而前者恰恰是缓存在干活的证据。
+ */
+export function formatLatency(milliseconds: number): string {
+  if (!Number.isFinite(milliseconds) || milliseconds <= 0) {
+    return '0 ms'
+  }
+  if (milliseconds < 1000) {
+    return `${Math.round(milliseconds)} ms`
+  }
+  return `${(milliseconds / 1000).toFixed(1)} s`
+}
