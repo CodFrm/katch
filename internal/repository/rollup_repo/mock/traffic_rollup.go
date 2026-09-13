@@ -101,19 +101,19 @@ func (mr *MockTrafficRollupRepoMockRecorder) Sum(ctx, from, to any) *gomock.Call
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Sum", reflect.TypeOf((*MockTrafficRollupRepo)(nil).Sum), ctx, from, to)
 }
 
-// SumByDay mocks base method.
-func (m *MockTrafficRollupRepo) SumByDay(ctx context.Context, from, to int64) ([]*rollup_repo.DayTotals, error) {
+// SumBySeries mocks base method.
+func (m *MockTrafficRollupRepo) SumBySeries(ctx context.Context, q rollup_repo.SeriesQuery) ([]*rollup_repo.SeriesTotals, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "SumByDay", ctx, from, to)
-	ret0, _ := ret[0].([]*rollup_repo.DayTotals)
+	ret := m.ctrl.Call(m, "SumBySeries", ctx, q)
+	ret0, _ := ret[0].([]*rollup_repo.SeriesTotals)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
-// SumByDay indicates an expected call of SumByDay.
-func (mr *MockTrafficRollupRepoMockRecorder) SumByDay(ctx, from, to any) *gomock.Call {
+// SumBySeries indicates an expected call of SumBySeries.
+func (mr *MockTrafficRollupRepoMockRecorder) SumBySeries(ctx, q any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SumByDay", reflect.TypeOf((*MockTrafficRollupRepo)(nil).SumByDay), ctx, from, to)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SumBySeries", reflect.TypeOf((*MockTrafficRollupRepo)(nil).SumBySeries), ctx, q)
 }
 
 // SumByUpstream mocks base method.

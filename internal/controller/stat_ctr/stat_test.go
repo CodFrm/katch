@@ -45,6 +45,13 @@ const (
 	testDailyDay = testToday - int64(stat.DailyDays-1)*86400
 )
 
+// testSeriesTo、testSeriesFrom 由 testNow 折算出的小时边界：testNow 落在整点
+// 之后的第 800 秒，时序的两端都要被推到整点上。
+const (
+	testSeriesTo   = int64(1699999200) + 3600
+	testSeriesFrom = testSeriesTo - 24*3600
+)
+
 type statEnv struct {
 	rollup   *mock_rollup_repo.MockTrafficRollupRepo
 	cache    *mock_cache_repo.MockCacheObjectRepo
@@ -105,10 +112,11 @@ func TestStatOverviewIsPublic(t *testing.T) {
 			}, nil)
 
 		env.cache.EXPECT().TotalSize(gomock.Any()).Return(int64(1<<30), nil)
-		env.rollup.EXPECT().SumByDay(gomock.Any(), testDailyDay, testToday+86400).
-			Return([]*rollup_repo.DayTotals{
-				{Day: testToday, Requests: 20, Hits: 15, BytesServed: 2048, BytesOrigin: 512},
-			}, nil)
+		env.rollup.EXPECT().SumBySeries(gomock.Any(), rollup_repo.SeriesQuery{
+			From: testDailyDay, To: testToday + 86400, Width: 86400,
+		}).Return([]*rollup_repo.SeriesTotals{
+			{Bucket: testToday, Requests: 20, Hits: 15, BytesServed: 2048, BytesOrigin: 512},
+		}, nil)
 
 		resp := &stat.OverviewResponse{}
 		convey.So(env.mux.Do(context.Background(), &stat.OverviewRequest{}, resp), convey.ShouldBeNil)
@@ -204,7 +212,9 @@ func TestStatOverviewHidden(t *testing.T) {
 			env.rollup.EXPECT().Sum(gomock.Any(), testNow-24*3600, testNow).
 				Return(&rollup_entity.Totals{Requests: 100, Hits: 60}, nil)
 			env.cache.EXPECT().TotalSize(gomock.Any()).Return(int64(4096), nil)
-			env.rollup.EXPECT().SumByDay(gomock.Any(), testDailyDay, testToday+86400).Return(nil, nil)
+			env.rollup.EXPECT().SumBySeries(gomock.Any(), rollup_repo.SeriesQuery{
+				From: testDailyDay, To: testToday + 86400, Width: 86400,
+			}).Return(nil, nil)
 
 			req := httptest.NewRequest(http.MethodGet, "/api/v1/stats/overview", nil)
 			req.Header.Set("Authorization", "Bearer "+adminKey)
@@ -217,5 +227,67 @@ func TestStatOverviewHidden(t *testing.T) {
 			convey.So(w.Body.String(), convey.ShouldContainSubstring, `"cache_bytes":4096`)
 			convey.So(w.Body.String(), convey.ShouldContainSubstring, `"daily":[`)
 		})
+	})
+}
+
+// TestStatUpstreamSeriesRequiresKey 单上游的逐小时量比区间合计还细，
+// 和区间统计走同一道闸：没有密钥连端点存不存在都不该看出来。
+func TestStatUpstreamSeriesRequiresKey(t *testing.T) {
+	env := setupStatTest(t, nil)
+	convey.Convey("单上游的时序要密钥", t, func() {
+		// 一个 EXPECT 都没有：鉴权一旦放行进 service，mock 会当场让用例失败。
+		req, err := env.mux.Request(context.Background(), &admin.UpstreamSeriesRequest{UpstreamID: 7})
+		convey.So(err, convey.ShouldBeNil)
+		w := httptest.NewRecorder()
+		env.engine.ServeHTTP(w, req)
+		convey.So(w.Code, convey.ShouldEqual, http.StatusUnauthorized)
+	})
+}
+
+// TestStatUpstreamSeries 覆盖上游详情那张 24 小时命中/回源堆叠图要的数据。
+func TestStatUpstreamSeries(t *testing.T) {
+	env := setupStatTest(t, nil)
+	convey.Convey("带密钥能读到某个上游的逐小时序列", t, func() {
+		env.rollup.EXPECT().SumBySeries(gomock.Any(), rollup_repo.SeriesQuery{
+			From: testSeriesFrom, To: testSeriesTo, Width: admin.SeriesBucketSeconds, UpstreamID: 7,
+		}).Return([]*rollup_repo.SeriesTotals{
+			{Bucket: testSeriesTo - 3600, Requests: 12, Hits: 8, Denied: 1, OriginErrors: 1, BytesServed: 2048, BytesOrigin: 512},
+		}, nil)
+
+		resp := &admin.UpstreamSeriesResponse{}
+		convey.So(env.mux.Do(context.Background(), &admin.UpstreamSeriesRequest{UpstreamID: 7}, resp,
+			muxclient.WithHeader(http.Header{"Authorization": []string{"Bearer " + adminKey}})),
+			convey.ShouldBeNil)
+		convey.So(resp.Range, convey.ShouldEqual, "24h")
+		convey.So(resp.BucketSeconds, convey.ShouldEqual, 3600)
+		convey.So(resp.From, convey.ShouldEqual, testSeriesFrom)
+		convey.So(resp.To, convey.ShouldEqual, testSeriesTo)
+		convey.So(len(resp.List), convey.ShouldEqual, 24)
+		convey.So(resp.List[0].Bucket, convey.ShouldEqual, testSeriesFrom)
+		convey.So(resp.List[0].Requests, convey.ShouldEqual, 0)
+		// 堆叠柱要的六个数都在最后那个点上。
+		last := resp.List[23]
+		convey.So(last.Bucket, convey.ShouldEqual, testSeriesTo-3600)
+		convey.So(last.Requests, convey.ShouldEqual, 12)
+		convey.So(last.Hits, convey.ShouldEqual, 8)
+		convey.So(last.Denied, convey.ShouldEqual, 1)
+		convey.So(last.OriginErrors, convey.ShouldEqual, 1)
+		convey.So(last.BytesServed, convey.ShouldEqual, 2048)
+		convey.So(last.BytesOrigin, convey.ShouldEqual, 512)
+	})
+}
+
+// TestStatUpstreamSeriesNeedsUpstream 不给上游就不该退化成全站时序：
+// 这是「某个上游的详情」，少一个参数就把全站逐小时的量顺手给出去太便宜了。
+func TestStatUpstreamSeriesNeedsUpstream(t *testing.T) {
+	env := setupStatTest(t, nil)
+	convey.Convey("没给 upstream_id 直接拒掉", t, func() {
+		// 一个 EXPECT 都没有：参数一旦漏过去，service 会拿 upstream_id=0
+		// 去查全站，mock 会当场让用例失败。
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/stats/upstreams/series", nil)
+		req.Header.Set("Authorization", "Bearer "+adminKey)
+		w := httptest.NewRecorder()
+		env.engine.ServeHTTP(w, req)
+		convey.So(w.Code, convey.ShouldEqual, http.StatusBadRequest)
 	})
 }

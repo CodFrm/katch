@@ -112,27 +112,59 @@ func TestTrafficRollupRepo_Save(t *testing.T) {
 	})
 }
 
-func TestTrafficRollupRepo_SumByDay(t *testing.T) {
-	convey.Convey("按自然日分组聚合", t, func() {
+func TestTrafficRollupRepo_SumBySeries(t *testing.T) {
+	convey.Convey("按等宽时间桶分组聚合", t, func() {
 		ctx, _, mock := testutils.Database(t)
-		// 分组键在 SQL 里算：把 14 天的分钟桶捞回 Go 里再分组，等于每次打开
-		// 首页都要扫回 14×1440 行。UTC 而不是进程时区：桶本身是 UTC 秒。
-		mock.ExpectQuery("SELECT \\(bucket - bucket % 86400\\) AS day,COALESCE\\(SUM\\(requests\\), 0\\).*"+
-			"FROM `traffic_rollups` WHERE bucket >= \\? AND bucket < \\? GROUP BY `day` ORDER BY day asc").
-			WithArgs(int64(1699920000), int64(1700092800)).
-			WillReturnRows(sqlmock.NewRows([]string{"day", "requests", "hits", "denied", "origin_errors", "bytes_served", "bytes_origin"}).
-				AddRow(1699920000, 100, 60, 5, 3, 4096, 1024).
-				AddRow(1700006400, 20, 20, 0, 0, 8192, 0))
 
-		got, err := NewTrafficRollup().SumByDay(ctx, 1699920000, 1700092800)
-		convey.So(err, convey.ShouldBeNil)
-		convey.So(len(got), convey.ShouldEqual, 2)
-		convey.So(got[0].Day, convey.ShouldEqual, 1699920000)
-		convey.So(got[0].Requests, convey.ShouldEqual, 100)
-		convey.So(got[0].Hits, convey.ShouldEqual, 60)
-		convey.So(got[0].BytesOrigin, convey.ShouldEqual, 1024)
-		convey.So(got[1].Day, convey.ShouldEqual, 1700006400)
-		convey.So(got[1].BytesServed, convey.ShouldEqual, 8192)
-		convey.So(mock.ExpectationsWereMet(), convey.ShouldBeNil)
+		convey.Convey("按自然日分桶，供首页的 14 天趋势用", func() {
+			// 分组键在 SQL 里算：把 14 天的分钟桶捞回 Go 里再分组，等于每次打开
+			// 首页都要扫回 14×1440 行。UTC 而不是进程时区：桶本身是 UTC 秒。
+			mock.ExpectQuery("SELECT \\(bucket - bucket % 86400\\) AS bucket_start,COALESCE\\(SUM\\(requests\\), 0\\).*"+
+				"FROM `traffic_rollups` WHERE bucket >= \\? AND bucket < \\? GROUP BY `bucket_start` ORDER BY bucket_start asc").
+				WithArgs(int64(1699920000), int64(1700092800)).
+				WillReturnRows(sqlmock.NewRows([]string{"bucket_start", "requests", "hits", "denied", "origin_errors", "bytes_served", "bytes_origin"}).
+					AddRow(1699920000, 100, 60, 5, 3, 4096, 1024).
+					AddRow(1700006400, 20, 20, 0, 0, 8192, 0))
+
+			got, err := NewTrafficRollup().SumBySeries(ctx, SeriesQuery{
+				From: 1699920000, To: 1700092800, Width: 86400,
+			})
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(len(got), convey.ShouldEqual, 2)
+			convey.So(got[0].Bucket, convey.ShouldEqual, 1699920000)
+			convey.So(got[0].Requests, convey.ShouldEqual, 100)
+			convey.So(got[0].Hits, convey.ShouldEqual, 60)
+			convey.So(got[0].BytesOrigin, convey.ShouldEqual, 1024)
+			convey.So(got[1].Bucket, convey.ShouldEqual, 1700006400)
+			convey.So(got[1].BytesServed, convey.ShouldEqual, 8192)
+			convey.So(mock.ExpectationsWereMet(), convey.ShouldBeNil)
+		})
+
+		convey.Convey("按小时分桶并只看一个上游，供上游详情的堆叠图用", func() {
+			// 桶宽是参数而不是另写一个方法：日和小时只差这一个数，各写一遍
+			// 迟早会在其中一边把左闭右开或者分组键写歪。
+			mock.ExpectQuery("SELECT \\(bucket - bucket % 3600\\) AS bucket_start,COALESCE\\(SUM\\(requests\\), 0\\).*"+
+				"FROM `traffic_rollups` WHERE \\(bucket >= \\? AND bucket < \\?\\) AND upstream_id = \\? GROUP BY `bucket_start` ORDER BY bucket_start asc").
+				WithArgs(int64(1699916400), int64(1700002800), int64(7)).
+				WillReturnRows(sqlmock.NewRows([]string{"bucket_start", "requests", "hits", "denied", "origin_errors", "bytes_served", "bytes_origin"}).
+					AddRow(1699999200, 12, 8, 1, 1, 2048, 512))
+
+			got, err := NewTrafficRollup().SumBySeries(ctx, SeriesQuery{
+				From: 1699916400, To: 1700002800, Width: 3600, UpstreamID: 7,
+			})
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(len(got), convey.ShouldEqual, 1)
+			convey.So(got[0].Bucket, convey.ShouldEqual, 1699999200)
+			convey.So(got[0].Hits, convey.ShouldEqual, 8)
+			convey.So(got[0].Denied, convey.ShouldEqual, 1)
+			convey.So(got[0].OriginErrors, convey.ShouldEqual, 1)
+			convey.So(mock.ExpectationsWereMet(), convey.ShouldBeNil)
+		})
+
+		convey.Convey("桶宽为零直接报错，不去库里除以零", func() {
+			_, err := NewTrafficRollup().SumBySeries(ctx, SeriesQuery{From: 1, To: 2})
+			convey.So(err, convey.ShouldNotBeNil)
+			convey.So(mock.ExpectationsWereMet(), convey.ShouldBeNil)
+		})
 	})
 }

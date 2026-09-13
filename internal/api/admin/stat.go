@@ -37,3 +37,49 @@ type UpstreamStatsResponse struct {
 	To    int64               `json:"to"`
 	List  []*UpstreamStatItem `json:"list"`
 }
+
+// SeriesBucketSeconds 时序的桶宽：一小时。
+//
+// 固定值而不是跟着 Range 变：换区间只该改「看多久」，桶宽跟着变会让 24 小时
+// 和 7 天两张图上的一根柱子代表不同的时间跨度，眼睛对不上，也没法对比。
+const SeriesBucketSeconds = 3600
+
+// UpstreamSeriesRequest 查单个上游的按小时时序。Range 留空按 24h 处理。
+type UpstreamSeriesRequest struct {
+	mux.Meta   `path:"/admin/stats/upstreams/series" method:"GET"`
+	UpstreamID int64  `form:"upstream_id" binding:"required" label:"上游"`
+	Range      string `form:"range" binding:"omitempty,oneof=24h 7d 30d" label:"统计区间"`
+}
+
+// UpstreamSeriesPoint 一个小时桶里的量。
+//
+// 六个计数一个不少：上游详情要画的是命中/回源的堆叠柱加回源原因分解，
+// 少给一个就得为同一张图再打一次接口，两次请求之间的时刻还会对不上。
+type UpstreamSeriesPoint struct {
+	// Bucket 这个小时的起点（秒，UTC）。
+	//
+	// UTC 而不是进程本地时区：分钟桶本身是 UTC 秒，跟着时区走会让同一批数据
+	// 在两台部署上落到不同的小时，换算成本地时间是界面的事。
+	Bucket       int64 `json:"bucket"`
+	Requests     int64 `json:"requests"`
+	Hits         int64 `json:"hits"`
+	Denied       int64 `json:"denied"`
+	OriginErrors int64 `json:"origin_errors"`
+	BytesServed  int64 `json:"bytes_served"`
+	BytesOrigin  int64 `json:"bytes_origin"`
+}
+
+// UpstreamSeriesResponse 一个上游在这段区间里的逐小时序列。
+//
+// 由旧到新、缺的小时补零、固定 (To-From)/SeriesBucketSeconds 个点：一个刚加
+// 上的上游应该是一排零点加一两根柱子，而不是一根柱子被拉满整张图。
+type UpstreamSeriesResponse struct {
+	// Range 实际生效的区间，请求没给时回显默认值。
+	Range string `json:"range"`
+	// From、To 这次序列的左闭右开边界（秒），都落在小时边界上。
+	From int64 `json:"from"`
+	To   int64 `json:"to"`
+	// BucketSeconds 桶宽（秒），恒为 SeriesBucketSeconds。
+	BucketSeconds int64                  `json:"bucket_seconds"`
+	List          []*UpstreamSeriesPoint `json:"list"`
+}

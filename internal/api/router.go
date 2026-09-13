@@ -59,7 +59,7 @@ func Router(_ context.Context, root *mux.Router) error {
 	// /api/v1/admin/* 一律要密钥；拉取路径与其余公开接口不经过这个中间件。
 	adminGroup := r.Group("/", requireAdminKey)
 	adminGroup.Bind(upstreamCtr.List, upstreamCtr.Save, upstreamCtr.Delete)
-	adminGroup.Bind(statCtr.ByUpstream)
+	adminGroup.Bind(statCtr.ByUpstream, statCtr.UpstreamSeries)
 	ruleCtr := rule_ctr.NewRule()
 	adminGroup.Bind(ruleCtr.List, ruleCtr.Save, ruleCtr.Delete, ruleCtr.Test)
 	cacheCtr := cache_ctr.NewCache()

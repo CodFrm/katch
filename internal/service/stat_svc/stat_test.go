@@ -160,11 +160,12 @@ func TestStat_Overview(t *testing.T) {
 			deps.rollup.EXPECT().Sum(gomock.Any(), testNow-24*3600, testNow).
 				Return(&rollup_entity.Totals{Requests: 100, Hits: 60, BytesServed: 4096, BytesOrigin: 1024}, nil)
 			deps.cache.EXPECT().TotalSize(gomock.Any()).Return(int64(777), nil)
-			deps.rollup.EXPECT().SumByDay(gomock.Any(), testDailyDay, testToday+86400).
-				Return([]*rollup_repo.DayTotals{
-					{Day: testDailyDay, Requests: 10, Hits: 4, BytesServed: 100, BytesOrigin: 90},
-					{Day: testToday, Requests: 20, Hits: 20, BytesServed: 200, BytesOrigin: 0},
-				}, nil)
+			deps.rollup.EXPECT().SumBySeries(gomock.Any(), rollup_repo.SeriesQuery{
+				From: testDailyDay, To: testToday + 86400, Width: 86400,
+			}).Return([]*rollup_repo.SeriesTotals{
+				{Bucket: testDailyDay, Requests: 10, Hits: 4, BytesServed: 100, BytesOrigin: 90},
+				{Bucket: testToday, Requests: 20, Hits: 20, BytesServed: 200, BytesOrigin: 0},
+			}, nil)
 
 			got, err := deps.svc.Overview(ctx, &stat.OverviewRequest{})
 			convey.So(err, convey.ShouldBeNil)
@@ -200,8 +201,9 @@ func TestStat_Overview(t *testing.T) {
 			deps.cache.EXPECT().TotalSize(gomock.Any()).Return(int64(0), nil)
 			// 趋势始终是近 14 天：区间问的是「看多久的合计」，趋势是首页侧栏
 			// 那张固定的 14 天图，改 range 不该把它一起改掉。
-			deps.rollup.EXPECT().SumByDay(gomock.Any(), testDailyDay, testToday+86400).
-				Return(nil, nil)
+			deps.rollup.EXPECT().SumBySeries(gomock.Any(), rollup_repo.SeriesQuery{
+				From: testDailyDay, To: testToday + 86400, Width: 86400,
+			}).Return(nil, nil)
 
 			got, err := deps.svc.Overview(ctx, &stat.OverviewRequest{Range: "30d"})
 			convey.So(err, convey.ShouldBeNil)
@@ -309,5 +311,97 @@ func TestStat_Prune(t *testing.T) {
 		removed, err := deps.svc.Prune(context.Background())
 		convey.So(err, convey.ShouldBeNil)
 		convey.So(removed, convey.ShouldEqual, 42)
+	})
+}
+
+// testHour 系列：testNow 落在整点之后的第 800 秒，序列的端点必须被推到桶边界上。
+const (
+	testHourStart  = int64(1699999200)
+	testSeriesTo   = testHourStart + 3600
+	testSeriesFrom = testSeriesTo - 24*3600
+)
+
+func TestStat_UpstreamSeries(t *testing.T) {
+	convey.Convey("单个上游的按小时时序", t, func() {
+		deps := setup(t, nil)
+		ctx := context.Background()
+
+		convey.Convey("24 小时是 24 个小时桶，缺的小时补零", func() {
+			deps.rollup.EXPECT().SumBySeries(gomock.Any(), rollup_repo.SeriesQuery{
+				From: testSeriesFrom, To: testSeriesTo, Width: 3600, UpstreamID: 7,
+			}).Return([]*rollup_repo.SeriesTotals{
+				{Bucket: testSeriesFrom, Requests: 10, Hits: 6, Denied: 1, OriginErrors: 1, BytesServed: 100, BytesOrigin: 40},
+				// 中间整整一段没有流量：补零而不是塌成相邻的两根柱子，
+				// 否则图上「凌晨三点没人拉」会看起来像「一直有量」。
+				{Bucket: testSeriesFrom + 5*3600, Requests: 4, Hits: 4, BytesServed: 50},
+				{Bucket: testHourStart, Requests: 2, Hits: 0, OriginErrors: 2},
+			}, nil)
+
+			got, err := deps.svc.UpstreamSeries(ctx, &admin.UpstreamSeriesRequest{UpstreamID: 7})
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(got.Range, convey.ShouldEqual, "24h")
+			convey.So(got.BucketSeconds, convey.ShouldEqual, 3600)
+			convey.So(len(got.List), convey.ShouldEqual, 24)
+			// 六个计数都带上：界面要画命中/回源的堆叠柱，少一个就得再打一次接口。
+			convey.So(got.List[0].Bucket, convey.ShouldEqual, testSeriesFrom)
+			convey.So(got.List[0].Requests, convey.ShouldEqual, 10)
+			convey.So(got.List[0].Hits, convey.ShouldEqual, 6)
+			convey.So(got.List[0].Denied, convey.ShouldEqual, 1)
+			convey.So(got.List[0].OriginErrors, convey.ShouldEqual, 1)
+			convey.So(got.List[0].BytesServed, convey.ShouldEqual, 100)
+			convey.So(got.List[0].BytesOrigin, convey.ShouldEqual, 40)
+			// 中间的空洞各占一个点，且相邻两点正好差一小时。
+			for i := 1; i < 5; i++ {
+				convey.So(got.List[i].Bucket, convey.ShouldEqual, testSeriesFrom+int64(i)*3600)
+				convey.So(got.List[i].Requests, convey.ShouldEqual, 0)
+				convey.So(got.List[i].BytesServed, convey.ShouldEqual, 0)
+			}
+			convey.So(got.List[5].Requests, convey.ShouldEqual, 4)
+			// 由旧到新，最后一个点是此刻所在的那个（还没走完的）小时。
+			convey.So(got.List[23].Bucket, convey.ShouldEqual, testHourStart)
+			convey.So(got.List[23].OriginErrors, convey.ShouldEqual, 2)
+		})
+
+		convey.Convey("区间端点落在小时中间时被推到桶边界上", func() {
+			// testNow 是 22:13:20：直接拿 now-24h 当左边界，第一个桶只会盖到
+			// 那一小时的后 46 分钟，图上第一根柱子会凭空矮一截。
+			deps.rollup.EXPECT().SumBySeries(gomock.Any(), rollup_repo.SeriesQuery{
+				From: testSeriesFrom, To: testSeriesTo, Width: 3600, UpstreamID: 7,
+			}).Return(nil, nil)
+
+			got, err := deps.svc.UpstreamSeries(ctx, &admin.UpstreamSeriesRequest{UpstreamID: 7})
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(testNow%3600, convey.ShouldNotEqual, 0)
+			convey.So(got.From%3600, convey.ShouldEqual, 0)
+			convey.So(got.To%3600, convey.ShouldEqual, 0)
+			convey.So(got.From, convey.ShouldEqual, testSeriesFrom)
+			// 右边界上取整：此刻所在的这个小时要整个落进来，否则界面上最新的
+			// 那根柱子要等到下一个整点才出现。
+			convey.So(got.To, convey.ShouldEqual, testSeriesTo)
+			convey.So(len(got.List), convey.ShouldEqual, 24)
+			convey.So(got.List[0].Requests, convey.ShouldEqual, 0)
+		})
+
+		convey.Convey("换 range 只把窗口拉长，桶宽还是一小时", func() {
+			deps.rollup.EXPECT().SumBySeries(gomock.Any(), rollup_repo.SeriesQuery{
+				From: testSeriesTo - 7*24*3600, To: testSeriesTo, Width: 3600, UpstreamID: 8,
+			}).Return([]*rollup_repo.SeriesTotals{{Bucket: testHourStart, Requests: 3}}, nil)
+
+			got, err := deps.svc.UpstreamSeries(ctx, &admin.UpstreamSeriesRequest{UpstreamID: 8, Range: "7d"})
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(got.Range, convey.ShouldEqual, "7d")
+			convey.So(got.BucketSeconds, convey.ShouldEqual, 3600)
+			convey.So(len(got.List), convey.ShouldEqual, 7*24)
+			convey.So(got.List[1].Bucket-got.List[0].Bucket, convey.ShouldEqual, 3600)
+			convey.So(got.List[7*24-1].Bucket, convey.ShouldEqual, testHourStart)
+			convey.So(got.List[7*24-1].Requests, convey.ShouldEqual, 3)
+		})
+
+		convey.Convey("查库出错原样抛给调用方", func() {
+			deps.rollup.EXPECT().SumBySeries(gomock.Any(), gomock.Any()).Return(nil, errors.New("db down"))
+
+			_, err := deps.svc.UpstreamSeries(ctx, &admin.UpstreamSeriesRequest{UpstreamID: 7})
+			convey.So(err, convey.ShouldNotBeNil)
+		})
 	})
 }

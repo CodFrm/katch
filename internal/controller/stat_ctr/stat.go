@@ -27,3 +27,9 @@ func (s *Stat) Overview(ctx context.Context, req *stat.OverviewRequest) (*stat.O
 func (s *Stat) ByUpstream(ctx context.Context, req *admin.UpstreamStatsRequest) (*admin.UpstreamStatsResponse, error) {
 	return stat_svc.Stat().ByUpstream(ctx, req)
 }
+
+// UpstreamSeries 单个上游的按小时时序。要密钥，理由同 ByUpstream：
+// 逐小时的量比区间合计还细，更是运营数据。
+func (s *Stat) UpstreamSeries(ctx context.Context, req *admin.UpstreamSeriesRequest) (*admin.UpstreamSeriesResponse, error) {
+	return stat_svc.Stat().UpstreamSeries(ctx, req)
+}

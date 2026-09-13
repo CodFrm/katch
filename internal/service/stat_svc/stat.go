@@ -86,6 +86,8 @@ type StatSvc interface {
 	Overview(ctx context.Context, req *stat.OverviewRequest) (*stat.OverviewResponse, error)
 	// ByUpstream 按上游的区间统计，附带此刻的降级状态。
 	ByUpstream(ctx context.Context, req *admin.UpstreamStatsRequest) (*admin.UpstreamStatsResponse, error)
+	// UpstreamSeries 单个上游的按小时时序，供上游详情的命中/回源堆叠图用。
+	UpstreamSeries(ctx context.Context, req *admin.UpstreamSeriesRequest) (*admin.UpstreamSeriesResponse, error)
 	// PublicUpstreams 每个上游对外可见的命中率与状态，按主机名索引。
 	PublicUpstreams(ctx context.Context) (map[string]*UpstreamPublicStat, error)
 	// Flush 把进程内计数器攒下的分钟桶落库。
@@ -325,38 +327,102 @@ func hitRate(hits, requests, denied, originErrors int64) float64 {
 // 多一套要对齐的口径。补零放在服务端：一个刚上线三天的站点，图上应该是 11 个
 // 零点加 3 根柱子，而不是 3 个点被拉满整张图。
 func (s *statSvc) daily(ctx context.Context) ([]*stat.DailyPoint, error) {
-	today := dayStart(s.opt.Now().Unix())
-	from := today - int64(stat.DailyDays-1)*secondsPerDay
 	// 右边界取到今天结束：左闭右开的区间里，今天这一天的桶必须整个落进来。
-	rows, err := rollup_repo.TrafficRollup().SumByDay(ctx, from, today+secondsPerDay)
+	to := bucketStart(s.opt.Now().Unix(), secondsPerDay) + secondsPerDay
+	rows, err := s.series(ctx, rollup_repo.SeriesQuery{
+		From: to - int64(stat.DailyDays)*secondsPerDay, To: to, Width: secondsPerDay,
+	})
 	if err != nil {
 		return nil, err
 	}
-	byDay := make(map[int64]*rollup_repo.DayTotals, len(rows))
+	points := make([]*stat.DailyPoint, 0, len(rows))
 	for _, row := range rows {
-		byDay[row.Day] = row
-	}
-	points := make([]*stat.DailyPoint, 0, stat.DailyDays)
-	for i := 0; i < stat.DailyDays; i++ {
-		day := from + int64(i)*secondsPerDay
-		point := &stat.DailyPoint{Day: day}
-		if row, ok := byDay[day]; ok {
-			point.Requests = row.Requests
-			point.Hits = row.Hits
-			point.BytesServed = row.BytesServed
-			point.BytesOrigin = row.BytesOrigin
-		}
-		points = append(points, point)
+		points = append(points, &stat.DailyPoint{
+			Day:         row.Bucket,
+			Requests:    row.Requests,
+			Hits:        row.Hits,
+			BytesServed: row.BytesServed,
+			BytesOrigin: row.BytesOrigin,
+		})
 	}
 	return points, nil
 }
 
-// dayStart 这一秒所属自然日（UTC）的零点。
+// UpstreamSeries 单个上游的按小时时序。
+//
+// 只给这一个上游的量，且要密钥：运维的问题是「某个上游怎么了」，而单上游的
+// 请求量和回源字节是运营数据，和首页那张站点名片不是一回事。
+func (s *statSvc) UpstreamSeries(ctx context.Context, req *admin.UpstreamSeriesRequest) (*admin.UpstreamSeriesResponse, error) {
+	name, from, to := s.seriesWindow(req.Range, admin.SeriesBucketSeconds)
+	rows, err := s.series(ctx, rollup_repo.SeriesQuery{
+		From: from, To: to, Width: admin.SeriesBucketSeconds, UpstreamID: req.UpstreamID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	points := make([]*admin.UpstreamSeriesPoint, 0, len(rows))
+	for _, row := range rows {
+		points = append(points, &admin.UpstreamSeriesPoint{
+			Bucket:       row.Bucket,
+			Requests:     row.Requests,
+			Hits:         row.Hits,
+			Denied:       row.Denied,
+			OriginErrors: row.OriginErrors,
+			BytesServed:  row.BytesServed,
+			BytesOrigin:  row.BytesOrigin,
+		})
+	}
+	return &admin.UpstreamSeriesResponse{
+		Range: name, From: from, To: to,
+		BucketSeconds: admin.SeriesBucketSeconds,
+		List:          points,
+	}, nil
+}
+
+// series 一段等宽时间桶的序列：区间先对齐到桶边界，缺的桶补零，由旧到新。
+//
+// 逐日和逐小时共用这一段：两者只差一个桶宽和一个上游过滤，各写一遍迟早会在
+// 其中一边把补零或者端点对齐写歪，而那种歪只表现为图上少一根柱子。
+func (s *statSvc) series(ctx context.Context, q rollup_repo.SeriesQuery) ([]*rollup_repo.SeriesTotals, error) {
+	q.From, q.To = alignWindow(q.From, q.To, q.Width)
+	rows, err := rollup_repo.TrafficRollup().SumBySeries(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	byBucket := make(map[int64]*rollup_repo.SeriesTotals, len(rows))
+	for _, row := range rows {
+		byBucket[row.Bucket] = row
+	}
+	points := make([]*rollup_repo.SeriesTotals, 0, (q.To-q.From)/q.Width)
+	for bucket := q.From; bucket < q.To; bucket += q.Width {
+		if row, ok := byBucket[bucket]; ok {
+			points = append(points, row)
+			continue
+		}
+		// 没有流量的桶也要占一个点：塌掉它会让「这一小时没人拉」在图上
+		// 和相邻的有量时段连成一片。
+		points = append(points, &rollup_repo.SeriesTotals{Bucket: bucket})
+	}
+	return points, nil
+}
+
+// bucketStart 这一秒所属桶（UTC）的起点。
 //
 // UTC 而不是进程本地时区：分钟桶本身是 UTC 秒，SQL 那边也是按 UTC 分的组，
-// 两边用不同的天会让序列的边界日对不上。
-func dayStart(sec int64) int64 {
-	return sec - sec%secondsPerDay
+// 两边用不同的起点会让序列的边界桶对不上。
+func bucketStart(sec, width int64) int64 {
+	return sec - sec%width
+}
+
+// alignWindow 把区间推到桶边界上：左边界下取整、右边界上取整。
+//
+// 不对齐的话端点那个桶只盖到一部分——图上第一根柱子会凭空矮一截，而看图的人
+// 无从知道那是真的没量还是区间切在了半路。
+func alignWindow(from, to, width int64) (int64, int64) {
+	if to%width != 0 {
+		to = bucketStart(to, width) + width
+	}
+	return bucketStart(from, width), to
 }
 
 // degraded 此刻降级中的上游，按主机名索引。
@@ -374,13 +440,29 @@ func (s *statSvc) degraded() map[string]backoff.Status {
 
 // window 求出这次聚合的区间名与左闭右开边界。
 func (s *statSvc) window(name string) (string, int64, int64) {
-	seconds, ok := rangeSeconds[name]
-	if !ok {
-		name = defaultRange
-		seconds = rangeSeconds[defaultRange]
-	}
+	name, seconds := normalizeRange(name)
 	to := s.opt.Now().Unix()
 	return name, to - seconds, to
+}
+
+// seriesWindow 求出时序的区间名与左闭右开边界，两端都落在桶边界上。
+//
+// 右边界从「此刻所在的那个桶」往后推一格，左边界由它减去区间长度定出来：
+// 反过来先取 now-区间 再两端各自对齐，会多出半个桶，24 小时的图上就会冒出
+// 第 25 根柱子。换 range 只改这里的区间长度，桶宽是调用方给的常量。
+func (s *statSvc) seriesWindow(name string, width int64) (string, int64, int64) {
+	name, seconds := normalizeRange(name)
+	to := bucketStart(s.opt.Now().Unix(), width) + width
+	return name, to - seconds, to
+}
+
+// normalizeRange 认区间名，不认得的一律当默认区间。
+func normalizeRange(name string) (string, int64) {
+	seconds, ok := rangeSeconds[name]
+	if !ok {
+		return defaultRange, rangeSeconds[defaultRange]
+	}
+	return name, seconds
 }
 
 // Run 跑定时的落库与裁剪。
