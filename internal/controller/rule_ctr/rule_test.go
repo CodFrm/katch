@@ -188,6 +188,10 @@ func TestRuleAdmin_SaveAndList(t *testing.T) {
 func TestRuleAdmin_Delete(t *testing.T) {
 	ruleRepo, _, testMux := setupRuleAdminTest(t)
 	convey.Convey("删除规则", t, func() {
+		// 删除前会先列一次规则：事件流要记下被删的那条长什么样（见 rule_ctr 的 ruleOf）。
+		ruleRepo.EXPECT().List(gomock.Any()).Return([]*rule_entity.AccessRule{
+			{ID: 11, Action: rule_entity.ActionDeny, Pattern: "*:latest"},
+		}, nil).AnyTimes()
 		ruleRepo.EXPECT().Find(gomock.Any(), int64(11)).Return(&rule_entity.AccessRule{ID: 11}, nil)
 		ruleRepo.EXPECT().Delete(gomock.Any(), int64(11)).Return(nil)
 		convey.So(testMux.Do(context.Background(), &admin.DeleteRuleRequest{ID: 11},

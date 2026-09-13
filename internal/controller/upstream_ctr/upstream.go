@@ -6,6 +6,8 @@ import (
 
 	"github.com/CodFrm/katch/internal/api/admin"
 	api_upstream "github.com/CodFrm/katch/internal/api/upstream"
+	"github.com/CodFrm/katch/internal/model/entity/event_entity"
+	"github.com/CodFrm/katch/internal/service/event_svc"
 	"github.com/CodFrm/katch/internal/service/stat_svc"
 	"github.com/CodFrm/katch/internal/service/upstream_svc"
 )
@@ -54,11 +56,60 @@ func (u *Upstream) PublicList(ctx context.Context, req *api_upstream.ListRequest
 }
 
 // Save 新增或更新一条上游。
+//
+// 写成功之后往事件流里记一条：一个上游是谁在什么时候停掉的，恰恰是
+// 「拉取突然全挂了」之后第一个要查的东西，而那时界面上只剩下现在的状态。
 func (u *Upstream) Save(ctx context.Context, req *admin.SaveUpstreamRequest) (*admin.SaveUpstreamResponse, error) {
-	return upstream_svc.Upstream().Save(ctx, req)
+	resp, err := upstream_svc.Upstream().Save(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	kind := event_entity.KindUpstreamCreated
+	if req.ID != 0 {
+		kind = event_entity.KindUpstreamUpdated
+	}
+	event_svc.Event().Record(ctx, &event_svc.RecordInput{
+		Kind: kind, Actor: event_entity.ActorAdmin, UpstreamID: resp.ID,
+		Detail: map[string]any{
+			"host":    req.Host,
+			"kind":    req.Kind,
+			"origin":  req.Origin,
+			"enabled": req.Enabled,
+		},
+	})
+	return resp, nil
 }
 
 // Delete 删除一条上游。
 func (u *Upstream) Delete(ctx context.Context, req *admin.DeleteUpstreamRequest) (*admin.DeleteUpstreamResponse, error) {
-	return upstream_svc.Upstream().Delete(ctx, req)
+	// 主机名要在删之前取：删完这条记录就没了，而事件里只剩一个 id 的话，
+	// 界面上这条「上游已删除」永远指不出删的是哪一个。
+	host := u.hostOf(ctx, req.ID)
+	resp, err := upstream_svc.Upstream().Delete(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	event_svc.Event().Record(ctx, &event_svc.RecordInput{
+		Kind: event_entity.KindUpstreamDeleted, Actor: event_entity.ActorAdmin,
+		UpstreamID: req.ID, Detail: map[string]any{"host": host},
+	})
+	return resp, nil
+}
+
+// hostOf 查这个 id 的主机名，查不到时给空串。
+//
+// 借 List 而不是另开一个按 id 查的方法：上游是人工维护的白名单，规模是几十条，
+// 而这条路径只在管理接口删上游时走一次。取不到不是错误——事件记不上也不许
+// 让这次删除失败，少一个主机名比少一次操作好。
+func (u *Upstream) hostOf(ctx context.Context, id int64) string {
+	list, err := upstream_svc.Upstream().List(ctx, &admin.ListUpstreamsRequest{})
+	if err != nil {
+		return ""
+	}
+	for _, item := range list.List {
+		if item.ID == id {
+			return item.Host
+		}
+	}
+	return ""
 }

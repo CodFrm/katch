@@ -201,6 +201,11 @@ func TestUpstreamSaveDuplicateHost(t *testing.T) {
 func TestUpstreamDelete(t *testing.T) {
 	upRepo, _, testMux, _ := setupAdminTest(t)
 	convey.Convey("删除上游", t, func() {
+		// 删除前会先列一次上游：事件流要记下被删的是哪个主机名，而删完那条
+		// 记录就没了（见 upstream_ctr 的 hostOf）。
+		upRepo.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{
+			{ID: 7, Host: "deb.debian.org"},
+		}, nil).AnyTimes()
 		convey.Convey("存在时删除成功", func() {
 			upRepo.EXPECT().Find(gomock.Any(), int64(7)).Return(&upstream_entity.Upstream{ID: 7}, nil)
 			upRepo.EXPECT().Delete(gomock.Any(), int64(7)).Return(nil)

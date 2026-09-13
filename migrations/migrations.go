@@ -12,6 +12,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/CodFrm/katch/internal/model/entity/cache_entity"
+	"github.com/CodFrm/katch/internal/model/entity/event_entity"
 	"github.com/CodFrm/katch/internal/model/entity/rollup_entity"
 	"github.com/CodFrm/katch/internal/model/entity/rule_entity"
 	"github.com/CodFrm/katch/internal/model/entity/setting_entity"
@@ -25,6 +26,7 @@ func migrationList() []*gormigrate.Migration {
 		cacheObject(),
 		trafficRollup(),
 		accessRule(),
+		event(),
 	}
 }
 
@@ -298,6 +300,49 @@ func accessRule() *gormigrate.Migration {
 		},
 		Rollback: func(tx *gorm.DB) error {
 			table, err := tableName(tx, &rule_entity.AccessRule{})
+			if err != nil {
+				return err
+			}
+			return tx.Exec(fmt.Sprintf("DROP TABLE IF EXISTS `%s`", table)).Error
+		},
+	}
+}
+
+// event 建事件表。
+//
+// 后台概览上那条时间线：自动告警与人为变更放在一起，带操作人（「管理接口与界面」
+// 一节）。kind 与 actor 存的是稳定枚举而不是给人读的句子——界面按它们查翻译表，
+// 一旦落进库的是英文散文，中英双语就只剩把后端字符串原样贴给用户这一条路。
+//
+// 表里没有 updatetime：事件只追加，一条改得动的历史记录不再是历史。也没有
+// 「草稿」「版本」这类列——规则的审批流与版本回滚在这一轮的 Out of scope 里，
+// 这张表只记变更发生过。
+func event() *gormigrate.Migration {
+	return &gormigrate.Migration{
+		ID: "20260913000001_event",
+		Migrate: func(tx *gorm.DB) error {
+			table, err := tableName(tx, &event_entity.Event{})
+			if err != nil {
+				return err
+			}
+			autoPK := "BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY"
+			if tx.Name() == "sqlite" {
+				autoPK = "INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT"
+			}
+			// 没有额外索引：唯一的读法是「按 id 倒序取最近 N 条」，主键自己就是
+			// 那个顺序。给 createtime 建一条谁也不会走的索引，只是让每一次写入
+			// 多维护一棵树——而写入发生在缓存回收、退避转换这些已经出了状况的时刻。
+			stmt := fmt.Sprintf("CREATE TABLE `%s` ("+
+				"`id` %s,"+
+				"`kind` VARCHAR(64) NOT NULL,"+
+				"`actor` VARCHAR(32) NOT NULL,"+
+				"`upstream_id` BIGINT NOT NULL DEFAULT 0,"+
+				"`detail` TEXT,"+
+				"`createtime` BIGINT NOT NULL DEFAULT 0)", table, autoPK)
+			return tx.Exec(stmt).Error
+		},
+		Rollback: func(tx *gorm.DB) error {
+			table, err := tableName(tx, &event_entity.Event{})
 			if err != nil {
 				return err
 			}

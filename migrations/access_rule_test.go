@@ -41,8 +41,11 @@ func TestAccessRuleMigration(t *testing.T) {
 		})
 
 		convey.Convey("迁移可回滚，不会把别的表一起带走", func() {
+			// 回滚指名这一条，而不是 RollbackLast：末尾那条是谁取决于此后还追加了
+			// 什么（迁移只追加不修改），拿「最后一条」当自己那条的用例会在下一次
+			// 追加迁移时失败，而失败的原因和被测的东西毫无关系。
 			convey.So(gormigrate.New(gormDB, gormigrate.DefaultOptions, migrationList()).
-				RollbackLast(), convey.ShouldBeNil)
+				RollbackMigration(accessRule()), convey.ShouldBeNil)
 			convey.So(gormDB.Migrator().HasTable(&rule_entity.AccessRule{}), convey.ShouldBeFalse)
 		})
 	})

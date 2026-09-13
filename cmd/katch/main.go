@@ -26,6 +26,7 @@ import (
 	"github.com/CodFrm/katch/internal/metrics"
 	"github.com/CodFrm/katch/internal/proxy/backoff"
 	"github.com/CodFrm/katch/internal/repository/cache_repo"
+	"github.com/CodFrm/katch/internal/repository/event_repo"
 	"github.com/CodFrm/katch/internal/repository/rollup_repo"
 	"github.com/CodFrm/katch/internal/repository/setting_repo"
 	"github.com/CodFrm/katch/internal/repository/upstream_repo"
@@ -68,13 +69,17 @@ func main() {
 	// 上游退避状态，进程内唯一一份（决策 17，不落库）：计数中间件往里喂回源的
 	// 成败，管理接口从里面读出「这个上游正在降级」。
 	backoffTracker := backoff.New(backoff.Options{})
+	// 包一层，让退避的**状态转换**落进事件流：界面上那条时间线要把自动告警和
+	// 人为变更放在一起。包装的只是转换那一刻，状态本身仍然只有上面那一份内存态。
+	// 计数中间件和回源闸拿到的必须是同一个包装：转换只有在成败被喂进来时才看得见。
+	backoffGate := proxy_svc.NewEventGate(backoffTracker)
 	// 闸装在回源那一缝上：上游降级期间拉取直接快速失败，不再每个请求都去等一次
 	// 连不上的拨号。装在这里而不是缓存前面——缓存命中不花上游任何成本，降级期间
 	// 盘上已有的副本必须照常服务。
 	//
 	// 回源并发上限、上游超时与重试次数不在这里给：同样是运行时项，由拉取路径
 	// 每次回源时现读，改完不必重启（决策 3/4）。
-	proxy_svc.Register(proxy_svc.New(proxy_svc.Options{Gate: backoffTracker}))
+	proxy_svc.Register(proxy_svc.New(proxy_svc.Options{Gate: backoffGate}))
 
 	ctx := context.Background()
 	// 自己装配配置源，而不是让 cago 用默认的文件源：默认那个在读到配置里没写的
@@ -112,6 +117,9 @@ func main() {
 			setting_repo.RegisterSetting(setting_svc.NewCachedSettingRepo(setting_repo.NewSetting()))
 			cache_repo.RegisterCacheObject(cache_repo.NewCacheObject())
 			rollup_repo.RegisterTrafficRollup(rollup_repo.NewTrafficRollup())
+			// 事件仓储不装配的话，退避转换、缓存回收和管理写入都记不下来——
+			// event_svc 遇到 nil 是丢掉事件并留一条日志，不会连累被观察的操作。
+			event_repo.RegisterEvent(event_repo.NewEvent())
 			admin := adminConfig{}
 			has, err := cfg.Has(ctx, "admin")
 			if err != nil {
@@ -166,7 +174,7 @@ func main() {
 			return nil
 		})).
 		Registry(metrics.Mount(metrics.Hooks{
-			Gate: backoffTracker,
+			Gate: backoffGate,
 			// 只用来判定「这个主机名该不该有自己的标签」，不是白名单那道闸——
 			// 判定仍然只有 proxy_svc 一个出处。
 			Lookup: func(ctx context.Context, host string) bool {

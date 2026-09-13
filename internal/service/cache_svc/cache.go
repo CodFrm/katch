@@ -21,9 +21,11 @@ import (
 
 	"github.com/CodFrm/katch/internal/cache"
 	"github.com/CodFrm/katch/internal/model/entity/cache_entity"
+	"github.com/CodFrm/katch/internal/model/entity/event_entity"
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
 	"github.com/CodFrm/katch/internal/pkg/code"
 	"github.com/CodFrm/katch/internal/repository/cache_repo"
+	"github.com/CodFrm/katch/internal/service/event_svc"
 	"github.com/CodFrm/katch/internal/service/proxy_svc"
 	"github.com/CodFrm/katch/internal/service/setting_svc"
 	"github.com/CodFrm/katch/internal/service/upstream_svc"
@@ -495,6 +497,10 @@ func (c *cacheSvc) saveRecord(ctx context.Context, in *recordInput) error {
 //
 // 淘汰只落在不可变且未被 pin 的对象上（由 EvictCandidates 保证）：可变对象由 TTL
 // 自行过期，pin 的对象是人明确要求留下的。
+//
+// 跑过一轮就往事件流上记一条（概览：自动告警与人为变更放在同一条时间线上）。
+// 记的是**这一轮**，不是每个被淘汰的对象：一次回收可能带走几百个对象，逐个记
+// 会把时间线冲掉，而运维要看的是「这台机器什么时候开始削缓存了」。
 func (c *cacheSvc) enforceQuota(ctx context.Context) {
 	c.evictMu.Lock()
 	defer c.evictMu.Unlock()
@@ -514,30 +520,55 @@ func (c *cacheSvc) enforceQuota(ctx context.Context) {
 	}
 	// 淘汰到回收水位而不是刚好等于配额，否则之后每写一个对象都要再淘汰一次。
 	waterline := quota * int64(limits.CacheReclaimPercent) / 100
+	removed, freed := c.reclaim(ctx, repo, total, waterline)
+	if removed == 0 {
+		// 一个都没淘汰掉（候选空了、或者删不动）：那些情况上面已经各留了一条
+		// 日志，而时间线上记一条「回收了 0 个对象」只是噪声。
+		return
+	}
+	event_svc.Event().Record(ctx, &event_svc.RecordInput{
+		Kind: event_entity.KindCacheReclaimed, Actor: event_entity.ActorSystem,
+		Detail: map[string]any{
+			"removed":     removed,
+			"freed_bytes": freed,
+			"quota_bytes": quota,
+		},
+	})
+}
+
+// reclaim 按最近最少使用淘汰到水位以下，返回淘汰了几条、腾出多少字节。
+//
+// 半途出错就带着已经削掉的量返回：那部分淘汰已经发生了，报成 0 会让时间线
+// 说谎。调用方持着 evictMu，这里不再加锁。
+func (c *cacheSvc) reclaim(ctx context.Context, repo cache_repo.CacheObjectRepo,
+	total, waterline int64) (removed, freed int64) {
 	for total > waterline {
 		candidates, err := repo.EvictCandidates(ctx, evictBatch)
 		if err != nil {
 			logger.Ctx(ctx).Error("查询淘汰候选失败", zap.Error(err))
-			return
+			return removed, freed
 		}
 		if len(candidates) == 0 {
 			// 剩下的全是 pin 的或可变的：这不是可以静默忽略的状态，配额已经守不住了。
 			logger.Ctx(ctx).Error("缓存超配额但没有可淘汰的对象",
-				zap.Int64("total", total), zap.Int64("quota", quota))
-			return
+				zap.Int64("total", total), zap.Int64("waterline", waterline))
+			return removed, freed
 		}
 		for _, object := range candidates {
 			if err := repo.Delete(ctx, object.ID); err != nil {
 				logger.Ctx(ctx).Error("淘汰缓存记录失败", zap.Int64("id", object.ID), zap.Error(err))
-				return
+				return removed, freed
 			}
 			c.removeIfUnreferenced(ctx, object.Digest)
 			total -= object.Size
+			removed++
+			freed += object.Size
 			if total <= waterline {
-				return
+				return removed, freed
 			}
 		}
 	}
+	return removed, freed
 }
 
 func (c *cacheSvc) Put(ctx context.Context, req *PutRequest) error {

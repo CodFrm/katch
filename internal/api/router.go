@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/CodFrm/katch/internal/controller/cache_ctr"
+	"github.com/CodFrm/katch/internal/controller/event_ctr"
 	"github.com/CodFrm/katch/internal/controller/rule_ctr"
 	"github.com/CodFrm/katch/internal/controller/setting_ctr"
 	"github.com/CodFrm/katch/internal/controller/site_ctr"
@@ -68,6 +69,9 @@ func Router(_ context.Context, root *mux.Router) error {
 	// 一个不要当前密钥就能换密钥的端点等于把后台直接送出去。
 	settingCtr := setting_ctr.NewSetting()
 	adminGroup.Bind(settingCtr.List, settingCtr.Save, settingCtr.RotateAdminKey)
+	// 事件流同一道闸：里面是主机名、规则模式和设置键的变更史，是运营数据。
+	eventCtr := event_ctr.NewEvent()
+	adminGroup.Bind(eventCtr.List)
 
 	return nil
 }
