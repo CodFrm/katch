@@ -71,6 +71,9 @@ func main() {
 	// 闸装在回源那一缝上：上游降级期间拉取直接快速失败，不再每个请求都去等一次
 	// 连不上的拨号。装在这里而不是缓存前面——缓存命中不花上游任何成本，降级期间
 	// 盘上已有的副本必须照常服务。
+	//
+	// 回源并发上限、上游超时与重试次数不在这里给：同样是运行时项，由拉取路径
+	// 每次回源时现读，改完不必重启（决策 3/4）。
 	proxy_svc.Register(proxy_svc.New(proxy_svc.Options{Gate: backoffTracker}))
 
 	ctx := context.Background()
@@ -102,7 +105,11 @@ func main() {
 			// 个请求），每个请求查一次库等于把镜像站的吞吐绑在 sqlite 上。缓存在
 			// 管理接口写入上游时自动失效，所以界面上改完不必重启。
 			upstream_repo.RegisterUpstream(proxy_svc.NewCachedUpstreamRepo(upstream_repo.NewUpstream()))
-			setting_repo.RegisterSetting(setting_repo.NewSetting())
+			// 设置表同样包一层进程内缓存，理由和上游表一样：每次回源都要读一遍
+			// 超时/并发/重试，每次写缓存都要读一遍配额，逐个请求查库等于把吞吐
+			// 绑在 sqlite 上。缓存在管理接口写设置时自动失效，所以界面上改完
+			// 下一个请求就按新值走。
+			setting_repo.RegisterSetting(setting_svc.NewCachedSettingRepo(setting_repo.NewSetting()))
 			cache_repo.RegisterCacheObject(cache_repo.NewCacheObject())
 			rollup_repo.RegisterTrafficRollup(rollup_repo.NewTrafficRollup())
 			admin := adminConfig{}
@@ -141,6 +148,8 @@ func main() {
 					zap.String("dir", cacheCfg.Dir), zap.Error(err))
 				return nil
 			}
+			// 配额、回收水位、可变对象 TTL 不在这里给：它们是 setting 表里的
+			// 运行时项，由缓存层每次用到时现读（决策 3/4）。
 			cache_svc.Register(cache_svc.New(store, cache_svc.Options{}))
 			return nil
 		})).

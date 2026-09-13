@@ -25,6 +25,7 @@ import (
 	"github.com/CodFrm/katch/internal/pkg/code"
 	"github.com/CodFrm/katch/internal/repository/cache_repo"
 	"github.com/CodFrm/katch/internal/service/proxy_svc"
+	"github.com/CodFrm/katch/internal/service/setting_svc"
 	"github.com/CodFrm/katch/internal/service/upstream_svc"
 )
 
@@ -43,9 +44,6 @@ const (
 )
 
 const (
-	defaultQuota          = int64(10) << 30
-	defaultReclaimPercent = 90
-	defaultMutableTTL     = int64(300)
 	// evictBatch 一次取多少条淘汰候选。取太小会把一次超配额拆成很多轮查询，
 	// 取太大则在缓存很满时一次拉回一大片记录。
 	evictBatch = 64
@@ -54,18 +52,17 @@ const (
 	copyBufferSize = 64 << 10
 )
 
-// Options 缓存层的运行参数。
+// Options 缓存层的构造参数。
 //
-// 这里只有「进程跑起来之后才有意义」的参数，缓存目录不在其中——目录是启动时就要
-// 定下来的东西，由 main 从配置文件读出来交给 cache.NewStore。
+// 配额、回收水位、可变对象 TTL **不在这里**：它们是 setting 表里的运行时项，
+// 每次用到时现读（决策 3/4——改完立刻生效，不必重启进程）。抄进构造参数里，
+// 设置页上改的数就要等下次重启才算数，那正是这三项落库的理由被抵消掉的样子。
+// 缓存目录同样不在这里：目录是启动时就要定下来的东西，由 main 从配置文件读出来
+// 交给 cache.NewStore。
 type Options struct {
-	// Quota 缓存总容量上限（字节），超过就按最近最少使用淘汰。
-	Quota int64
-	// ReclaimPercent 回收水位：超配额后一直淘汰到配额的这个百分比。
-	// 不淘汰到刚好等于配额，否则每写一个对象都要触发一次淘汰。
-	ReclaimPercent int
-	// MutableTTLSeconds 可变对象的默认存活时长，上游没单独配时用它。
-	MutableTTLSeconds int64
+	// Runtime 运行时设置的来源，nil 表示进程级的那一个（setting_svc）。
+	// 用例注入一个假的，就能在不写库的情况下把配额压到几十字节。
+	Runtime setting_svc.RuntimeSource
 }
 
 // PutRequest 直接写入一个缓存对象。
@@ -131,7 +128,8 @@ type CacheSvc interface {
 
 type cacheSvc struct {
 	store *cache.Store
-	opt   Options
+	// runtime 配额、回收水位与可变对象 TTL 的来源，每次用到时现读。
+	runtime setting_svc.RuntimeSource
 	// mu 只护 inflight 这张表。
 	mu       sync.Mutex
 	inflight map[string]*flight
@@ -142,16 +140,22 @@ type cacheSvc struct {
 // New 构造缓存层。store 为 nil 表示磁盘不可用——此时它是一个纯透传的实现，
 // 拉取照常，只是不命中也不写入。
 func New(store *cache.Store, opt Options) CacheSvc {
-	if opt.Quota <= 0 {
-		opt.Quota = defaultQuota
+	if opt.Runtime == nil {
+		opt.Runtime = setting_svc.Setting()
 	}
-	if opt.ReclaimPercent <= 0 || opt.ReclaimPercent > 100 {
-		opt.ReclaimPercent = defaultReclaimPercent
+	return &cacheSvc{store: store, runtime: opt.Runtime, inflight: map[string]*flight{}}
+}
+
+// limits 读一次运行时设置。
+//
+// 读不出来不让这次拉取失败：返回的快照在出错时是出厂值，缓存是优化，
+// 它的参数读不到不该让拉取整体失败（失败与降级）。
+func (c *cacheSvc) limits(ctx context.Context) *setting_svc.RuntimeSettings {
+	rt, err := c.runtime.Runtime(ctx)
+	if err != nil {
+		logger.Ctx(ctx).Error("读取运行时设置失败，本次按默认值处理", zap.Error(err))
 	}
-	if opt.MutableTTLSeconds <= 0 {
-		opt.MutableTTLSeconds = defaultMutableTTL
-	}
-	return &cacheSvc{store: store, opt: opt, inflight: map[string]*flight{}}
+	return rt
 }
 
 // defaultCache 在 main 装配之前就是纯透传：拉取路径不该依赖装配顺序。
@@ -470,7 +474,9 @@ func (c *cacheSvc) saveRecord(ctx context.Context, in *recordInput) error {
 	if !in.Immutable {
 		ttl := in.TTLSeconds
 		if ttl <= 0 {
-			ttl = c.opt.MutableTTLSeconds
+			// 上游没单独配 TTL 时用设置里的默认值，现读现用：站长把默认 TTL
+			// 改短之后，下一个写进来的可变对象就按新值过期。
+			ttl = c.limits(ctx).MutableTTLSeconds
 		}
 		object.ExpiresAt = now + ttl
 	}
@@ -499,11 +505,15 @@ func (c *cacheSvc) enforceQuota(ctx context.Context) {
 		logger.Ctx(ctx).Error("统计缓存占用失败", zap.Error(err))
 		return
 	}
-	if total <= c.opt.Quota {
+	// 配额与水位在这里现读：站长在设置页把配额改小，下一次写进缓存的对象就会
+	// 按新配额触发回收，不必重启进程（决策 3/4）。
+	limits := c.limits(ctx)
+	quota := limits.CacheQuotaBytes
+	if total <= quota {
 		return
 	}
 	// 淘汰到回收水位而不是刚好等于配额，否则之后每写一个对象都要再淘汰一次。
-	waterline := c.opt.Quota * int64(c.opt.ReclaimPercent) / 100
+	waterline := quota * int64(limits.CacheReclaimPercent) / 100
 	for total > waterline {
 		candidates, err := repo.EvictCandidates(ctx, evictBatch)
 		if err != nil {
@@ -513,7 +523,7 @@ func (c *cacheSvc) enforceQuota(ctx context.Context) {
 		if len(candidates) == 0 {
 			// 剩下的全是 pin 的或可变的：这不是可以静默忽略的状态，配额已经守不住了。
 			logger.Ctx(ctx).Error("缓存超配额但没有可淘汰的对象",
-				zap.Int64("total", total), zap.Int64("quota", c.opt.Quota))
+				zap.Int64("total", total), zap.Int64("quota", quota))
 			return
 		}
 		for _, object := range candidates {

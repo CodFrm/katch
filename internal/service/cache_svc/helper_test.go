@@ -1,6 +1,7 @@
 package cache_svc
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
@@ -23,7 +24,36 @@ import (
 	"github.com/CodFrm/katch/internal/repository/upstream_repo"
 	mock_upstream_repo "github.com/CodFrm/katch/internal/repository/upstream_repo/mock"
 	"github.com/CodFrm/katch/internal/service/proxy_svc"
+	"github.com/CodFrm/katch/internal/service/setting_svc"
 )
+
+// fakeRuntime 用例侧的运行时设置。
+//
+// 基线从 setting_svc 取而不是在这里另抄一份出厂值：两份兜底值一旦分叉，用例会在
+// 生产默认值改掉之后继续绿着。仓储没注册时 Runtime 给的就是出厂值，不碰库。
+type fakeRuntime struct {
+	mu sync.Mutex
+	rt *setting_svc.RuntimeSettings
+}
+
+func newFakeRuntime(t *testing.T, patch func(rt *setting_svc.RuntimeSettings)) *fakeRuntime {
+	t.Helper()
+	rt, err := setting_svc.Setting().Runtime(context.Background())
+	if err != nil {
+		t.Fatalf("取出厂运行时设置失败：%v", err)
+	}
+	if patch != nil {
+		patch(rt)
+	}
+	return &fakeRuntime{rt: rt}
+}
+
+func (f *fakeRuntime) Runtime(context.Context) (*setting_svc.RuntimeSettings, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	snapshot := *f.rt
+	return &snapshot, nil
+}
 
 // 假源站用 httptest，不打任何真实网络；缓存记录用 mockgen 生成的 mock，
 // 但让它背一个内存表——LRU、过期、并发合并这些行为要的是「记录之间的先后」，
@@ -314,5 +344,13 @@ func corruptBlob(t *testing.T, store *cache.Store, repo *fakeRepo, key string) {
 	_ = f.Close()
 	if err := os.WriteFile(name, []byte(strings.Repeat("X", int(size))), 0o600); err != nil {
 		t.Fatalf("改写副本失败：%v", err)
+	}
+}
+
+// quotaOf 只改配额与回收水位的那种补丁。
+func quotaOf(quota int64, percent int) func(rt *setting_svc.RuntimeSettings) {
+	return func(rt *setting_svc.RuntimeSettings) {
+		rt.CacheQuotaBytes = quota
+		rt.CacheReclaimPercent = percent
 	}
 }

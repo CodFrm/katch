@@ -13,6 +13,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/CodFrm/katch/internal/api/admin"
+	"github.com/CodFrm/katch/internal/api/site"
 	"github.com/CodFrm/katch/internal/model/entity/setting_entity"
 	"github.com/CodFrm/katch/internal/pkg/code"
 	"github.com/CodFrm/katch/internal/repository/setting_repo"
@@ -40,6 +41,11 @@ type SettingSvc interface {
 	// PublicHomepage 首页的上游列表与命中率是否对匿名调用方可见。
 	// 库里没有这一行、或者这一行的值读不懂时都按可见处理，理由见实现。
 	PublicHomepage(ctx context.Context) (bool, error)
+	// Runtime 读出运行时设置此刻的值，供缓存层与拉取路径按新值干活。
+	// 返回的快照永远非 nil：读不出来时给的是出厂值，错误一并返回。
+	Runtime(ctx context.Context) (*RuntimeSettings, error)
+	// SiteInfo 站点名片：名称与拉取命令里用的站点地址，供公开接口用。
+	SiteInfo(ctx context.Context, req *site.InfoRequest) (*site.InfoResponse, error)
 	// List 读出全部运行时设置，库里没写过的项给默认值。
 	List(ctx context.Context, req *admin.ListSettingsRequest) (*admin.ListSettingsResponse, error)
 	// Save 写入若干运行时设置。不认识的键、类型不对或超出取值范围的值会让整批

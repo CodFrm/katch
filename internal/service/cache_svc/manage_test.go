@@ -36,7 +36,7 @@ func TestEviction_EvictsLeastRecentlyUsedOverQuota(t *testing.T) {
 		})
 		// 配额 25 字节、回收到 80%（20 字节）：写进第三个 10 字节的对象就得腾地方。
 		svc, repo, store := setupSvc(t, o, staticUpstream("deb.debian.org"),
-			Options{Quota: 25, ReclaimPercent: 80})
+			Options{Runtime: newFakeRuntime(t, quotaOf(25, 80))})
 
 		putObject(t, svc, "/pool/a.deb", "aaaaaaaaaa", true)
 		putObject(t, svc, "/pool/b.deb", "bbbbbbbbbb", true)
@@ -67,7 +67,7 @@ func TestEviction_SkipsPinnedAndMutable(t *testing.T) {
 			_, _ = io.WriteString(w, "0123456789")
 		})
 		svc, repo, _ := setupSvc(t, o, staticUpstream("deb.debian.org"),
-			Options{Quota: 25, ReclaimPercent: 80})
+			Options{Runtime: newFakeRuntime(t, quotaOf(25, 80))})
 
 		putObject(t, svc, "/pool/pinned.deb", "pppppppppp", true)
 		convey.So(svc.Pin(context.Background(), &PinRequest{

@@ -40,9 +40,8 @@ const (
 	OriginRetriesSetting = "origin_retries"
 )
 
-// 这几个默认值和 cache_svc.New 的兜底值是同一组数（10 GiB / 90% / 300 秒）。
-// 眼下两边各写一份：main 还没有把设置喂给 cache_svc，缓存层起来时读不到库。
-// 等装配那一步接上，兜底值应该只剩这里一份。
+// 出厂默认值，全仓只此一份：缓存层与拉取路径都经 Runtime 读这里，谁也不再自带
+// 一套兜底数。两份兜底值意味着「库里没写过这一项」时的行为取决于是谁先问的。
 const (
 	defaultCacheQuotaBytes      = int64(10) << 30
 	defaultCacheReclaimPercent  = 90
@@ -264,4 +263,104 @@ func (s *settingSvc) RotateAdminKey(ctx context.Context, req *admin.RotateAdminK
 	// 不记密钥本身，也不记哈希：日志是会被转走的。
 	logger.Ctx(ctx).Info("管理密钥已轮换")
 	return &admin.RotateAdminKeyResponse{}, nil
+}
+
+// RuntimeSettings 运行时设置此刻的一份取值快照。
+//
+// 它是一份快照而不是一个长期持有的对象：消费方每次要用的时候读一次，读到的就是
+// 库里此刻的值。决策 3/4 把这些项放进库而不是 config.yaml，凭的正是「改完立刻
+// 生效、不必重启进程」——把值在构造时抄进某个 service 的字段里，这句话就没了。
+type RuntimeSettings struct {
+	SiteName   string
+	SiteDomain string
+	// CacheQuotaBytes 缓存总容量上限（字节）。
+	CacheQuotaBytes int64
+	// CacheReclaimPercent 回收水位：超配额后一直淘汰到配额的这个百分比。
+	CacheReclaimPercent int
+	// MutableTTLSeconds 可变对象的默认存活时长，上游没单独配时用它。
+	MutableTTLSeconds int64
+	// OriginConcurrency 同时压在上游那一侧的回源数上限。
+	OriginConcurrency int
+	// OriginTimeoutSeconds 单次回源多久拿不到响应算失败。
+	OriginTimeoutSeconds int
+	// OriginRetries 回源失败重试几次，0 表示不重试。
+	OriginRetries int
+}
+
+// RuntimeSource 运行时设置的来源。
+//
+// 消费方（缓存层、拉取路径）依赖这个接口而不是 SettingSvc 整个：它们要的只是
+// 「此刻这几项是多少」，用例注入一个假的也不必去实现密钥轮换。
+type RuntimeSource interface {
+	Runtime(ctx context.Context) (*RuntimeSettings, error)
+}
+
+// defaultRuntimeSettings 出厂值。
+//
+// 它照着 settingDefs 上的默认值拼，而不是再抄一组常量：抄一份意味着「库里没写过
+// 这一项」的行为取决于是谁先问的——设置页读到一个数，拉取路径按另一个数干活。
+func defaultRuntimeSettings() *RuntimeSettings {
+	rt := &RuntimeSettings{}
+	for _, def := range settingDefs {
+		// 认领不了的键只会是这份快照不要的那些（public_homepage），
+		// 有没有漏掉一项由 TestRuntime_CoversEverySettingDef 守着。
+		_ = rt.assign(def.Key, def.Default)
+	}
+	return rt
+}
+
+// Runtime 读出运行时设置此刻的值。
+//
+// 返回的快照**永远非 nil**，读不出来时给的是出厂值：拉取路径每次回源都要问一次，
+// 库坏了就让镜像站停摆，和「缓存是优化，它坏掉不该让拉取整体失败」是同一种错。
+// 错误仍旧一并返回，调用方据此记一条日志，管理路径据此报错。
+func (s *settingSvc) Runtime(ctx context.Context) (*RuntimeSettings, error) {
+	rt := defaultRuntimeSettings()
+	if setting_repo.Setting() == nil {
+		// 仓储还没装配（main 在起 HTTP 之前就装好了，走到这里的只有那些不碰
+		// 设置表的用例）。这不是故障，按出厂值答。
+		return rt, nil
+	}
+	for _, def := range settingDefs {
+		value, err := s.current(ctx, def)
+		if err != nil {
+			return defaultRuntimeSettings(), err
+		}
+		if err := rt.assign(def.Key, value); err != nil {
+			// current 已经把值归一化过，解不出来只可能是这里漏了一个键。
+			logger.Ctx(ctx).Warn("运行时设置读不出来，按默认值处理",
+				zap.String("key", def.Key), zap.Error(err))
+		}
+	}
+	return rt, nil
+}
+
+// assign 把一项归一化之后的值填进快照。
+//
+// 用一个 switch 而不是反射打 tag：这张表一共八项，switch 漏掉一项时
+// TestRuntime_ReadsEverySettingDef 会当场报出来。
+func (r *RuntimeSettings) assign(key string, value json.RawMessage) error {
+	switch key {
+	case SiteNameSetting:
+		return json.Unmarshal(value, &r.SiteName)
+	case SiteDomainSetting:
+		return json.Unmarshal(value, &r.SiteDomain)
+	case CacheQuotaBytesSetting:
+		return json.Unmarshal(value, &r.CacheQuotaBytes)
+	case CacheReclaimPercentSetting:
+		return json.Unmarshal(value, &r.CacheReclaimPercent)
+	case MutableTTLSecondsSetting:
+		return json.Unmarshal(value, &r.MutableTTLSeconds)
+	case OriginConcurrencySetting:
+		return json.Unmarshal(value, &r.OriginConcurrency)
+	case OriginTimeoutSecondsSetting:
+		return json.Unmarshal(value, &r.OriginTimeoutSeconds)
+	case OriginRetriesSetting:
+		return json.Unmarshal(value, &r.OriginRetries)
+	case PublicHomepageSetting:
+		// 首页是否公开有自己的读法（PublicHomepage），不进这份快照：拉取路径
+		// 用不上它，而接口层要的是那条「读不出来就收口」的语义。
+		return nil
+	}
+	return fmt.Errorf("没有认领这一项设置")
 }

@@ -9,11 +9,16 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"time"
+
+	"github.com/cago-frame/cago/pkg/logger"
+	"go.uber.org/zap"
 
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
 	"github.com/CodFrm/katch/internal/proxy/dispatch"
 	"github.com/CodFrm/katch/internal/proxy/origin"
 	"github.com/CodFrm/katch/internal/proxy/registry"
+	"github.com/CodFrm/katch/internal/service/setting_svc"
 	"github.com/CodFrm/katch/internal/service/upstream_svc"
 )
 
@@ -70,6 +75,11 @@ type Gate interface {
 type Options struct {
 	// Gate 退避闸。nil 表示不退避，一律放行。
 	Gate Gate
+	// Runtime 运行时设置的来源，nil 表示进程级的那一个（setting_svc）。
+	//
+	// 回源并发上限、上游超时与重试次数都从这里现读，不在构造时抄成字段：
+	// 它们是 setting 表里的运行时项，改完必须在下一次回源上就生效（决策 3/4）。
+	Runtime setting_svc.RuntimeSource
 }
 
 type proxySvc struct {
@@ -79,15 +89,24 @@ type proxySvc struct {
 	// 上面那几行里，绕过去就等于绕过它们。
 	registry *registry.Adapter
 	gate     Gate
+	// runtime 并发上限、超时与重试次数的来源，每次回源现读。
+	runtime setting_svc.RuntimeSource
+	// slots 回源并发闸，进程内唯一一份：上限是「这台 katch 同时压给上游多少个
+	// 请求」，按 service 实例各算各的就限不住。
+	slots originSlots
 }
 
 // New 构造拉取路径的业务层。
 func New(opt Options) ProxySvc {
 	client := origin.New()
+	if opt.Runtime == nil {
+		opt.Runtime = setting_svc.Setting()
+	}
 	return &proxySvc{
 		origin:   client,
 		registry: registry.New(registry.Options{Origin: client}),
 		gate:     opt.Gate,
+		runtime:  opt.Runtime,
 	}
 }
 
@@ -121,15 +140,79 @@ func (p *proxySvc) Fetch(ctx context.Context, target *Target) (io.ReadCloser, *M
 	if p.gate != nil && !p.gate.Allow(target.Host) {
 		return nil, nil, ErrUpstreamBackoff
 	}
-	resp, err := p.fetchUpstream(ctx, target, upstream)
+	// 并发上限、超时与重试都在这里现读：站长在设置页改完，下一次回源就按新值走。
+	rt := p.settings(ctx)
+	release, err := p.slots.acquire(ctx, rt.OriginConcurrency)
 	if err != nil {
 		return nil, nil, err
 	}
-	return resp.Body, &Meta{
+	resp, stop, err := p.fetchWithRetry(ctx, target, upstream, rt)
+	if err != nil {
+		release()
+		return nil, nil, err
+	}
+	// 名额与超时用的 context 一直留到响应体被关闭，见 guardedBody。
+	body := &guardedBody{ReadCloser: resp.Body, done: func() {
+		stop()
+		release()
+	}}
+	return body, &Meta{
 		StatusCode:    resp.StatusCode,
 		Header:        resp.Header,
 		ContentLength: resp.ContentLength,
 	}, nil
+}
+
+// settings 读一次运行时设置。
+//
+// 读不出来不让拉取停摆：返回的快照在出错时是出厂值（失败与降级一节——库不可用时
+// 读路径要能继续服务）。
+func (p *proxySvc) settings(ctx context.Context) *setting_svc.RuntimeSettings {
+	rt, err := p.runtime.Runtime(ctx)
+	if err != nil {
+		logger.Ctx(ctx).Error("读取运行时设置失败，本次回源按默认值处理", zap.Error(err))
+	}
+	return rt
+}
+
+// fetchWithRetry 回源，失败按设置里的次数重试；返回的第二个值要在响应体关闭时调用。
+//
+// 只有「拿不到响应」才重试：上游的 4xx/5xx 是一个要原样透传的答复，重试它等于把
+// 上游明确给出的结论当成噪声，还会把一次 404 放大成 N 次回源。
+//
+// 超时不下沉到 http.Client：那是一个覆盖整次请求（含响应体读取）的总时限，几百 MB
+// 的镜像层会稳定地在读到一半时被它掐断。这里用一个只跑到「拿到响应头」为止的计时器，
+// 拿到响应就把它停掉，随后的响应体读取不再受它管。计时器装在这一层而不是 origin 里，
+// 是因为 registry 上游要经适配器绕一趟 token 交换，装在这里两条回源方式才都被盖住。
+func (p *proxySvc) fetchWithRetry(ctx context.Context, target *Target,
+	upstream *upstream_entity.Upstream, rt *setting_svc.RuntimeSettings,
+) (*origin.Response, context.CancelFunc, error) {
+	timeout := time.Duration(rt.OriginTimeoutSeconds) * time.Second
+	// 重试次数是个非负数（写入时校验挡着），真读到一个负数也要至少回源一次：
+	// 一次都不试就返回，交出去的会是一个既没响应也没错误的结果，调用方当场崩。
+	attempts := max(rt.OriginRetries+1, 1)
+	var lastErr error
+	for range attempts {
+		attemptCtx, cancel := context.WithCancel(ctx)
+		var timer *time.Timer
+		if timeout > 0 {
+			timer = time.AfterFunc(timeout, cancel)
+		}
+		resp, err := p.fetchUpstream(attemptCtx, target, upstream)
+		if timer != nil {
+			timer.Stop()
+		}
+		if err == nil {
+			return resp, cancel, nil
+		}
+		cancel()
+		lastErr = err
+		if ctx.Err() != nil {
+			// 调用方自己走了，再试也是白试。
+			break
+		}
+	}
+	return nil, nil, lastErr
 }
 
 // fetchUpstream 按上游类别选一条回源方式。

@@ -81,11 +81,16 @@ type Client struct {
 	http *http.Client
 }
 
-// New 构造带超时的回源客户端。
+// New 构造回源客户端。
 //
-// 超时全部下沉到 transport，**不设 http.Client.Timeout**：那是一个覆盖整次请求
-// （含响应体读取）的总时限，一个几百 MB 的镜像层会稳定地在读到一半时被它掐断。
-// 真正要防的是「连不上」和「连上了不回响应头」，这两件事由下面两个超时兜住。
+// **不设 http.Client.Timeout**：那是一个覆盖整次请求（含响应体读取）的总时限，
+// 一个几百 MB 的镜像层会稳定地在读到一半时被它掐断。
+//
+// 也**不设 ResponseHeaderTimeout**：「单次回源多久拿不到响应算失败」是 setting 表
+// 里的运行时项，由调用方（proxy_svc）在每次回源时按当时的设置加一个只跑到响应头
+// 为止的计时器。在这里再钉一个固定值，会让设置页上调大的超时被悄悄截断在这个数上——
+// 一个改了却不生效的设置比没有这个设置更糟。连接建立仍有自己的硬上限（下面两个），
+// 那是 TCP/TLS 这一步的事，和整次回源的时限不是一回事。
 func New() *Client {
 	return &Client{http: &http.Client{
 		Transport: &http.Transport{
@@ -96,7 +101,6 @@ func New() *Client {
 			MaxIdleConnsPerHost:   10,
 			IdleConnTimeout:       90 * time.Second,
 			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: 30 * time.Second,
 			ExpectContinueTimeout: time.Second,
 		},
 		// 不设 CheckRedirect，用标准库默认的「最多跟随 10 次」：GitHub 的 release

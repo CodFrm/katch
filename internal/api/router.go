@@ -14,6 +14,7 @@ import (
 	"github.com/CodFrm/katch/internal/controller/cache_ctr"
 	"github.com/CodFrm/katch/internal/controller/rule_ctr"
 	"github.com/CodFrm/katch/internal/controller/setting_ctr"
+	"github.com/CodFrm/katch/internal/controller/site_ctr"
 	"github.com/CodFrm/katch/internal/controller/stat_ctr"
 	"github.com/CodFrm/katch/internal/controller/system_ctr"
 	"github.com/CodFrm/katch/internal/controller/upstream_ctr"
@@ -42,8 +43,11 @@ func Router(_ context.Context, root *mux.Router) error {
 	sysCtr := system_ctr.NewSystem()
 	statCtr := stat_ctr.NewStat()
 	upstreamCtr := upstream_ctr.NewUpstream()
+	siteCtr := site_ctr.NewSite()
 	// 版本号无条件公开：它不描述这台镜像站代理了什么，关掉也藏不住什么。
-	r.Group("/").Bind(sysCtr.Version)
+	// 站点名片同理：站名是页面标题，站点地址是拉取命令里的那一段主机名，
+	// 藏起来只会让界面连该教人敲什么命令都说不出来。
+	r.Group("/").Bind(sysCtr.Version, siteCtr.Info)
 
 	// 站点总览与上游列表是首页那张名片：总览只给全站合计，不暴露单条路径、
 	// 单个调用方或单个上游的量；上游列表只给启用中的上游和名片级字段。
