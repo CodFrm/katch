@@ -13,6 +13,14 @@ export interface AdminSession {
   signOut: () => void
   /** 密钥在用的过程中失效了（被轮换掉）：清掉它并说明原因。 */
   reject: (reason: AdminFailure) => void
+  /**
+   * 换上一把刚生效的密钥。
+   *
+   * 轮换是从后台里发起的：换成功的那一刻，浏览器手上这把当场作废，下一个请求就
+   * 会 401 把人踢回登录页。所以轮换成功要立刻把新的那把接过来——让发起轮换的人
+   * 被自己的操作踢出去，是一种明明知道会发生却不处理的坏掉。
+   */
+  adopt: (key: string) => void
 }
 
 /**
@@ -48,11 +56,17 @@ export function useAdminSession(): AdminSession {
     setFailure(null)
   }, [])
 
+  const adopt = useCallback((next: string) => {
+    localStorage.setItem(ADMIN_KEY_STORAGE, next)
+    setKey(next)
+    setFailure(null)
+  }, [])
+
   const reject = useCallback((reason: AdminFailure) => {
     localStorage.removeItem(ADMIN_KEY_STORAGE)
     setKey(null)
     setFailure(reason)
   }, [])
 
-  return { key, failure, verifying, signIn, signOut, reject }
+  return { key, failure, verifying, signIn, signOut, reject, adopt }
 }

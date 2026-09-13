@@ -90,3 +90,48 @@ export function formatStamp(seconds: number, now: Date = new Date()): Stamp {
   }
   return { day: 'earlier', time, date }
 }
+
+/**
+ * 把 `3 TB` 这样的短串解回字节数，认不出来时给 null。
+ *
+ * 它是 formatBytes 的逆：设置页把配额读成人能改的短串，再原样写回去。少了这一半，
+ * 输入框里显示的和保存下去的就是两个值——那是一种保存一次就改掉设置的界面。
+ * 认不出来时**不给一个兜底数**：把 `3 PB?` 当成 0 存进去比报错糟得多。
+ */
+export function parseBytes(text: string): number | null {
+  const matched = /^\s*(\d+(?:\.\d+)?)\s*([a-zA-Z]*)\s*$/.exec(text)
+  if (!matched) {
+    return null
+  }
+  const unit = matched[2].toUpperCase() || UNITS[0]
+  const index = (UNITS as readonly string[]).indexOf(unit)
+  if (index < 0) {
+    return null
+  }
+  return Math.round(Number(matched[1]) * 1024 ** index)
+}
+
+/** 秒数写成 `30s` / `5m` / `1h`：能整除的用大单位，不能整除的退回小的。 */
+export function formatDuration(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return '0s'
+  }
+  const rounded = Math.round(seconds)
+  if (rounded % 3600 === 0) {
+    return `${rounded / 3600}h`
+  }
+  if (rounded % 60 === 0) {
+    return `${rounded / 60}m`
+  }
+  return `${rounded}s`
+}
+
+/** `5m` 解回秒数，不带单位按秒算，认不出来给 null。 */
+export function parseDuration(text: string): number | null {
+  const matched = /^\s*(\d+(?:\.\d+)?)\s*([smh]?)\s*$/.exec(text)
+  if (!matched) {
+    return null
+  }
+  const scale = { '': 1, s: 1, m: 60, h: 3600 }[matched[2]] ?? 1
+  return Math.round(Number(matched[1]) * scale)
+}

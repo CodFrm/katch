@@ -50,7 +50,10 @@
     "signOut": "Sign out",
     "nav": {
       "overview": "Overview",
-      "upstreams": "Upstreams"
+      "upstreams": "Upstreams",
+      "cache": "Cache objects",
+      "settings": "Settings",
+      "addUpstream": "Add upstream"
     },
     "range": {
       "24h": "24 hours",
@@ -132,7 +135,176 @@
       "hits": "Cache hit",
       "origin": "Origin",
       "axisStart": "{{range}} ago",
-      "axisNow": "now"
+      "axisNow": "now",
+      "tab": {
+        "overview": "Overview",
+        "rules": "Access rules"
+      },
+      "pause": "Pause",
+      "resume": "Resume",
+      "purge": "Purge cache",
+      "purgeConfirm": "Purge now",
+      "purgeCancel": "Cancel",
+      "edit": "Edit",
+      "addTitle": "Add upstream",
+      "editTitle": "Edit upstream",
+      "form": {
+        "host": "Upstream host",
+        "origin": "Origin address",
+        "kind": "Upstream kind",
+        "defaultPolicy": "Default policy",
+        "note": "Note",
+        "save": "Save upstream",
+        "cancel": "Cancel"
+      }
+    },
+    "error": {
+      "unreachable": "Cannot reach this katch, so nothing was saved. Check that the service is still running.",
+      "rejected": "The backend did not accept this change.",
+      "upstreamHostExists": "An upstream with this host already exists.",
+      "ruleNotFound": "That rule is gone. Refresh and try again.",
+      "cacheObjectNotFound": "That cache object is gone.",
+      "purgeTargetRequired": "Say which object or which upstream to purge.",
+      "settingKeyUnknown": "One setting is unknown to this katch — the UI may be newer than the backend.",
+      "settingValueInvalid": "One setting has a value outside the allowed range. Fix it and save again."
+    },
+    "rules": {
+      "title": "Access rules",
+      "globalTitle": "Global access rules",
+      "globalSubtitle": "Evaluated before every upstream's own rules",
+      "defaultPolicy": "Default policy",
+      "policy": {
+        "allow_all": "Allow everything",
+        "deny_unless_matched": "Only what rules allow"
+      },
+      "policyHint": {
+        "allow_all": "Requests no rule matches are proxied as usual",
+        "deny_unless_matched": "Requests no rule matches get a 403"
+      },
+      "globalScopeHint": "These rules are evaluated before every upstream's own rules",
+      "globalCount": "{{total}} global rule(s) are evaluated before this table",
+      "add": "Add rule",
+      "save": "Save rule",
+      "cancel": "Cancel",
+      "edit": "Edit",
+      "remove": "Delete",
+      "empty": "No rules yet.",
+      "columns": {
+        "action": "Action",
+        "pattern": "Path pattern",
+        "note": "Note",
+        "operations": "Actions"
+      },
+      "action": {
+        "allow": "Allow",
+        "deny": "Deny"
+      },
+      "tester": "Rule tester",
+      "testerHint": "Paste a resource address and see which rule decides it. No real request is made.",
+      "testerLabel": "Resource address",
+      "testerPlaceholder": "library/alpine:3.21",
+      "testerSubmit": "Evaluate",
+      "verdictLabel": "Verdict",
+      "allowed": "Allowed",
+      "denied": "Denied",
+      "verdictRule": "Decided at step {{index}}",
+      "verdictNote": " · {{note}}",
+      "verdictDefault": {
+        "allow_all": "No rule matched, so the default policy applies: allow everything",
+        "deny_unless_matched": "No rule matched, so the default policy applies: only what rules allow"
+      },
+      "trace": "Evaluation",
+      "scope": {
+        "global": "Global",
+        "upstream": "Upstream",
+        "default": "Default"
+      },
+      "stepMatched": "matched",
+      "stepUnmatched": "no match",
+      "stepDecisive": "decided · {{action}}",
+      "traceFootnote": "Rules are evaluated by specificity, not by the order they were added: the longer literal prefix wins, then the one with fewer wildcards, and deny wins a tie."
+    },
+    "cache": {
+      "title": "Cache objects",
+      "objects": "objects",
+      "addressing": "Content addressed — one copy per layer",
+      "capacity": "Cache capacity",
+      "quota": "/ quota {{size}}",
+      "watermark": "LRU reclaim starts at {{percent}}%",
+      "search": "Search cache objects",
+      "searchPlaceholder": "library/*",
+      "found": "{{total}} found",
+      "filterUpstream": "Filter by upstream",
+      "allUpstreams": "All upstreams",
+      "selected": "{{total}} selected",
+      "purge": "Purge",
+      "pin": "Pin",
+      "unpin": "Unpin",
+      "pinned": "Pinned",
+      "empty": "No object matches.",
+      "selectColumn": "Select",
+      "selectObject": "Select {{key}}",
+      "purged": "Purged {{removed}} object(s)",
+      "purgedWithSkipped": "Purged {{removed}} object(s); {{skipped}} pinned one(s) stayed",
+      "columns": {
+        "object": "Object",
+        "upstream": "Upstream",
+        "size": "Size",
+        "hits": "Hits",
+        "lastAccess": "Last access",
+        "operations": "Actions"
+      }
+    },
+    "settings": {
+      "title": "Settings",
+      "subtitle": "Runtime settings only — every change takes effect right away, no restart",
+      "save": "Save changes",
+      "saved": "Saved · {{time}}",
+      "configNoticeLead": "Listen address, database and logging live in",
+      "configNoticeTail": ", not here; changing them needs a process restart.",
+      "rotate": "Rotate",
+      "rotateConfirm": "Rotate key",
+      "cancel": "Cancel",
+      "newKey": "New admin key",
+      "keyLength": "at least {{min}} characters",
+      "unreadableValue": "One value is unreadable. Write it like 3 TB, 512 MB, 5m or 30s.",
+      "globalRulesLink": "{{total}} rules →",
+      "groups": {
+        "site": "Site",
+        "cache": "Cache",
+        "origin": "Origin",
+        "access": "Access"
+      },
+      "fields": {
+        "siteDomain": "Public domain",
+        "siteName": "Site name",
+        "publicHomepage": "Public homepage",
+        "quota": "Total quota",
+        "watermark": "Reclaim watermark",
+        "watermarkShort": "watermark",
+        "mutableTTL": "Mutable object TTL",
+        "immutable": "Immutable objects",
+        "concurrency": "Origin concurrency",
+        "timeout": "Origin timeout",
+        "retries": "Retries",
+        "retriesShort": "retries",
+        "adminKey": "Admin key",
+        "globalRules": "Global access rules"
+      },
+      "hints": {
+        "siteDomain": "The domain users pull from; also used to build commands",
+        "publicHomepage": "Off: the homepage keeps only the input box, no upstreams or hit rate",
+        "quota": "Crossing the watermark starts LRU reclaim",
+        "mutableTTL": "Manifests, Release files, @latest — the objects that change",
+        "immutable": "Content addressed, never expires, evicted by LRU only",
+        "concurrency": "Requests hitting one upstream at the same time",
+        "globalRules": "Evaluated before every upstream's own rules"
+      },
+      "states": {
+        "publicOn": "Upstreams and hit rate are visible to everyone",
+        "publicOff": "The homepage keeps only the input box",
+        "immutable": "Decided by the content digest, not configurable"
+      }
     }
   },
   "login": {

@@ -1,4 +1,4 @@
-import { LayoutGrid, LogOut } from 'lucide-react'
+import { Database, LayoutGrid, LogOut, Plus, SlidersHorizontal } from 'lucide-react'
 import type { ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { NavLink } from 'react-router-dom'
@@ -10,6 +10,17 @@ import { cn } from '@/lib/utils'
 
 /** 字标与当前域之间的分隔符，是排版而不是文案。 */
 const SEPARATOR = '/'
+
+/**
+ * 全局导航。
+ *
+ * 只放有后端撑着的那几个域：画一个点进去是空的入口，比不画它更让人以为功能坏了。
+ */
+const NAV = [
+  { to: '/admin', end: true, icon: LayoutGrid, label: 'admin.nav.overview' },
+  { to: '/admin/cache', end: false, icon: Database, label: 'admin.nav.cache' },
+  { to: '/admin/settings', end: false, icon: SlidersHorizontal, label: 'admin.nav.settings' },
+]
 
 /**
  * 后台外壳：左栏常驻，右侧换内容。
@@ -47,21 +58,24 @@ export function AdminShell({
         </header>
 
         <nav className="flex flex-col gap-0.5 px-2.5 py-4">
-          <NavLink
-            to="/admin"
-            end
-            className={({ isActive }) =>
-              cn(
-                'flex items-center gap-2.5 px-2.5 py-2 text-[13px]',
-                isActive
-                  ? 'bg-muted text-foreground'
-                  : 'text-muted-foreground hover:text-foreground'
-              )
-            }
-          >
-            <LayoutGrid className="size-[15px]" aria-hidden />
-            {t('admin.nav.overview')}
-          </NavLink>
+          {NAV.map((item) => (
+            <NavLink
+              key={item.to}
+              to={item.to}
+              end={item.end}
+              className={({ isActive }) =>
+                cn(
+                  'flex items-center gap-2.5 px-2.5 py-2 text-[13px]',
+                  isActive
+                    ? 'bg-muted text-foreground'
+                    : 'text-muted-foreground hover:text-foreground'
+                )
+              }
+            >
+              <item.icon className="size-[15px]" aria-hidden />
+              {t(item.label)}
+            </NavLink>
+          ))}
         </nav>
 
         <div className="flex min-w-0 flex-1 flex-col gap-1 px-2.5 pb-4">
@@ -94,6 +108,14 @@ export function AdminShell({
             </NavLink>
           ))}
         </div>
+
+        <NavLink
+          to="/admin/upstreams/new"
+          className="border-border text-muted-foreground hover:text-foreground flex items-center gap-2.5 border-t px-5 py-3.5 text-[13px]"
+        >
+          <Plus className="size-3.5" aria-hidden />
+          {t('admin.nav.addUpstream')}
+        </NavLink>
       </aside>
 
       <main className="flex min-w-0 flex-1 flex-col">{children}</main>

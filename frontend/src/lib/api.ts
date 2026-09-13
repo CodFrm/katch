@@ -251,3 +251,249 @@ export function fetchAdminEvents(key: string, limit: number, signal?: AbortSigna
 export function fetchAdminOverview(key: string, range: StatRange, signal?: AbortSignal) {
   return adminGet<Overview>(`/api/v1/stats/overview?range=${range}`, key, signal)
 }
+
+// ── 管理端的写操作 ────────────────────────────────────────────────────
+//
+// 读和写的失败不是同一组：写还会被后端按业务规则挡下来（不认识的设置项、超出
+// 取值范围、主机名重复）。那种失败带一个稳定的错误码，界面按码查自己的文案——
+// 后端的 msg 一个字都不往外贴。
+
+/** 一次管理写操作的结果。rejected 带着后端的业务码，由 lib/errors 翻成人话。 */
+export type MutationResult<T> =
+  | { ok: true; data: T }
+  | { ok: false; reason: 'unauthorized' }
+  | { ok: false; reason: 'unreachable' }
+  | { ok: false; reason: 'rejected'; code: number }
+
+async function adminSend<T>(
+  path: string,
+  key: string,
+  method: 'POST' | 'DELETE',
+  payload?: unknown
+): Promise<MutationResult<T>> {
+  try {
+    const resp = await fetch(path, {
+      method,
+      headers: {
+        Accept: 'application/json',
+        Authorization: `Bearer ${key}`,
+        ...(payload === undefined ? {} : { 'Content-Type': 'application/json' }),
+      },
+      body: payload === undefined ? undefined : JSON.stringify(payload),
+    })
+    if (resp.status === 401) {
+      return { ok: false, reason: 'unauthorized' }
+    }
+    const body = (await resp.json()) as Envelope<T>
+    if (!resp.ok || body.code !== 0) {
+      // 4xx 带着业务码：那是「这次改动本身不成立」，和够不到后端是两件事。
+      return typeof body.code === 'number' && body.code > 0
+        ? { ok: false, reason: 'rejected', code: body.code }
+        : { ok: false, reason: 'unreachable' }
+    }
+    return { ok: true, data: body.data }
+  } catch {
+    return { ok: false, reason: 'unreachable' }
+  }
+}
+
+/** 一条访问规则，取值与后端 api/admin.RuleItem 一致。upstream_id 为 0 即全局规则。 */
+export interface AdminRuleItem {
+  id: number
+  upstream_id: number
+  action: RuleAction
+  pattern: string
+  note: string
+  createtime: number
+  updatetime: number
+}
+
+/** 规则动作，与后端 rule_entity 的取值一致。 */
+export type RuleAction = 'allow' | 'deny'
+
+/** 判定发生在哪一层，与后端 admin.Scope 一致。 */
+export type RuleScope = 'global' | 'upstream' | 'default'
+
+/** 上游的默认策略，与后端 upstream_entity 的取值一致。 */
+export type DefaultPolicy = 'allow_all' | 'deny_unless_matched'
+
+/** 试算过程里的一步。整个过程里至多有一步 decisive 为真。 */
+export interface RuleTraceStep {
+  scope: RuleScope
+  rule_id: number
+  pattern: string
+  action: RuleAction
+  matched: boolean
+  decisive: boolean
+}
+
+/** 试算结果：判定、是哪条规则决定的、以及完整的求值过程。 */
+export interface RuleTestResult {
+  host: string
+  path: string
+  allowed: boolean
+  scope: RuleScope
+  matched_rule: AdminRuleItem | null
+  default_policy: DefaultPolicy
+  trace: RuleTraceStep[]
+}
+
+/** 一个缓存对象，取值与后端 api/admin.CacheObjectItem 一致。 */
+export interface CacheObjectItem {
+  id: number
+  upstream_id: number
+  key: string
+  digest: string
+  size: number
+  immutable: boolean
+  pinned: boolean
+  expires_at: number
+  last_access_at: number
+  hit_count: number
+  createtime: number
+  updatetime: number
+}
+
+/** 缓存搜索的一页。page/size 是后端归一化之后的值，分页器按它画。 */
+export interface CacheSearchResult {
+  list: CacheObjectItem[]
+  total: number
+  page: number
+  size: number
+}
+
+/** 清缓存清掉了几条、因为被固定而留下几条。 */
+export interface PurgeResult {
+  removed: number
+  skipped: number
+}
+
+/** 一项运行时设置的值类型，界面按它选控件。 */
+export type SettingValueType = 'bool' | 'int' | 'string'
+
+/** 一项运行时设置。value 是后端给的 JSON 值本身（字符串、整数或布尔）。 */
+export interface SettingItem {
+  key: string
+  value: unknown
+  type: SettingValueType
+}
+
+/** 上游的登记信息，写回去时字段要凑齐：保存是整条覆盖，不是打补丁。 */
+export interface UpstreamDraft {
+  id: number
+  host: string
+  kind: UpstreamKind
+  origin: string
+  enabled: boolean
+  immutable_patterns: string[]
+  mutable_ttl_seconds: number
+  default_policy: DefaultPolicy
+  library_completion: boolean
+  note: string
+}
+
+export function fetchRules(key: string, signal?: AbortSignal) {
+  return adminGet<{ list: AdminRuleItem[] }>('/api/v1/admin/rules', key, signal)
+}
+
+export function saveRule(
+  key: string,
+  rule: { id: number; upstream_id: number; action: RuleAction; pattern: string; note: string }
+) {
+  return adminSend<{ id: number }>('/api/v1/admin/rules', key, 'POST', rule)
+}
+
+export function deleteRule(key: string, id: number) {
+  return adminSend<Record<string, never>>(`/api/v1/admin/rules/${id}`, key, 'DELETE')
+}
+
+/**
+ * 试算一条资源地址。
+ *
+ * host 留空时后端按拉取路径的形态解析整条地址，所以上游页上带 host、
+ * 全局那一面不带，粘一条完整的 katch 地址两边都认。
+ */
+export function testRule(key: string, host: string, path: string) {
+  return adminSend<RuleTestResult>('/api/v1/admin/rules/test', key, 'POST', { host, path })
+}
+
+export function saveUpstream(key: string, upstream: UpstreamDraft) {
+  return adminSend<{ id: number }>('/api/v1/admin/upstreams', key, 'POST', upstream)
+}
+
+export function searchCacheObjects(
+  key: string,
+  query: { keyword: string; upstreamID: number; page: number },
+  signal?: AbortSignal
+) {
+  const params = new URLSearchParams({ page: String(query.page) })
+  if (query.keyword) {
+    params.set('keyword', query.keyword)
+  }
+  if (query.upstreamID > 0) {
+    params.set('upstream_id', String(query.upstreamID))
+  }
+  return adminGet<CacheSearchResult>(`/api/v1/admin/cache/objects?${params}`, key, signal)
+}
+
+/** 清缓存：给 id 清一条，给 upstreamID 清整个上游（固定过的会留下）。 */
+export function purgeCache(key: string, target: { id?: number; upstreamID?: number }) {
+  return adminSend<PurgeResult>('/api/v1/admin/cache/purge', key, 'POST', {
+    id: target.id ?? 0,
+    upstream_id: target.upstreamID ?? 0,
+  })
+}
+
+export function pinCacheObject(key: string, id: number, pinned: boolean) {
+  return adminSend<Record<string, never>>(`/api/v1/admin/cache/objects/${id}/pin`, key, 'POST', {
+    pinned,
+  })
+}
+
+export function fetchSettings(key: string, signal?: AbortSignal) {
+  return adminGet<{ list: SettingItem[] }>('/api/v1/admin/settings', key, signal)
+}
+
+/** 写若干设置，只写给出的那些键。后端整批校验，不会写进去半套。 */
+export function saveSettings(key: string, settings: Record<string, unknown>) {
+  return adminSend<{ list: SettingItem[] }>('/api/v1/admin/settings', key, 'POST', { settings })
+}
+
+export function rotateAdminKey(key: string, newKey: string) {
+  return adminSend<Record<string, never>>('/api/v1/admin/settings/admin-key', key, 'POST', {
+    new_key: newKey,
+  })
+}
+
+/**
+ * 带密钥取公开上游列表。
+ *
+ * 缓存页要的是「每个上游占了多少」，而按上游分的缓存量只有这个接口给。它默认
+ * 公开，站长关掉公开首页之后匿名调用方拿 404，带密钥的照样能读。
+ */
+export function fetchUpstreamCacheSizes(key: string, signal?: AbortSignal) {
+  return adminGet<UpstreamList>('/api/v1/upstreams', key, signal)
+}
+
+/**
+ * 库里那条上游整理成写回去的形态。
+ *
+ * 保存是整条覆盖而不是打补丁，所以写回去的字段必须凑齐；createtime 这类只读字段
+ * 不进请求体——它们不是调用方能决定的东西。默认策略可能是空串（从没配过），
+ * 按后端 upstream_entity.PolicyAllowAll 的兜底补上。
+ */
+export function toUpstreamDraft(upstream: AdminUpstreamItem): UpstreamDraft {
+  return {
+    id: upstream.id,
+    host: upstream.host,
+    kind: upstream.kind,
+    origin: upstream.origin,
+    enabled: upstream.enabled,
+    immutable_patterns: upstream.immutable_patterns,
+    mutable_ttl_seconds: upstream.mutable_ttl_seconds,
+    default_policy:
+      upstream.default_policy === 'deny_unless_matched' ? 'deny_unless_matched' : 'allow_all',
+    library_completion: upstream.library_completion,
+    note: upstream.note,
+  }
+}

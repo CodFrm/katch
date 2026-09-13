@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest'
 
-import { formatBytes, formatCount, formatPercent, formatStamp } from '@/lib/format'
+import {
+  formatBytes,
+  formatCount,
+  formatDuration,
+  formatPercent,
+  formatStamp,
+  parseBytes,
+  parseDuration,
+} from '@/lib/format'
 
 describe('formatBytes', () => {
   const cases: [number, string, string][] = [
@@ -83,5 +91,55 @@ describe('formatStamp', () => {
       time: '18:04',
       date: '09-09',
     })
+  })
+})
+
+// 设置页把字节数与秒数写成人能改的短串（`3 TB`、`5m`），再解回机器要的数。
+// 解析必须是 format 的逆：一个读得出来却写不回去的输入框，保存一次就把值改了。
+describe('parseBytes', () => {
+  const cases: [string, number | null][] = [
+    ['3 TB', 3 * 1024 ** 4],
+    ['3TB', 3 * 1024 ** 4],
+    ['1.82 tb', Math.round(1.82 * 1024 ** 4)],
+    ['512', 512],
+    ['512 B', 512],
+    ['', null],
+    ['abc', null],
+    ['-1 GB', null],
+    ['3 PB?', null],
+  ]
+  for (const [input, want] of cases) {
+    it(`${input || '空串'} -> ${want}`, () => {
+      expect(parseBytes(input)).toBe(want)
+    })
+  }
+
+  it('和 formatBytes 互为逆运算', () => {
+    const bytes = 3 * 1024 ** 4
+    const shown = formatBytes(bytes)
+    expect(parseBytes(`${shown.value} ${shown.unit}`)).toBe(bytes)
+  })
+})
+
+describe('formatDuration / parseDuration', () => {
+  const cases: [number, string][] = [
+    [30, '30s'],
+    [300, '5m'],
+    [3600, '1h'],
+    [5400, '90m'],
+    [86400, '24h'],
+  ]
+  for (const [seconds, text] of cases) {
+    it(`${seconds} 秒写成 ${text}`, () => {
+      expect(formatDuration(seconds)).toBe(text)
+      expect(parseDuration(text)).toBe(seconds)
+    })
+  }
+
+  it('不带单位按秒算，认不出来的给 null', () => {
+    expect(parseDuration('45')).toBe(45)
+    expect(parseDuration('5 分钟')).toBeNull()
+    expect(parseDuration('')).toBeNull()
+    expect(parseDuration('-5s')).toBeNull()
   })
 })

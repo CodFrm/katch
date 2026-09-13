@@ -1,14 +1,21 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 import {
   fetchAdminEvents,
   fetchAdminOverview,
   fetchAdminUpstreams,
+  fetchRules,
+  fetchSettings,
+  fetchUpstreamCacheSizes,
   fetchUpstreamSeries,
   fetchUpstreamStats,
+  searchCacheObjects,
   type AdminResult,
+  type AdminRuleItem,
   type AdminUpstreamItem,
+  type CacheSearchResult,
   type EventItem,
+  type SettingItem,
   type StatRange,
   type UpstreamSeriesPoint,
   type UpstreamStatItem,
@@ -51,6 +58,8 @@ export interface AdminUpstreamData {
   upstreams: AdminUpstreamItem[]
   /** 每个上游在当前区间里的量，后端连一次请求都没有的上游也会给。 */
   stats: UpstreamStatItem[]
+  /** 改完上游（新增、编辑、启停）之后重新取一遍，让侧栏和详情一起跟上。 */
+  reload: () => void
 }
 
 /**
@@ -65,7 +74,11 @@ export function useAdminUpstreamData(
   onUnauthorized: () => void
 ): AdminUpstreamData {
   const reject = useRejectOnUnauthorized(onUnauthorized)
-  const [data, setData] = useState<AdminUpstreamData>({ upstreams: [], stats: [] })
+  const [data, setData] = useState<{
+    upstreams: AdminUpstreamItem[]
+    stats: UpstreamStatItem[]
+  }>({ upstreams: [], stats: [] })
+  const [token, reload] = useReloadToken()
 
   useEffect(() => {
     const controller = new AbortController()
@@ -83,9 +96,9 @@ export function useAdminUpstreamData(
       })
     })
     return () => controller.abort()
-  }, [key, range, reject])
+  }, [key, range, token, reject])
 
-  return data
+  return { ...data, reload }
 }
 
 export interface OverviewExtras {
@@ -199,4 +212,118 @@ export function useUpstreamSeries(
   // 上一个上游的序列不许在这一个的图上出现：切换上游时手里那份数据属于别人，
   // 所以这里比对 id 而不是在 effect 里先把状态清空。
   return loaded && loaded.id === upstreamID ? loaded.points : null
+}
+
+/**
+ * 一份能被写操作刷新的数据。
+ *
+ * 管理页改完要看到改完的样子，所以每个取数钩子都给一个 reload：写成功之后调它，
+ * 而不是在本地把那条记录改一遍——本地改一遍等于前端第二次实现后端的写入语义，
+ * 两边一旦不一致，界面上看到的就是一个后端没有的状态。
+ */
+export interface Reloadable<T> {
+  data: T
+  reload: () => void
+}
+
+function useReloadToken(): [number, () => void] {
+  const [token, setToken] = useState(0)
+  const reload = useCallback(() => setToken((value) => value + 1), [])
+  return [token, reload]
+}
+
+/** 全部访问规则（全局的与各上游的）。规则规模是几十条，后端不分页。 */
+export function useAdminRules(
+  key: string,
+  onUnauthorized: () => void
+): Reloadable<AdminRuleItem[]> {
+  const reject = useRejectOnUnauthorized(onUnauthorized)
+  const [rules, setRules] = useState<AdminRuleItem[]>([])
+  const [token, reload] = useReloadToken()
+
+  useEffect(() => {
+    const controller = new AbortController()
+    void fetchRules(key, controller.signal).then((result) => {
+      if (!controller.signal.aborted) {
+        setRules(unwrap(result, () => reject.current())?.list ?? [])
+      }
+    })
+    return () => controller.abort()
+  }, [key, token, reject])
+
+  return { data: rules, reload }
+}
+
+/**
+ * 缓存对象的一页。还没问到时是 null——「一个对象都没有」和「还没问到」在界面上
+ * 是两句不同的话，前者该说「没有匹配的对象」，后者什么都不该说。
+ */
+export function useCacheObjects(
+  key: string,
+  query: { keyword: string; upstreamID: number; page: number },
+  onUnauthorized: () => void
+): Reloadable<CacheSearchResult | null> {
+  const reject = useRejectOnUnauthorized(onUnauthorized)
+  const [result, setResult] = useState<CacheSearchResult | null>(null)
+  const [token, reload] = useReloadToken()
+  const { keyword, upstreamID, page } = query
+
+  useEffect(() => {
+    const controller = new AbortController()
+    void searchCacheObjects(key, { keyword, upstreamID, page }, controller.signal).then(
+      (response) => {
+        if (!controller.signal.aborted) {
+          setResult(unwrap(response, () => reject.current()))
+        }
+      }
+    )
+    return () => controller.abort()
+  }, [key, keyword, upstreamID, page, token, reject])
+
+  return { data: result, reload }
+}
+
+/** 按上游分的缓存占用（主机名 → 字节数），容量条按它分段。 */
+export function useUpstreamCacheSizes(
+  key: string,
+  onUnauthorized: () => void
+): { host: string; cacheBytes: number }[] {
+  const reject = useRejectOnUnauthorized(onUnauthorized)
+  const [sizes, setSizes] = useState<{ host: string; cacheBytes: number }[]>([])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    void fetchUpstreamCacheSizes(key, controller.signal).then((result) => {
+      if (controller.signal.aborted) {
+        return
+      }
+      const list = unwrap(result, () => reject.current())?.list ?? []
+      setSizes(list.map((item) => ({ host: item.host, cacheBytes: item.cache_bytes })))
+    })
+    return () => controller.abort()
+  }, [key, reject])
+
+  return sizes
+}
+
+/** 全部运行时设置，还没读到时是 null。 */
+export function useAdminSettings(
+  key: string,
+  onUnauthorized: () => void
+): Reloadable<SettingItem[] | null> {
+  const reject = useRejectOnUnauthorized(onUnauthorized)
+  const [settings, setSettings] = useState<SettingItem[] | null>(null)
+  const [token, reload] = useReloadToken()
+
+  useEffect(() => {
+    const controller = new AbortController()
+    void fetchSettings(key, controller.signal).then((result) => {
+      if (!controller.signal.aborted) {
+        setSettings(unwrap(result, () => reject.current())?.list ?? null)
+      }
+    })
+    return () => controller.abort()
+  }, [key, token, reject])
+
+  return { data: settings, reload }
 }

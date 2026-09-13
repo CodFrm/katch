@@ -50,7 +50,10 @@
     "signOut": "退出登录",
     "nav": {
       "overview": "概览",
-      "upstreams": "上游"
+      "upstreams": "上游",
+      "cache": "缓存对象",
+      "settings": "设置",
+      "addUpstream": "添加上游"
     },
     "range": {
       "24h": "24 小时",
@@ -132,7 +135,176 @@
       "hits": "命中缓存",
       "origin": "回源",
       "axisStart": "{{range}}前",
-      "axisNow": "现在"
+      "axisNow": "现在",
+      "tab": {
+        "overview": "概况",
+        "rules": "访问规则"
+      },
+      "pause": "暂停",
+      "resume": "恢复",
+      "purge": "清空缓存",
+      "purgeConfirm": "确认清空",
+      "purgeCancel": "取消",
+      "edit": "编辑",
+      "addTitle": "添加上游",
+      "editTitle": "编辑上游",
+      "form": {
+        "host": "上游主机名",
+        "origin": "回源地址",
+        "kind": "上游类别",
+        "defaultPolicy": "默认策略",
+        "note": "备注",
+        "save": "保存上游",
+        "cancel": "取消"
+      }
+    },
+    "error": {
+      "unreachable": "连不上这台 katch，改动没有保存。确认一下服务还在运行。",
+      "rejected": "这次改动后端没有接受。",
+      "upstreamHostExists": "这个主机名已经有一条上游了。",
+      "ruleNotFound": "这条规则已经不在了，刷新一下再试。",
+      "cacheObjectNotFound": "这个缓存对象已经不在了。",
+      "purgeTargetRequired": "要先说清楚清哪一个对象或哪个上游。",
+      "settingKeyUnknown": "有一项设置这台 katch 不认识，界面可能比后端新。",
+      "settingValueInvalid": "有一项设置的取值不合法，改成允许的范围再保存。"
+    },
+    "rules": {
+      "title": "访问规则",
+      "globalTitle": "全局访问规则",
+      "globalSubtitle": "先于每个上游自己的规则求值",
+      "defaultPolicy": "默认策略",
+      "policy": {
+        "allow_all": "允许全部",
+        "deny_unless_matched": "仅允许命中规则"
+      },
+      "policyHint": {
+        "allow_all": "没有规则命中的请求照常代理",
+        "deny_unless_matched": "未命中任何规则的请求返回 403"
+      },
+      "globalScopeHint": "这些规则先于每个上游自己的规则求值",
+      "globalCount": "另有 {{total}} 条全局规则先于本表求值",
+      "add": "添加规则",
+      "save": "保存规则",
+      "cancel": "取消",
+      "edit": "编辑",
+      "remove": "删除",
+      "empty": "还没有规则。",
+      "columns": {
+        "action": "动作",
+        "pattern": "路径模式",
+        "note": "说明",
+        "operations": "操作"
+      },
+      "action": {
+        "allow": "允许",
+        "deny": "拒绝"
+      },
+      "tester": "规则测试",
+      "testerHint": "粘一个资源地址，看它会被哪条规则决定。不发起真实请求。",
+      "testerLabel": "资源地址",
+      "testerPlaceholder": "library/alpine:3.21",
+      "testerSubmit": "试算",
+      "verdictLabel": "试算结果",
+      "allowed": "放行",
+      "denied": "拒绝",
+      "verdictRule": "命中第 {{index}} 条规则",
+      "verdictNote": " · {{note}}",
+      "verdictDefault": {
+        "allow_all": "没有规则命中，落到默认策略：允许全部",
+        "deny_unless_matched": "没有规则命中，落到默认策略：仅允许命中规则"
+      },
+      "trace": "匹配过程",
+      "scope": {
+        "global": "全局",
+        "upstream": "本上游",
+        "default": "默认"
+      },
+      "stepMatched": "匹配",
+      "stepUnmatched": "不匹配",
+      "stepDecisive": "命中 · {{action}}",
+      "traceFootnote": "规则按具体度求值，不按录入顺序：前缀更长的先说了算，前缀一样长时通配符少的先说了算，仍相等时拒绝优先。"
+    },
+    "cache": {
+      "title": "缓存对象",
+      "objects": "个对象",
+      "addressing": "内容寻址，同一层只存一份",
+      "capacity": "缓存容量",
+      "quota": "/ 配额 {{size}}",
+      "watermark": "达到 {{percent}}% 触发 LRU 回收",
+      "search": "搜索缓存对象",
+      "searchPlaceholder": "library/*",
+      "found": "命中 {{total}} 个",
+      "filterUpstream": "按上游筛选",
+      "allUpstreams": "全部上游",
+      "selected": "已选 {{total}} 项",
+      "purge": "清除",
+      "pin": "固定",
+      "unpin": "取消固定",
+      "pinned": "已固定",
+      "empty": "没有匹配的对象。",
+      "selectColumn": "选择",
+      "selectObject": "选择 {{key}}",
+      "purged": "清除了 {{removed}} 个对象",
+      "purgedWithSkipped": "清除了 {{removed}} 个对象，{{skipped}} 个已固定的对象保留",
+      "columns": {
+        "object": "对象",
+        "upstream": "上游",
+        "size": "大小",
+        "hits": "命中",
+        "lastAccess": "最后访问",
+        "operations": "操作"
+      }
+    },
+    "settings": {
+      "title": "设置",
+      "subtitle": "这里只有运行时配置，改完立刻生效，不需要重启",
+      "save": "保存更改",
+      "saved": "已保存 · {{time}}",
+      "configNoticeLead": "监听地址、数据库、日志这些基础设施配置在",
+      "configNoticeTail": "里，不在这里改，改动需要重启进程。",
+      "rotate": "轮换",
+      "rotateConfirm": "确认轮换",
+      "cancel": "取消",
+      "newKey": "新的管理密钥",
+      "keyLength": "至少 {{min}} 位",
+      "unreadableValue": "有一个值看不懂，写成 3 TB、512 MB 或 5m、30s 这样的形式。",
+      "globalRulesLink": "{{total}} 条规则 →",
+      "groups": {
+        "site": "站点",
+        "cache": "缓存",
+        "origin": "拉取",
+        "access": "访问"
+      },
+      "fields": {
+        "siteDomain": "对外域名",
+        "siteName": "站点名称",
+        "publicHomepage": "公开首页",
+        "quota": "总配额",
+        "watermark": "回收水位",
+        "watermarkShort": "水位",
+        "mutableTTL": "可变对象 TTL",
+        "immutable": "不可变对象",
+        "concurrency": "回源并发上限",
+        "timeout": "上游超时",
+        "retries": "重试次数",
+        "retriesShort": "重试",
+        "adminKey": "管理员密钥",
+        "globalRules": "全局访问规则"
+      },
+      "hints": {
+        "siteDomain": "用户拉取时写的域名，也用于生成命令",
+        "publicHomepage": "关闭后首页只保留输入框，不展示上游和命中率",
+        "quota": "超过水位触发 LRU 回收",
+        "mutableTTL": "manifest、Release、@latest 这类会变的对象",
+        "immutable": "内容寻址，永不过期，只按 LRU 淘汰",
+        "concurrency": "同一上游同时回源的请求数",
+        "globalRules": "先于每个上游自己的规则求值"
+      },
+      "states": {
+        "publicOn": "上游列表与命中率对所有人可见",
+        "publicOff": "首页只保留输入框",
+        "immutable": "由内容摘要决定，不可配置"
+      }
     }
   },
   "login": {
