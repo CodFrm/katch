@@ -41,3 +41,52 @@ export function formatPercent(rate: number): string {
   }
   return (Math.min(1, Math.max(0, rate)) * 100).toFixed(1)
 }
+
+/**
+ * 请求数一类的计数：三位一组的整数，不带单位。
+ *
+ * 不折成「万 / 亿」这种量级单位：那套写法只在中文里成立，翻成英文要换一套进位，
+ * 于是同一个数在两种语言下的量级都不一样。分组符固定用 en-US，免得数字本身跟着
+ * 浏览器语言变形——它是机器产出的量，不是一句话。
+ */
+export function formatCount(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) {
+    return '0'
+  }
+  return Math.round(value).toLocaleString('en-US')
+}
+
+/** 事件时刻拆成「哪一天 + 几点几分」，那句「昨天」由界面按自己的语言组织。 */
+export interface Stamp {
+  day: 'today' | 'yesterday' | 'earlier'
+  /** 本地时间的 HH:MM。 */
+  time: string
+  /** 本地时间的 MM-DD，只在 earlier 时有用。 */
+  date: string
+}
+
+function pad(value: number): string {
+  return String(value).padStart(2, '0')
+}
+
+/**
+ * 秒级时间戳换成本地时刻。
+ *
+ * 后端给的是 UTC 秒（时序的桶也一样），换算成看的人所在的时区是界面的事——
+ * 同一批数据在两台部署上必须落在同一个小时，显示成几点则各随各地。
+ */
+export function formatStamp(seconds: number, now: Date = new Date()): Stamp {
+  const at = new Date(seconds * 1000)
+  const time = `${pad(at.getHours())}:${pad(at.getMinutes())}`
+  const date = `${pad(at.getMonth() + 1)}-${pad(at.getDate())}`
+  const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+  const elapsed = midnight - new Date(at.getFullYear(), at.getMonth(), at.getDate()).getTime()
+  const oneDay = 24 * 60 * 60 * 1000
+  if (elapsed <= 0) {
+    return { day: 'today', time, date }
+  }
+  if (elapsed <= oneDay) {
+    return { day: 'yesterday', time, date }
+  }
+  return { day: 'earlier', time, date }
+}

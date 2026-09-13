@@ -47,7 +47,105 @@
     "status": "Status"
   },
   "admin": {
-    "title": "Admin",
-    "pending": "This side is not built yet."
+    "signOut": "Sign out",
+    "nav": {
+      "overview": "Overview",
+      "upstreams": "Upstreams"
+    },
+    "range": {
+      "24h": "24 hours",
+      "7d": "7 days",
+      "30d": "30 days"
+    },
+    "overview": {
+      "title": "Overview",
+      "upstreamCount": "{{total}} upstreams",
+      "health": "{{normal}} normal, {{degraded}} throttled"
+    },
+    "metrics": {
+      "globalLabel": "Global metrics",
+      "requests": "Requests",
+      "overallHitRate": "Overall hit rate",
+      "hitRate": "Hit rate",
+      "saved": "Origin saved",
+      "cached": "Cache used",
+      "errorRate": "Error rate",
+      "errorFrom": "mostly from {{host}}"
+    },
+    "matrix": {
+      "title": "Upstream health",
+      "hint": "Bars are requests over the last 12 hours. Click to open an upstream."
+    },
+    "events": {
+      "title": "Recent events",
+      "empty": "No events yet.",
+      "yesterday": "Yesterday {{time}}",
+      "tone": {
+        "change": "Change",
+        "degraded": "Degraded",
+        "recovered": "Recovered",
+        "reclaim": "Reclaim",
+        "unknown": "Other"
+      },
+      "actor": {
+        "admin": "Admin",
+        "system": "Automatic",
+        "unknown": "Unknown"
+      },
+      "action": {
+        "allow": "allow",
+        "deny": "deny"
+      },
+      "kind": {
+        "upstream_created": "Added upstream {{host}}",
+        "upstream_created_unknown": "Added an upstream",
+        "upstream_updated": "Updated upstream {{host}}",
+        "upstream_updated_unknown": "Updated an upstream",
+        "upstream_deleted": "Deleted upstream {{host}}",
+        "upstream_deleted_unknown": "Deleted an upstream",
+        "upstream_degraded": "{{host}} kept failing at the origin and backed off",
+        "upstream_degraded_unknown": "An upstream kept failing at the origin and backed off",
+        "upstream_recovered": "{{host}} serves from the origin again",
+        "upstream_recovered_unknown": "An upstream serves from the origin again",
+        "rule_created": "Added rule {{action}} {{pattern}}",
+        "rule_created_unknown": "Added a rule",
+        "rule_updated": "Updated rule {{action}} {{pattern}}",
+        "rule_updated_unknown": "Updated a rule",
+        "rule_deleted": "Deleted rule {{action}} {{pattern}}",
+        "rule_deleted_unknown": "Deleted a rule",
+        "setting_changed": "Changed settings {{keys}}",
+        "setting_changed_unknown": "Changed runtime settings",
+        "admin_key_rotated": "Rotated the admin key",
+        "cache_reclaimed": "Evicted {{removed}} cold objects, freeing {{size}}",
+        "unknown": "An event this build does not know yet"
+      }
+    },
+    "upstream": {
+      "metricsLabel": "Upstream metrics",
+      "originRequests": "Origin requests",
+      "served": "Bytes served",
+      "enabled": "Enabled",
+      "disabled": "Paused",
+      "missing": "This upstream is gone — it may have been deleted.",
+      "chartTitle": "Requests · last {{range}}",
+      "chartLabel": "Cache hits and origin requests over the last {{range}}",
+      "hits": "Cache hit",
+      "origin": "Origin",
+      "axisStart": "{{range}} ago",
+      "axisNow": "now"
+    }
+  },
+  "login": {
+    "title": "Admin sign-in",
+    "pitch": "One domain in front of every upstream. Container images, APT, Go modules and GitHub releases — cached once, shared by everyone.",
+    "versionLabel": "Version",
+    "subtitle": "Enter the admin key. On first start it is the initial key from config.yaml; rotate it in settings once you are in.",
+    "keyLabel": "Admin key",
+    "show": "Show",
+    "hide": "Hide",
+    "submit": "Enter admin",
+    "invalid": "That key does not get you in. The admin API answers a wrong key and a missing key exactly the same way, so this is all anyone can tell.",
+    "unreachable": "Cannot reach this katch. Check that the service is still running.",
+    "loopbackNotice": "The admin API listens on 127.0.0.1 only by default. If you expose it through a reverse proxy, add your own layer of authentication."
   }
 }

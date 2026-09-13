@@ -242,7 +242,8 @@ describe('两个面的外壳', () => {
       </MemoryRouter>
     )
 
-    expect(await screen.findByText('管理后台')).toBeInTheDocument()
+    // 后台那一面从登录开始：密钥握在浏览器里，没有它就只有这一屏。
+    expect(await screen.findByRole('heading', { name: '管理登录' })).toBeInTheDocument()
     expect(screen.queryByRole('textbox', { name: '要拉什么' })).not.toBeInTheDocument()
   })
 

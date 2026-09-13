@@ -1,7 +1,17 @@
 import { describe, expect, it } from 'vitest'
 
-import type { DailyPoint, Overview } from '@/lib/api'
-import { dailyHitRates, hitRate, savedBytesToday } from '@/lib/stats'
+import type { DailyPoint, Overview, UpstreamSeriesPoint, UpstreamStatItem } from '@/lib/api'
+import {
+  aggregateUpstreams,
+  dailyHitRates,
+  errorRate,
+  hitRate,
+  miniBars,
+  originRequests,
+  savedBytesToday,
+  stackedBars,
+  topOriginErrorUpstream,
+} from '@/lib/stats'
 
 function overview(patch: Partial<Overview>): Overview {
   return {
@@ -80,5 +90,139 @@ describe('dailyHitRates', () => {
       { day: 2, rate: 0.25 },
       { day: 3, rate: 1 },
     ])
+  })
+})
+
+function stat(patch: Partial<UpstreamStatItem>): UpstreamStatItem {
+  return {
+    upstream_id: 1,
+    host: 'docker.io',
+    requests: 0,
+    hits: 0,
+    denied: 0,
+    origin_errors: 0,
+    bytes_served: 0,
+    bytes_origin: 0,
+    degraded: false,
+    retry_at: 0,
+    ...patch,
+  }
+}
+
+function point(patch: Partial<UpstreamSeriesPoint>): UpstreamSeriesPoint {
+  return {
+    bucket: 0,
+    requests: 0,
+    hits: 0,
+    denied: 0,
+    origin_errors: 0,
+    bytes_served: 0,
+    bytes_origin: 0,
+    ...patch,
+  }
+}
+
+describe('originRequests 与 errorRate', () => {
+  // 回源数和命中率同一个分母口径：被规则挡下、回源失败的请求都不算问过缓存。
+  it('回源数是问过缓存又没命中的那些', () => {
+    expect(originRequests(stat({ requests: 1000, hits: 942, denied: 8, origin_errors: 10 }))).toBe(
+      40
+    )
+  })
+
+  it('错误率的分母是总请求，一次都没来过时是 0', () => {
+    expect(errorRate(stat({ requests: 1200, origin_errors: 20 }))).toBeCloseTo(0.0167, 4)
+    expect(errorRate(stat({}))).toBe(0)
+  })
+})
+
+describe('aggregateUpstreams', () => {
+  it('把每个上游的计数加成全站合计', () => {
+    const total = aggregateUpstreams([
+      stat({
+        requests: 1000,
+        hits: 900,
+        denied: 1,
+        origin_errors: 2,
+        bytes_served: 30,
+        bytes_origin: 10,
+      }),
+      stat({
+        requests: 200,
+        hits: 100,
+        denied: 3,
+        origin_errors: 4,
+        bytes_served: 8,
+        bytes_origin: 5,
+      }),
+    ])
+    expect(total).toEqual({
+      requests: 1200,
+      hits: 1000,
+      denied: 4,
+      origin_errors: 6,
+      bytes_served: 38,
+      bytes_origin: 15,
+    })
+  })
+
+  it('一个上游都没有时给一份零，而不是 NaN', () => {
+    expect(aggregateUpstreams([]).requests).toBe(0)
+    expect(hitRate(aggregateUpstreams([]))).toBe(0)
+  })
+})
+
+describe('topOriginErrorUpstream', () => {
+  // 一个全站错误率不告诉任何人该去看哪台，而这份数据里已经有答案了。
+  it('指出回源失败最多的那个上游', () => {
+    const worst = topOriginErrorUpstream([
+      stat({ host: 'docker.io', origin_errors: 2 }),
+      stat({ host: 'pypi.org', origin_errors: 20 }),
+    ])
+    expect(worst?.host).toBe('pypi.org')
+  })
+
+  it('一个都没错时是 null，不硬挑一个出来', () => {
+    expect(topOriginErrorUpstream([stat({}), stat({})])).toBeNull()
+  })
+})
+
+describe('stackedBars', () => {
+  // 高度按区间峰值归一，不是按每根柱子自己的量——那样每根都顶天，看不出忙闲。
+  it('按区间峰值归一，回源段是这个小时里没命中的比例', () => {
+    const bars = stackedBars([
+      point({ bucket: 1, requests: 50, hits: 40 }),
+      point({ bucket: 2, requests: 100, hits: 60 }),
+    ])
+    expect(bars[0]).toEqual({ bucket: 1, height: 0.5, originShare: 0.2 })
+    expect(bars[1]).toEqual({ bucket: 2, height: 1, originShare: 0.4 })
+  })
+
+  it('被规则挡下与回源失败的请求不进这张图的分母', () => {
+    const [bar] = stackedBars([
+      point({ bucket: 1, requests: 100, hits: 40, denied: 50, origin_errors: 10 }),
+    ])
+    expect(bar.height).toBe(1)
+    expect(bar.originShare).toBe(0)
+  })
+
+  it('一整段都没有请求时给一排零高度，而不是 NaN', () => {
+    expect(stackedBars([point({ bucket: 1 }), point({ bucket: 2 })])).toEqual([
+      { bucket: 1, height: 0, originShare: 0 },
+      { bucket: 2, height: 0, originShare: 0 },
+    ])
+  })
+})
+
+describe('miniBars', () => {
+  it('只取最后那几个小时，按这几个小时的峰值归一', () => {
+    const points = [10, 20, 40].map((requests, index) => point({ bucket: index, requests }))
+    expect(miniBars(points, 2)).toEqual([0.5, 1])
+  })
+
+  // 12 根柱子里有 3 根有数据，和 3 根柱子占满整块，说的是两件不同的事。
+  it('数据不够时在前面补零，长度恒等于要的根数', () => {
+    expect(miniBars([point({ requests: 5 })], 4)).toEqual([0, 0, 0, 1])
+    expect(miniBars([], 3)).toEqual([0, 0, 0])
   })
 })

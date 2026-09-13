@@ -47,7 +47,105 @@
     "status": "状态"
   },
   "admin": {
-    "title": "管理后台",
-    "pending": "这一面还没有搭起来。"
+    "signOut": "退出登录",
+    "nav": {
+      "overview": "概览",
+      "upstreams": "上游"
+    },
+    "range": {
+      "24h": "24 小时",
+      "7d": "7 天",
+      "30d": "30 天"
+    },
+    "overview": {
+      "title": "概览",
+      "upstreamCount": "{{total}} 个上游",
+      "health": "{{normal}} 正常 {{degraded}} 限流"
+    },
+    "metrics": {
+      "globalLabel": "全局指标",
+      "requests": "总请求",
+      "overallHitRate": "整体命中率",
+      "hitRate": "命中率",
+      "saved": "省下回源",
+      "cached": "缓存占用",
+      "errorRate": "错误率",
+      "errorFrom": "主要来自 {{host}}"
+    },
+    "matrix": {
+      "title": "上游健康",
+      "hint": "柱状为近 12 小时请求量 · 点击进入上游"
+    },
+    "events": {
+      "title": "最近事件",
+      "empty": "还没有事件。",
+      "yesterday": "昨天 {{time}}",
+      "tone": {
+        "change": "变更",
+        "degraded": "降级",
+        "recovered": "恢复",
+        "reclaim": "回收",
+        "unknown": "其他"
+      },
+      "actor": {
+        "admin": "管理员",
+        "system": "自动",
+        "unknown": "未知"
+      },
+      "action": {
+        "allow": "放行",
+        "deny": "拒绝"
+      },
+      "kind": {
+        "upstream_created": "添加上游 {{host}}",
+        "upstream_created_unknown": "添加了一个上游",
+        "upstream_updated": "修改上游 {{host}}",
+        "upstream_updated_unknown": "修改了一个上游",
+        "upstream_deleted": "删除上游 {{host}}",
+        "upstream_deleted_unknown": "删除了一个上游",
+        "upstream_degraded": "{{host}} 回源连续失败，已进入退避",
+        "upstream_degraded_unknown": "有上游回源连续失败，已进入退避",
+        "upstream_recovered": "{{host}} 回源恢复，退出退避",
+        "upstream_recovered_unknown": "有上游回源恢复，退出退避",
+        "rule_created": "新增规则 {{action}} {{pattern}}",
+        "rule_created_unknown": "新增了一条规则",
+        "rule_updated": "修改规则 {{action}} {{pattern}}",
+        "rule_updated_unknown": "修改了一条规则",
+        "rule_deleted": "删除规则 {{action}} {{pattern}}",
+        "rule_deleted_unknown": "删除了一条规则",
+        "setting_changed": "修改设置 {{keys}}",
+        "setting_changed_unknown": "修改了运行时设置",
+        "admin_key_rotated": "轮换了管理密钥",
+        "cache_reclaimed": "淘汰 {{removed}} 个冷对象，腾出 {{size}}",
+        "unknown": "一条没见过的事件"
+      }
+    },
+    "upstream": {
+      "metricsLabel": "上游指标",
+      "originRequests": "回源请求",
+      "served": "已服务流量",
+      "enabled": "启用中",
+      "disabled": "已停用",
+      "missing": "找不到这个上游，它可能已经被删掉了。",
+      "chartTitle": "请求量 · 最近 {{range}}",
+      "chartLabel": "最近 {{range}}的命中与回源",
+      "hits": "命中缓存",
+      "origin": "回源",
+      "axisStart": "{{range}}前",
+      "axisNow": "现在"
+    }
+  },
+  "login": {
+    "title": "管理登录",
+    "pitch": "一个域名代掉所有上游。容器镜像、APT 源、Go module、GitHub Release，缓存一次，全网共用。",
+    "versionLabel": "版本",
+    "subtitle": "输入管理员密钥。首次启动用 config.yaml 里的初始密钥，登录后可在设置里轮换。",
+    "keyLabel": "管理员密钥",
+    "show": "显示",
+    "hide": "隐藏",
+    "submit": "进入管理台",
+    "invalid": "这把密钥进不去。管理接口不区分「密钥错误」和「没填密钥」，两种情况的回应一模一样。",
+    "unreachable": "连不上这台 katch，确认一下服务还在运行。",
+    "loopbackNotice": "管理接口默认只监听 127.0.0.1。通过反向代理对外暴露时，请自行再加一层认证。"
   }
 }
