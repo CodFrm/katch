@@ -136,6 +136,17 @@
       "origin": "回源",
       "axisStart": "{{range}}前",
       "axisNow": "现在",
+      "missReasons": {
+        "title": "回源原因",
+        "empty": "这段时间没有回源",
+        "percent": "{{percent}}%",
+        "reason": {
+          "first": "首次拉取",
+          "ttl": "TTL 过期",
+          "evicted": "缓存被淘汰",
+          "changed": "上游 digest 变更"
+        }
+      },
       "tab": {
         "overview": "概况",
         "rules": "访问规则"

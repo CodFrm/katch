@@ -27,6 +27,7 @@ func migrationList() []*gormigrate.Migration {
 		trafficRollup(),
 		accessRule(),
 		event(),
+		trafficRollupMissReasons(),
 	}
 }
 
@@ -347,6 +348,52 @@ func event() *gormigrate.Migration {
 				return err
 			}
 			return tx.Exec(fmt.Sprintf("DROP TABLE IF EXISTS `%s`", table)).Error
+		},
+	}
+}
+
+// trafficRollupMissReasons 给分钟桶补上四个回源原因列。
+//
+// 补丁迁移而不是改 20260912000003：那一条已经跑过的环境不会再跑一遍，改它只会
+// 让新旧部署的表结构悄悄分叉。
+//
+// 四列而不是一张每请求的明细表：界面上的回源原因分解只要占比，占比可加，而
+// 决策 16 否掉了每请求写库。NOT NULL DEFAULT 0 是给升级上来的老行用的——
+// 没有默认值，那些行的这四列会是 NULL，扫进 int64 时直接报错，而那要等到一台
+// 跑了 90 天的机器升级之后第一次打开上游详情才会发现。
+//
+// 逐列 ADD COLUMN 而不是一条多子句的 ALTER：MySQL 认后者，sqlite 不认。
+func trafficRollupMissReasons() *gormigrate.Migration {
+	columns := []string{"miss_first", "miss_ttl", "miss_evicted", "miss_changed"}
+	return &gormigrate.Migration{
+		ID: "20260913000002_traffic_rollup_miss_reasons",
+		Migrate: func(tx *gorm.DB) error {
+			table, err := tableName(tx, &rollup_entity.TrafficRollup{})
+			if err != nil {
+				return err
+			}
+			for _, column := range columns {
+				if err := tx.Exec(fmt.Sprintf(
+					"ALTER TABLE `%s` ADD COLUMN `%s` BIGINT NOT NULL DEFAULT 0",
+					table, column)).Error; err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			table, err := tableName(tx, &rollup_entity.TrafficRollup{})
+			if err != nil {
+				return err
+			}
+			// 只拿掉这四列：回滚一条补丁迁移不该把整张表和 90 天的流量一起带走。
+			for _, column := range columns {
+				if err := tx.Exec(fmt.Sprintf("ALTER TABLE `%s` DROP COLUMN `%s`",
+					table, column)).Error; err != nil {
+					return err
+				}
+			}
+			return nil
 		},
 	}
 }

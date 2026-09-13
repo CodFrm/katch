@@ -186,6 +186,14 @@ export interface UpstreamSeriesPoint {
   origin_errors: number
   bytes_served: number
   bytes_origin: number
+  /** 从没缓存过。 */
+  miss_first: number
+  /** 可变对象的 TTL 过期了。 */
+  miss_ttl: number
+  /** 不可变对象被淘汰了。 */
+  miss_evicted: number
+  /** 上游的 digest 和我们手上那份对不上。 */
+  miss_changed: number
 }
 
 export interface UpstreamSeries {

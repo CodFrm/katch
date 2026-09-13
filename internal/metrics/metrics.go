@@ -7,6 +7,10 @@
 //     请求量和命中率从那张表聚合——一个自部署的镜像站不该为了看自己的命中率
 //     就要先搭一套监控。
 //
+// 回源原因（traffic_rollup 上的四列）只进分钟桶，不在 /metrics 上另开一族：
+// 可观测性一节把要导出的 katch_* 列全了，而这四个数是给界面上那条占比条用的，
+// spec 的数据模型把它们定在 traffic_rollup 的列上。
+//
 // 它挂在拉取路径的最外层（和 SPA 共用的 NoRoute 之前），按响应本身判定结果：
 // 状态码加 cache_svc 留下的 X-Katch-Cache。这样计数只有一个出处，而不必在
 // 缓存层和代理层各插一次埋点。
@@ -46,11 +50,34 @@ const (
 	// cacheStatusHeader 缓存层在响应上留下的命中标记。
 	cacheStatusHeader = "X-Katch-Cache"
 	cacheStatusHit    = "HIT"
+	// MissHeader 缓存层在未命中的响应上留下的归因。
+	//
+	// 和命中标记分成两个头而不是把原因拼进 X-Katch-Cache 的值里：那个值是已经
+	// 发出去的约定（拉取路径的用例与 make smoke 都按 HIT / MISS 逐字比对），
+	// 往里塞后缀等于改一份对外契约，而归因是新加的一维。
+	MissHeader = "X-Katch-Miss"
 	// unknownUpstream 未知主机共用的标签值。
 	//
 	// 不能把请求里的主机名原样当标签：拉取路径是公开的，任何人都能用一串没见过的
 	// 主机名给每次探测造一个新的时间序列，那是一条不需要密码的内存放大路径。
 	unknownUpstream = "unknown"
+)
+
+// MissReason 一次未命中是为什么发生的，对应 traffic_rollup 上的四列。
+//
+// 这四个是缓存层判出来的，中间件只负责转运：按响应反推不出「从来没缓存过」
+// 和「缓存过但被淘汰了」的区别——两者在表上都只是「查不到记录」。
+type MissReason string
+
+const (
+	// MissFirst 从来没缓存过。没留下归因的未命中也算这一档，见 missReason。
+	MissFirst MissReason = "first"
+	// MissTTL 可变对象的 TTL 过期了。
+	MissTTL MissReason = "ttl"
+	// MissEvicted 不可变对象被 LRU 淘汰了。
+	MissEvicted MissReason = "evicted"
+	// MissChanged 上游的 digest 和手上那份对不上。
+	MissChanged MissReason = "changed"
 )
 
 // Event 一次拉取的记录。
@@ -60,6 +87,8 @@ type Event struct {
 	// Kind 请求形态，registry 或 static，由 dispatch 判定。
 	Kind   string
 	Result Result
+	// MissReason 未命中的归因，Result 不是 ResultMiss 时无意义。
+	MissReason MissReason
 	// BytesServed 发给客户端的字节数。
 	BytesServed int64
 	// BytesOrigin 其中来自上游的字节数。命中时为 0——界面上的「节省流量」
@@ -79,6 +108,12 @@ type Bucket struct {
 	OriginErrors int64
 	BytesServed  int64
 	BytesOrigin  int64
+	// 四个回源原因，加起来正好是未命中数（Requests 减去其余三项）。
+	// 界面上的回源原因分解读的就是这四个数的占比。
+	MissFirst   int64
+	MissTTL     int64
+	MissEvicted int64
+	MissChanged int64
 }
 
 // Gate 退避状态。中间件只喂给它回源的成败，并把降级标到指标上；
@@ -308,6 +343,20 @@ func (r *Recorder) addBucket(ev Event) {
 	case ResultOriginError:
 		b.OriginErrors++
 	case ResultMiss:
+		switch ev.MissReason {
+		case MissTTL:
+			b.MissTTL++
+		case MissEvicted:
+			b.MissEvicted++
+		case MissChanged:
+			b.MissChanged++
+		case MissFirst:
+			b.MissFirst++
+		default:
+			// 归因不认得就算首次拉取，不能不记：四项之和必须等于未命中数，
+			// 少掉的那一块在占比条上看不出来，只会让别的几项显得比实际大。
+			b.MissFirst++
+		}
 	}
 	b.BytesServed += ev.BytesServed
 	b.BytesOrigin += ev.BytesOrigin
@@ -352,6 +401,9 @@ func (r *Recorder) Middleware(hooks Hooks) gin.HandlerFunc {
 		}
 		ev.Upstream = host
 		ev.Result = classify(c.Writer.Status(), c.Writer.Header().Get(cacheStatusHeader))
+		if ev.Result == ResultMiss {
+			ev.MissReason = missReason(c.Writer.Header().Get(MissHeader))
+		}
 		if size := int64(c.Writer.Size()); size > 0 {
 			ev.BytesServed = size
 			if ev.Result == ResultMiss {
@@ -398,6 +450,26 @@ func classify(status int, cacheStatus string) Result {
 		return ResultHit
 	default:
 		return ResultMiss
+	}
+}
+
+// missReason 认缓存层留下的归因，不认得的一律当首次拉取。
+//
+// 没有归因的未命中确实存在：HEAD、Range 这类请求根本没问过缓存，查不到上游的
+// 请求也不会走到缓存层。它们手上没有任何一份可复用的副本，算进首次拉取是这四
+// 档里唯一说得通的一档，而「不记」会让占比之和不再是 100%。
+func missReason(value string) MissReason {
+	switch MissReason(value) {
+	case MissTTL:
+		return MissTTL
+	case MissEvicted:
+		return MissEvicted
+	case MissChanged:
+		return MissChanged
+	case MissFirst:
+		return MissFirst
+	default:
+		return MissFirst
 	}
 }
 

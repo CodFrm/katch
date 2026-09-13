@@ -177,3 +177,63 @@ export function dailyHitRates(overview: Overview): DailyHitRate[] {
     rate: point.requests > 0 ? Math.min(1, Math.max(0, point.hits / point.requests)) : 0,
   }))
 }
+
+/** 回源原因，顺序就是界面上从上到下的顺序。 */
+export const MISS_REASONS = ['first', 'ttl', 'evicted', 'changed'] as const
+
+export type MissReason = (typeof MISS_REASONS)[number]
+
+/** 一个回源原因占这段区间里全部回源的比例。 */
+export interface MissReasonShare {
+  reason: MissReason
+  /** 这个原因下的回源次数。 */
+  count: number
+  /** 占比，整数百分点，四项加起来恒为 100。 */
+  percent: number
+}
+
+/**
+ * 把逐小时序列里的四个原因加成一段区间的占比，一次回源都没有时给空数组。
+ *
+ * 分母是四项之和，不是「问过缓存又没命中」那个回源数：两者本该相等，但补丁
+ * 迁移之前落下的行四列都是零，用后者当分母会画出一条既不是 100% 也没法解释的
+ * 占比条。四项全零就是「这段时间没有可分解的回源」，界面据此不画东西——四条
+ * 0% 的条和「全是命中」长得一模一样，而后者是好消息。
+ *
+ * 余数用最大余数法补给小数部分最大的那一项，而不是逐项四舍五入：后者会给出
+ * 33+33+33=99，缺的那一个百分点不写在任何一行上，看的人只会觉得这几个数算错了。
+ */
+export function missReasonShares(points: UpstreamSeriesPoint[]): MissReasonShare[] {
+  const counts = points.reduce<Record<MissReason, number>>(
+    (sum, point) => ({
+      first: sum.first + Math.max(0, point.miss_first),
+      ttl: sum.ttl + Math.max(0, point.miss_ttl),
+      evicted: sum.evicted + Math.max(0, point.miss_evicted),
+      changed: sum.changed + Math.max(0, point.miss_changed),
+    }),
+    { first: 0, ttl: 0, evicted: 0, changed: 0 }
+  )
+  const total = MISS_REASONS.reduce((sum, reason) => sum + counts[reason], 0)
+  if (total <= 0) {
+    return []
+  }
+  const shares = MISS_REASONS.map((reason) => ({
+    reason,
+    count: counts[reason],
+    percent: Math.floor((counts[reason] * 100) / total),
+  }))
+  // 平局按固定顺序（sort 是稳定的）：名次随刷新跳来跳去时，人会以为数据变了。
+  const byRemainder = [...shares].sort(
+    (a, b) =>
+      (counts[b.reason] * 100) / total - b.percent - ((counts[a.reason] * 100) / total - a.percent)
+  )
+  let rest = 100 - shares.reduce((sum, share) => sum + share.percent, 0)
+  for (const share of byRemainder) {
+    if (rest <= 0) {
+      break
+    }
+    share.percent += 1
+    rest -= 1
+  }
+  return shares
+}

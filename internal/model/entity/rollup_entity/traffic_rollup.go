@@ -23,6 +23,15 @@ type TrafficRollup struct {
 	BytesServed int64 `gorm:"column:bytes_served" json:"bytes_served"`
 	// BytesOrigin 其中来自上游的字节数，两者之差就是这个镜像站省下的流量。
 	BytesOrigin int64 `gorm:"column:bytes_origin" json:"bytes_origin"`
+	// 四个回源原因：首次拉取、TTL 过期、被淘汰、上游 digest 变更。
+	// 它们加起来正好是未命中数，所以仍然没有 misses 列——上面那条理由没变。
+	//
+	// 做成这张表上的四列而不是一张每请求的明细表：界面只需要占比，而占比是
+	// 可加的；决策 16 否掉每请求写库的理由（把热路径拖进事务）在这里同样成立。
+	MissFirst   int64 `gorm:"column:miss_first" json:"miss_first"`
+	MissTTL     int64 `gorm:"column:miss_ttl" json:"miss_ttl"`
+	MissEvicted int64 `gorm:"column:miss_evicted" json:"miss_evicted"`
+	MissChanged int64 `gorm:"column:miss_changed" json:"miss_changed"`
 	Createtime  int64 `gorm:"column:createtime" json:"createtime"`
 	Updatetime  int64 `gorm:"column:updatetime" json:"updatetime"`
 }

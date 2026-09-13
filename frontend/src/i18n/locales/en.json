@@ -136,6 +136,17 @@
       "origin": "Origin",
       "axisStart": "{{range}} ago",
       "axisNow": "now",
+      "missReasons": {
+        "title": "Origin fetch reasons",
+        "empty": "No origin fetches in this window",
+        "percent": "{{percent}}%",
+        "reason": {
+          "first": "First pull",
+          "ttl": "TTL expired",
+          "evicted": "Evicted from cache",
+          "changed": "Upstream digest changed"
+        }
+      },
       "tab": {
         "overview": "Overview",
         "rules": "Access rules"

@@ -7,6 +7,7 @@ import {
   errorRate,
   hitRate,
   miniBars,
+  missReasonShares,
   originRequests,
   savedBytesToday,
   stackedBars,
@@ -118,6 +119,10 @@ function point(patch: Partial<UpstreamSeriesPoint>): UpstreamSeriesPoint {
     origin_errors: 0,
     bytes_served: 0,
     bytes_origin: 0,
+    miss_first: 0,
+    miss_ttl: 0,
+    miss_evicted: 0,
+    miss_changed: 0,
     ...patch,
   }
 }
@@ -224,5 +229,39 @@ describe('miniBars', () => {
   it('数据不够时在前面补零，长度恒等于要的根数', () => {
     expect(miniBars([point({ requests: 5 })], 4)).toEqual([0, 0, 0, 1])
     expect(miniBars([], 3)).toEqual([0, 0, 0])
+  })
+})
+
+describe('missReasonShares', () => {
+  it('四个原因按固定顺序给出占比，加起来是 100', () => {
+    const shares = missReasonShares([
+      point({ miss_first: 40, miss_ttl: 14, miss_evicted: 5, miss_changed: 1 }),
+      point({ miss_first: 22, miss_ttl: 7, miss_evicted: 6, miss_changed: 5 }),
+    ])
+    // 顺序是固定的，不按大小排：名次随刷新跳来跳去时，人会以为数据变了。
+    expect(shares.map((s) => s.reason)).toEqual(['first', 'ttl', 'evicted', 'changed'])
+    expect(shares.map((s) => s.count)).toEqual([62, 21, 11, 6])
+    expect(shares.map((s) => s.percent)).toEqual([62, 21, 11, 6])
+    expect(shares.reduce((sum, s) => sum + s.percent, 0)).toBe(100)
+  })
+
+  it('除不尽的时候也凑满 100，而不是 99', () => {
+    // 逐项四舍五入会给出 33 + 33 + 33 = 99，图上就会缺一块，而缺的那块
+    // 不写在任何一行上，看的人只会觉得这几个数算错了。
+    const shares = missReasonShares([point({ miss_first: 1, miss_ttl: 1, miss_evicted: 1 })])
+    expect(shares.map((s) => s.percent)).toEqual([34, 33, 33, 0])
+    expect(shares.reduce((sum, s) => sum + s.percent, 0)).toBe(100)
+  })
+
+  it('一次回源都没有时给空，而不是四条零', () => {
+    // 四条 0% 的条和「这段时间全是命中」长得一模一样，而后者是好消息。
+    expect(missReasonShares([point({ requests: 10, hits: 10 })])).toEqual([])
+    expect(missReasonShares([])).toEqual([])
+  })
+
+  it('未命中还没有归因的老数据也算没有数据', () => {
+    // 补丁迁移之前落下的行四列都是 0，但这一小时确实有回源。按四项之和当分母，
+    // 这种行给出的是「没有可分解的回源」，而不是一条 100% 的首次拉取。
+    expect(missReasonShares([point({ requests: 10, hits: 4 })])).toEqual([])
   })
 })

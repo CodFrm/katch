@@ -55,6 +55,7 @@ type UpstreamSeriesRequest struct {
 //
 // 六个计数一个不少：上游详情要画的是命中/回源的堆叠柱加回源原因分解，
 // 少给一个就得为同一张图再打一次接口，两次请求之间的时刻还会对不上。
+// 回源原因分解要的那四个也在这里，理由同上——它和堆叠图是同一份序列。
 type UpstreamSeriesPoint struct {
 	// Bucket 这个小时的起点（秒，UTC）。
 	//
@@ -67,6 +68,12 @@ type UpstreamSeriesPoint struct {
 	OriginErrors int64 `json:"origin_errors"`
 	BytesServed  int64 `json:"bytes_served"`
 	BytesOrigin  int64 `json:"bytes_origin"`
+	// 四个回源原因：从没缓存过、TTL 过期、被淘汰、上游 digest 变更。
+	// 四项之和就是这个小时的未命中数，界面按这个分母算占比。
+	MissFirst   int64 `json:"miss_first"`
+	MissTTL     int64 `json:"miss_ttl"`
+	MissEvicted int64 `json:"miss_evicted"`
+	MissChanged int64 `json:"miss_changed"`
 }
 
 // UpstreamSeriesResponse 一个上游在这段区间里的逐小时序列。

@@ -96,14 +96,46 @@ function series(upstreamID: number) {
     from: TO - 24 * HOUR,
     to: TO,
     bucket_seconds: HOUR,
+    list: Array.from({ length: 24 }, (_, i) => {
+      const scale = (i + 1) * upstreamID
+      // 未命中数正好等于四个原因之和：后端的口径就是这样，用例里对不上的话
+      // 占比条和堆叠图会各说各的。
+      return {
+        bucket: TO - (24 - i) * HOUR,
+        requests: 50 * scale,
+        hits: 40 * scale,
+        denied: 0,
+        origin_errors: 0,
+        bytes_served: 0,
+        bytes_origin: 0,
+        miss_first: 6 * scale,
+        miss_ttl: 2 * scale,
+        miss_evicted: scale,
+        miss_changed: scale,
+      }
+    }),
+  }
+}
+
+/** 一段一次回源都没有的序列：全是命中，四个原因都是零。 */
+function quietSeries() {
+  return {
+    range: '24h',
+    from: TO - 24 * HOUR,
+    to: TO,
+    bucket_seconds: HOUR,
     list: Array.from({ length: 24 }, (_, i) => ({
       bucket: TO - (24 - i) * HOUR,
-      requests: 10 * (i + 1) * upstreamID,
-      hits: 8 * (i + 1) * upstreamID,
+      requests: 8,
+      hits: 8,
       denied: 0,
       origin_errors: 0,
       bytes_served: 0,
       bytes_origin: 0,
+      miss_first: 0,
+      miss_ttl: 0,
+      miss_evicted: 0,
+      miss_changed: 0,
     })),
   }
 }
@@ -158,8 +190,9 @@ function envelope(data: unknown) {
 
 let requests: { url: string; key: string | null }[] = []
 
-function stubFetch(options: { key?: string } = {}) {
+function stubFetch(options: { key?: string; series?: (id: number) => unknown } = {}) {
   const good = options.key ?? KEY
+  const seriesOf = options.series ?? series
   vi.stubGlobal(
     'fetch',
     vi.fn(async (url: string, init?: RequestInit) => {
@@ -173,7 +206,7 @@ function stubFetch(options: { key?: string } = {}) {
       }
       if (url.startsWith('/api/v1/admin/stats/upstreams/series')) {
         const id = Number(new URLSearchParams(url.split('?')[1]).get('upstream_id'))
-        return envelope(series(id))
+        return envelope(seriesOf(id))
       }
       if (url.startsWith('/api/v1/admin/stats/upstreams')) {
         return envelope(stats)
@@ -391,6 +424,40 @@ describe('后台上游详情', () => {
     const seriesCall = requests.find((r) => r.url.includes('/stats/upstreams/series?'))
     expect(seriesCall?.url).toContain('upstream_id=1')
     expect(seriesCall?.key).toBe(`Bearer ${KEY}`)
+  })
+
+  it('回源原因分解成四项，占比之和正好 100%', async () => {
+    // 堆叠图只说「有多少请求最后还是去了上游」，占比条回答的是下一个问题：
+    // 为什么去的。这两张图读的是同一份序列，所以它们不会各说各的。
+    stubFetch()
+    renderAdmin('/admin/upstreams/1')
+
+    const panel = await screen.findByRole('group', { name: '回源原因' })
+    const rows = panel.querySelectorAll('[data-slot="miss-reason"]')
+    expect(rows).toHaveLength(4)
+    expect(
+      [...rows].map((row) => row.querySelector('[data-slot="miss-label"]')?.textContent)
+    ).toEqual(['首次拉取', 'TTL 过期', '缓存被淘汰', '上游 digest 变更'])
+
+    const percents = [...rows].map((row) =>
+      Number(row.querySelector('[data-slot="miss-share"]')?.textContent?.replace('%', ''))
+    )
+    expect(percents).toEqual([60, 20, 10, 10])
+    expect(percents.reduce((sum, value) => sum + value, 0)).toBe(100)
+    // 条的长度就是占比本身，不是另算一套。
+    const bar = rows[0].querySelector('[data-slot="miss-bar"]') as HTMLElement
+    expect(bar.style.width).toBe('60%')
+  })
+
+  it('这段时间一次回源都没有时不画四条零', async () => {
+    // 四条 0% 和「全是命中」长得一样，而后者是好消息——画出来只会让人以为
+    // 数据没上来。
+    stubFetch({ series: () => quietSeries() })
+    renderAdmin('/admin/upstreams/1')
+
+    const panel = await screen.findByRole('group', { name: '回源原因' })
+    expect(panel.querySelectorAll('[data-slot="miss-reason"]')).toHaveLength(0)
+    expect(within(panel).getByText('这段时间没有回源')).toBeInTheDocument()
   })
 
   it('详情头给的是这个上游的登记信息，不是别人的', async () => {

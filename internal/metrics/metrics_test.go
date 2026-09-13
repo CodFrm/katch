@@ -21,7 +21,9 @@ import (
 type upstreamResponse struct {
 	status int
 	cache  string
-	body   string
+	// miss 缓存层留下的回源原因，空表示这次响应上没有归因。
+	miss string
+	body string
 }
 
 // newTestEngine 拼出和生产一样的形状：中间件在前，拉取处理器挂在 NoRoute 上。
@@ -32,6 +34,9 @@ func newTestEngine(r *Recorder, hooks Hooks, resp *upstreamResponse) *gin.Engine
 	engine.NoRoute(func(c *gin.Context) {
 		if resp.cache != "" {
 			c.Header("X-Katch-Cache", resp.cache)
+		}
+		if resp.miss != "" {
+			c.Header(MissHeader, resp.miss)
 		}
 		if resp.body != "" {
 			c.Data(resp.status, "application/octet-stream", []byte(resp.body))
@@ -333,5 +338,73 @@ func TestRecorder_CacheUsageReplacesPreviousSnapshot(t *testing.T) {
 		convey.So(body, convey.ShouldContainSubstring, `katch_cache_bytes{upstream="deb.debian.org"} 512`)
 		convey.So(body, convey.ShouldContainSubstring, `katch_cache_objects{upstream="docker.io"} 0`)
 		convey.So(body, convey.ShouldContainSubstring, `katch_cache_bytes{upstream="docker.io"} 0`)
+	})
+}
+
+// TestRecorder_MissReasonsPartitionEveryRequest 未命中的四个原因加上命中、拒绝与
+// 回源失败，要正好把这一分钟的请求分完。
+//
+// 分完这件事本身就是断言：界面上那条占比条的分母是「未命中数」，而未命中数是
+// requests 减去其余三项。四个原因要是漏掉某一类未命中，占比之和就不是 100%，
+// 而少掉的那一块在图上看不出来——它只是让别的几项看起来比实际大。
+func TestRecorder_MissReasonsPartitionEveryRequest(t *testing.T) {
+	convey.Convey("四个回源原因把未命中分完，一个请求都不落下", t, func() {
+		reg := prometheus.NewRegistry()
+		clock := time.Unix(1700000045, 0)
+		rec := New(Options{Registerer: reg, Now: func() time.Time { return clock }})
+		hooks := Hooks{Lookup: knownUpstreams("deb.debian.org")}
+
+		pull := func(resp *upstreamResponse) {
+			get(newTestEngine(rec, hooks, resp), "/deb.debian.org/pool/main/a.deb")
+		}
+		pull(&upstreamResponse{status: http.StatusOK, cache: "HIT", body: "x"})
+		pull(&upstreamResponse{status: http.StatusOK, cache: "HIT", body: "x"})
+		pull(&upstreamResponse{status: http.StatusOK, cache: "MISS", miss: "first", body: "x"})
+		pull(&upstreamResponse{status: http.StatusOK, cache: "MISS", miss: "ttl", body: "x"})
+		pull(&upstreamResponse{status: http.StatusOK, cache: "MISS", miss: "evicted", body: "x"})
+		pull(&upstreamResponse{status: http.StatusOK, cache: "MISS", miss: "changed", body: "x"})
+		// 没有归因的未命中：透传的 HEAD/Range 和缓存层根本没碰的请求都长这样。
+		pull(&upstreamResponse{status: http.StatusOK, cache: "MISS", body: "x"})
+		pull(&upstreamResponse{status: http.StatusForbidden})
+		pull(&upstreamResponse{status: http.StatusBadGateway})
+
+		got := rec.Drain()
+		convey.So(len(got), convey.ShouldEqual, 1)
+		b := got[0]
+		convey.So(b.Requests, convey.ShouldEqual, 9)
+		convey.So(b.Hits, convey.ShouldEqual, 2)
+		convey.So(b.Denied, convey.ShouldEqual, 1)
+		convey.So(b.OriginErrors, convey.ShouldEqual, 1)
+		// 认不出的那次算首次拉取：那条路上没有任何一份被判定为可复用的副本，
+		// 而四项之和必须等于未命中数，否则占比条会少一块。
+		convey.So(b.MissFirst, convey.ShouldEqual, 2)
+		convey.So(b.MissTTL, convey.ShouldEqual, 1)
+		convey.So(b.MissEvicted, convey.ShouldEqual, 1)
+		convey.So(b.MissChanged, convey.ShouldEqual, 1)
+		convey.So(b.MissFirst+b.MissTTL+b.MissEvicted+b.MissChanged,
+			convey.ShouldEqual, b.Requests-b.Hits-b.Denied-b.OriginErrors)
+	})
+}
+
+// TestRecorder_HitRecordsNoMissReason 命中一个原因计数都不落。
+func TestRecorder_HitRecordsNoMissReason(t *testing.T) {
+	convey.Convey("缓存命中不落任何回源原因", t, func() {
+		reg := prometheus.NewRegistry()
+		rec := New(Options{Registerer: reg})
+		hooks := Hooks{Lookup: knownUpstreams("deb.debian.org")}
+
+		// 命中的响应上不会有归因头，但就算缓存层留了一个（比如同一次回源的
+		// 尾随读者最后读到的是已经落库的副本），命中也不该记成回源。
+		get(newTestEngine(rec, hooks, &upstreamResponse{
+			status: http.StatusOK, cache: "HIT", miss: "ttl", body: "x",
+		}), "/deb.debian.org/pool/main/a.deb")
+
+		got := rec.Drain()
+		convey.So(len(got), convey.ShouldEqual, 1)
+		convey.So(got[0].Hits, convey.ShouldEqual, 1)
+		convey.So(got[0].MissFirst, convey.ShouldEqual, 0)
+		convey.So(got[0].MissTTL, convey.ShouldEqual, 0)
+		convey.So(got[0].MissEvicted, convey.ShouldEqual, 0)
+		convey.So(got[0].MissChanged, convey.ShouldEqual, 0)
 	})
 }

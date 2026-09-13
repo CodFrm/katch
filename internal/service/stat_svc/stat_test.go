@@ -453,3 +453,72 @@ func scrapeDefault() string {
 	promhttp.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	return w.Body.String()
 }
+
+// TestStat_FlushCarriesMissReasons 四个回源原因跟着分钟桶一起落进 traffic_rollup。
+//
+// 和别的计数一样是累加而不是覆盖：一分钟内可能落库两次（进程重启、或上一次落库
+// 慢了半拍），覆盖会把前半分钟的归因整个抹掉，而占比条读的正是这几列。
+func TestStat_FlushCarriesMissReasons(t *testing.T) {
+	convey.Convey("回源原因跟着分钟桶累加进同一行", t, func() {
+		deps := setup(t, nil)
+		ctx := context.Background()
+		deps.cache.EXPECT().SizeByUpstream(gomock.Any()).AnyTimes().Return(map[int64]int64{}, nil)
+		deps.cache.EXPECT().CountByUpstream(gomock.Any()).AnyTimes().Return(map[int64]int64{}, nil)
+		deps.upstream.EXPECT().List(gomock.Any()).AnyTimes().Return([]*upstream_entity.Upstream{}, nil)
+
+		deps.drained = []metrics.Bucket{{
+			Host: "deb.debian.org", Bucket: 1700000040,
+			Requests: 10, Hits: 4, Denied: 1, OriginErrors: 1,
+			MissFirst: 2, MissTTL: 1, MissEvicted: 1, MissChanged: 0,
+		}}
+		deps.upstream.EXPECT().FindByHost(gomock.Any(), "deb.debian.org").
+			Return(&upstream_entity.Upstream{ID: 7, Host: "deb.debian.org", Enabled: true}, nil)
+		deps.rollup.EXPECT().FindByBucket(gomock.Any(), int64(7), int64(1700000040)).
+			Return(&rollup_entity.TrafficRollup{
+				ID: 3, UpstreamID: 7, Bucket: 1700000040,
+				Requests: 5, MissFirst: 1, MissTTL: 2, MissEvicted: 3, MissChanged: 4,
+			}, nil)
+		var saved *rollup_entity.TrafficRollup
+		deps.rollup.EXPECT().Save(gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, row *rollup_entity.TrafficRollup) error {
+				saved = row
+				return nil
+			})
+
+		convey.So(deps.svc.Flush(ctx), convey.ShouldBeNil)
+		convey.So(saved.MissFirst, convey.ShouldEqual, 3)
+		convey.So(saved.MissTTL, convey.ShouldEqual, 3)
+		convey.So(saved.MissEvicted, convey.ShouldEqual, 4)
+		convey.So(saved.MissChanged, convey.ShouldEqual, 4)
+	})
+}
+
+// TestStat_UpstreamSeriesCarriesMissReasons 上游详情的回源原因分解和堆叠图读同一份序列。
+//
+// 不为占比条另开一个端点：同一屏上的两个数来自两次请求，就会来自两个时刻，
+// 然后对不上（UpstreamSeriesPoint 的注释说的就是这件事）。
+func TestStat_UpstreamSeriesCarriesMissReasons(t *testing.T) {
+	convey.Convey("按小时序列带上四个回源原因", t, func() {
+		deps := setup(t, nil)
+		deps.rollup.EXPECT().SumBySeries(gomock.Any(), rollup_repo.SeriesQuery{
+			From: testSeriesFrom, To: testSeriesTo, Width: 3600, UpstreamID: 7,
+		}).Return([]*rollup_repo.SeriesTotals{
+			{Bucket: testHourStart, Requests: 10, Hits: 4, Denied: 1, OriginErrors: 1,
+				MissFirst: 2, MissTTL: 1, MissEvicted: 1, MissChanged: 0},
+		}, nil)
+
+		got, err := deps.svc.UpstreamSeries(context.Background(), &admin.UpstreamSeriesRequest{UpstreamID: 7})
+		convey.So(err, convey.ShouldBeNil)
+		last := got.List[len(got.List)-1]
+		convey.So(last.Bucket, convey.ShouldEqual, testHourStart)
+		convey.So(last.MissFirst, convey.ShouldEqual, 2)
+		convey.So(last.MissTTL, convey.ShouldEqual, 1)
+		convey.So(last.MissEvicted, convey.ShouldEqual, 1)
+		convey.So(last.MissChanged, convey.ShouldEqual, 0)
+		// 四项之和正好是这一小时的未命中数：界面按这个分母算占比。
+		convey.So(last.MissFirst+last.MissTTL+last.MissEvicted+last.MissChanged,
+			convey.ShouldEqual, last.Requests-last.Hits-last.Denied-last.OriginErrors)
+		// 补零的桶四项都是零，不是「没有这个字段」。
+		convey.So(got.List[0].MissFirst, convey.ShouldEqual, 0)
+	})
+}

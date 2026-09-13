@@ -24,6 +24,16 @@ const sumColumns = "COALESCE(SUM(requests), 0) AS requests," +
 	"COALESCE(SUM(bytes_served), 0) AS bytes_served," +
 	"COALESCE(SUM(bytes_origin), 0) AS bytes_origin"
 
+// missColumns 四个回源原因，只加在序列聚合上。
+//
+// 全站总览与健康矩阵问的是命中率和流量，不需要归因；而上游详情的占比条和
+// 堆叠图读的是同一份序列（任务 15 的那一条），在这里加完，界面上就不必为一张
+// 图打第二次接口，两个数也不会来自两个时刻。
+const missColumns = "COALESCE(SUM(miss_first), 0) AS miss_first," +
+	"COALESCE(SUM(miss_ttl), 0) AS miss_ttl," +
+	"COALESCE(SUM(miss_evicted), 0) AS miss_evicted," +
+	"COALESCE(SUM(miss_changed), 0) AS miss_changed"
+
 // seriesColumn 把整分钟折算回它所属的等宽时间桶（UTC）的起点。
 //
 // 在 SQL 里分组而不是把分钟桶捞回 Go 里分：14 天是 14×1440 个桶乘上游数，
@@ -63,6 +73,11 @@ type SeriesTotals struct {
 	OriginErrors int64 `gorm:"column:origin_errors" json:"origin_errors"`
 	BytesServed  int64 `gorm:"column:bytes_served" json:"bytes_served"`
 	BytesOrigin  int64 `gorm:"column:bytes_origin" json:"bytes_origin"`
+	// 四个回源原因，加起来是这个桶里的未命中数。
+	MissFirst   int64 `gorm:"column:miss_first" json:"miss_first"`
+	MissTTL     int64 `gorm:"column:miss_ttl" json:"miss_ttl"`
+	MissEvicted int64 `gorm:"column:miss_evicted" json:"miss_evicted"`
+	MissChanged int64 `gorm:"column:miss_changed" json:"miss_changed"`
 }
 
 // TrafficRollupRepo 分钟桶的存取。
@@ -147,7 +162,7 @@ func (t *trafficRollupRepo) SumBySeries(ctx context.Context, q SeriesQuery) ([]*
 	}
 	list := make([]*SeriesTotals, 0)
 	tx := db.Ctx(ctx).Model(&rollup_entity.TrafficRollup{}).
-		Select(fmt.Sprintf(seriesColumn, q.Width)+","+sumColumns).
+		Select(fmt.Sprintf(seriesColumn, q.Width)+","+sumColumns+","+missColumns).
 		Where("bucket >= ? AND bucket < ?", q.From, q.To)
 	if q.UpstreamID > 0 {
 		tx = tx.Where("upstream_id = ?", q.UpstreamID)

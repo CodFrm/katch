@@ -168,3 +168,32 @@ func TestTrafficRollupRepo_SumBySeries(t *testing.T) {
 		})
 	})
 }
+
+// TestTrafficRollupRepo_SumBySeriesMissReasons 序列聚合要把四个回源原因一起加出来。
+//
+// 只加在序列这一条上：上游详情的占比条读的就是这份序列，而全站总览与健康矩阵
+// 问的是「命中率与流量」，多带四列只会让两个用不上它的查询各多扫四列。
+func TestTrafficRollupRepo_SumBySeriesMissReasons(t *testing.T) {
+	convey.Convey("按小时分桶时连四个回源原因一起聚合", t, func() {
+		ctx, _, mock := testutils.Database(t)
+		mock.ExpectQuery("SELECT \\(bucket - bucket % 3600\\) AS bucket_start,.*"+
+			"COALESCE\\(SUM\\(miss_first\\), 0\\) AS miss_first,COALESCE\\(SUM\\(miss_ttl\\), 0\\) AS miss_ttl,"+
+			"COALESCE\\(SUM\\(miss_evicted\\), 0\\) AS miss_evicted,COALESCE\\(SUM\\(miss_changed\\), 0\\) AS miss_changed "+
+			"FROM `traffic_rollups`").
+			WithArgs(int64(1699916400), int64(1700002800), int64(7)).
+			WillReturnRows(sqlmock.NewRows([]string{"bucket_start", "requests", "hits",
+				"miss_first", "miss_ttl", "miss_evicted", "miss_changed"}).
+				AddRow(1699999200, 12, 8, 2, 1, 1, 0))
+
+		got, err := NewTrafficRollup().SumBySeries(ctx, SeriesQuery{
+			From: 1699916400, To: 1700002800, Width: 3600, UpstreamID: 7,
+		})
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(len(got), convey.ShouldEqual, 1)
+		convey.So(got[0].MissFirst, convey.ShouldEqual, 2)
+		convey.So(got[0].MissTTL, convey.ShouldEqual, 1)
+		convey.So(got[0].MissEvicted, convey.ShouldEqual, 1)
+		convey.So(got[0].MissChanged, convey.ShouldEqual, 0)
+		convey.So(mock.ExpectationsWereMet(), convey.ShouldBeNil)
+	})
+}

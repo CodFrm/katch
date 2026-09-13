@@ -188,6 +188,10 @@ func (s *statSvc) saveBucket(ctx context.Context, now int64, bucket metrics.Buck
 	row.OriginErrors += bucket.OriginErrors
 	row.BytesServed += bucket.BytesServed
 	row.BytesOrigin += bucket.BytesOrigin
+	row.MissFirst += bucket.MissFirst
+	row.MissTTL += bucket.MissTTL
+	row.MissEvicted += bucket.MissEvicted
+	row.MissChanged += bucket.MissChanged
 	row.Updatetime = now
 	return rollup_repo.TrafficRollup().Save(ctx, row)
 }
@@ -413,6 +417,10 @@ func (s *statSvc) UpstreamSeries(ctx context.Context, req *admin.UpstreamSeriesR
 			OriginErrors: row.OriginErrors,
 			BytesServed:  row.BytesServed,
 			BytesOrigin:  row.BytesOrigin,
+			MissFirst:    row.MissFirst,
+			MissTTL:      row.MissTTL,
+			MissEvicted:  row.MissEvicted,
+			MissChanged:  row.MissChanged,
 		})
 	}
 	return &admin.UpstreamSeriesResponse{

@@ -148,6 +148,8 @@ type cacheSvc struct {
 	inflight map[string]*flight
 	// evictMu 把淘汰串起来：几个下载同时收尾时各淘汰各的，会把缓存削过头。
 	evictMu sync.Mutex
+	// forgot 被我们自己收走的键，供下一次未命中归因，见 miss.go。
+	forgot *forgotten
 }
 
 // New 构造缓存层。store 为 nil 表示磁盘不可用——此时它是一个纯透传的实现，
@@ -156,7 +158,8 @@ func New(store *cache.Store, opt Options) CacheSvc {
 	if opt.Runtime == nil {
 		opt.Runtime = setting_svc.Setting()
 	}
-	return &cacheSvc{store: store, runtime: opt.Runtime, inflight: map[string]*flight{}}
+	return &cacheSvc{store: store, runtime: opt.Runtime,
+		inflight: map[string]*flight{}, forgot: newForgotten()}
 }
 
 // limits 读一次运行时设置。
@@ -195,10 +198,17 @@ func (c *cacheSvc) Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCl
 		return proxy_svc.Proxy().Fetch(ctx, target)
 	}
 	key := cacheKey(target)
-	if body, meta, ok := c.serveFromDisk(ctx, upstream, key); ok {
+	body, meta, m := c.serveFromDisk(ctx, upstream, key)
+	if m == nil {
 		return body, meta, nil
 	}
-	return c.fetchAndCache(ctx, target, upstream, key)
+	body, meta, err = c.fetchAndCache(ctx, target, upstream, key)
+	if err != nil {
+		return nil, nil, err
+	}
+	// 归因收口在这一处：它必须在第一个字节发出去之前定下来，而「上游那份还是
+	// 不是我们手上那份」要等回源的响应头到手才知道（见 miss.stamp）。
+	return body, m.stamp(meta), nil
 }
 
 func (c *cacheSvc) usable() bool {
@@ -250,17 +260,28 @@ func cacheKey(target *proxy_svc.Target) string {
 	return target.Path + "?" + target.RawQuery
 }
 
-// serveFromDisk 命中则由磁盘服务，返回的第三个值表示这次是不是命中。
-func (c *cacheSvc) serveFromDisk(ctx context.Context, upstream *upstream_entity.Upstream, key string) (io.ReadCloser, *proxy_svc.Meta, bool) {
+// serveFromDisk 命中则由磁盘服务。
+//
+// 第三个返回值为 nil 表示这次是命中；否则它带着这次未命中的归因——判断只能在
+// 这里做，往上一层就只剩「查不到记录」这一个事实了。
+func (c *cacheSvc) serveFromDisk(ctx context.Context, upstream *upstream_entity.Upstream,
+	key string) (io.ReadCloser, *proxy_svc.Meta, *miss) {
 	repo := cache_repo.CacheObject()
 	object, err := repo.FindByKey(ctx, upstream.ID, key)
 	if err != nil {
-		// 库不可用不该让拉取停摆：当成未命中，回源照常。
+		// 库不可用不该让拉取停摆：当成未命中，回源照常。库都读不到的时候，
+		// 「这个对象以前有没有缓存过」同样无从谈起，归因只能退回首次拉取。
 		logger.Ctx(ctx).Error("读缓存记录失败", zap.String("key", key), zap.Error(err))
-		return nil, nil, false
+		return nil, nil, &miss{reason: metrics.MissFirst}
 	}
-	if object == nil || object.Expired(time.Now().Unix()) {
-		return nil, nil, false
+	if object == nil {
+		// 表里什么都没有：可能从没缓存过，也可能是被我们自己收走的。
+		return nil, nil, &miss{reason: c.forgot.recall(upstream.ID, key)}
+	}
+	if object.Expired(time.Now().Unix()) {
+		// 记录还在，只是过期了——可变对象由 TTL 自行过期（缓存一节）。
+		// 带上手上这份的摘要：回源的响应头会说清上游那份是不是同一个。
+		return nil, nil, &miss{reason: metrics.MissTTL, heldDigest: object.Digest}
 	}
 	file, size, err := c.store.Open(object.Digest)
 	if err != nil {
@@ -268,7 +289,7 @@ func (c *cacheSvc) serveFromDisk(ctx context.Context, upstream *upstream_entity.
 		logger.Ctx(ctx).Error("缓存副本丢失", zap.String("key", key),
 			zap.String("digest", object.Digest), zap.Error(err))
 		c.dropRecord(ctx, object)
-		return nil, nil, false
+		return nil, nil, brokenCopyMiss()
 	}
 	if size != object.Size {
 		_ = file.Close()
@@ -276,7 +297,7 @@ func (c *cacheSvc) serveFromDisk(ctx context.Context, upstream *upstream_entity.
 			zap.Int64("want", object.Size), zap.Int64("got", size))
 		metrics.RecordIntegrityFailure(upstream.Host)
 		c.dropRecord(ctx, object)
-		return nil, nil, false
+		return nil, nil, brokenCopyMiss()
 	}
 	// 校验在发字节之前做完：失败时这一次请求还回得了源（缓存一节）。
 	if err := verifyCopy(file, object); err != nil {
@@ -287,7 +308,7 @@ func (c *cacheSvc) serveFromDisk(ctx context.Context, upstream *upstream_entity.
 			zap.String("digest", object.Digest), zap.Error(err))
 		metrics.RecordIntegrityFailure(upstream.Host)
 		c.dropRecord(ctx, object)
-		return nil, nil, false
+		return nil, nil, brokenCopyMiss()
 	}
 	if err := repo.Touch(ctx, object.ID, time.Now().Unix()); err != nil {
 		// 命中已经成立了，访问时间没更新上只影响淘汰顺序，不该让这次拉取失败。
@@ -303,7 +324,17 @@ func (c *cacheSvc) serveFromDisk(ctx context.Context, upstream *upstream_entity.
 		StatusCode:    http.StatusOK,
 		Header:        header,
 		ContentLength: object.Size,
-	}, true
+	}, nil
+}
+
+// brokenCopyMiss 副本已经坏了、被丢掉了，这次只能回源。
+//
+// 算首次拉取而不是「内容变更」：变的是我们自己的盘，不是上游。记成内容变更会
+// 把站长支去查上游，而真正该看的是那条校验失败的 error 与
+// katch_cache_integrity_failures_total。不带摘要——手上那份既然已经不可信，
+// 拿它去和上游比也没有意义。
+func brokenCopyMiss() *miss {
+	return &miss{reason: metrics.MissFirst}
 }
 
 // dropRecord 丢掉一条坏记录，连同它独占的那份内容。
@@ -339,7 +370,7 @@ func (c *cacheSvc) removeIfUnreferenced(ctx context.Context, digest string) {
 // fetchAndCache 未命中：回源，同一对象的并发请求合并成一次（决策 9）。
 func (c *cacheSvc) fetchAndCache(ctx context.Context, target *proxy_svc.Target,
 	upstream *upstream_entity.Upstream, key string) (io.ReadCloser, *proxy_svc.Meta, error) {
-	flightKey := strconv.FormatInt(upstream.ID, 10) + "\x00" + key
+	flightKey := objectKey(upstream.ID, key)
 
 	c.mu.Lock()
 	if running, ok := c.inflight[flightKey]; ok {
@@ -583,6 +614,9 @@ func (c *cacheSvc) reclaim(ctx context.Context, repo cache_repo.CacheObjectRepo,
 				logger.Ctx(ctx).Error("淘汰缓存记录失败", zap.Int64("id", object.ID), zap.Error(err))
 				return removed, freed
 			}
+			// 记一笔「这条是被淘汰走的」：下一次拉到它时，表里同样什么都
+			// 查不到，而它和一次首次拉取说的是相反的事。
+			c.forgot.remember(object.UpstreamID, object.Key, metrics.MissEvicted)
 			c.removeIfUnreferenced(ctx, object.Digest)
 			total -= object.Size
 			removed++
@@ -622,6 +656,9 @@ func (c *cacheSvc) Sweep(ctx context.Context) (int64, error) {
 					zap.Int64("id", object.ID), zap.Error(err))
 				return removed, err
 			}
+			// 过期被收走的记录同样查不到了，但它是 TTL 到期，不是从没缓存过——
+			// 少了这一笔，一个全是可变对象的上游会显示成「几乎都是首次拉取」。
+			c.forgot.remember(object.UpstreamID, object.Key, metrics.MissTTL)
 			c.removeIfUnreferenced(ctx, object.Digest)
 			removed++
 		}
@@ -733,6 +770,9 @@ func (c *cacheSvc) Purge(ctx context.Context, req *PurgeRequest) (*PurgeResponse
 		if err := repo.Delete(ctx, object.ID); err != nil {
 			return nil, err
 		}
+		// 人手清掉的对象，再被拉回来就是一次首次拉取。这一笔还顺带盖掉它更早
+		// 之前留下的那条淘汰记录，否则清完缓存的第一次拉取会报成「被淘汰」。
+		c.forgot.remember(object.UpstreamID, object.Key, metrics.MissFirst)
 		if c.store != nil {
 			c.removeIfUnreferenced(ctx, object.Digest)
 		}
