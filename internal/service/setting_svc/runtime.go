@@ -38,6 +38,10 @@ const (
 	OriginTimeoutSecondsSetting = "origin_timeout_seconds"
 	// OriginRetriesSetting 回源失败的重试次数，0 表示不重试。
 	OriginRetriesSetting = "origin_retries"
+	// RecentRequestRetentionSecondsSetting「最近请求」历史的保留时长（秒）。
+	//
+	// 它是这份历史占用磁盘的唯一闸门：保留期越长，库越大，占用与流量线性相关。
+	RecentRequestRetentionSecondsSetting = "recent_request_retention_seconds"
 )
 
 // 出厂默认值，全仓只此一份：缓存层与拉取路径都经 Runtime 读这里，谁也不再自带
@@ -49,6 +53,8 @@ const (
 	defaultOriginConcurrency    = 32
 	defaultOriginTimeoutSeconds = 30
 	defaultOriginRetries        = 2
+	// 一天是「刚刚发生了什么」够用、磁盘又吃得消的那个数。
+	defaultRecentRequestRetentionSeconds = 86400
 )
 
 // settingDef 一项运行时设置的定义：类型、默认值和取值范围。
@@ -100,6 +106,10 @@ var settingDefs = []*settingDef{
 	{Key: OriginRetriesSetting, Type: admin.SettingTypeInt,
 		// 0 次重试是合法的选择：一次失败就报错，由客户端自己再来。
 		Default: jsonInt(defaultOriginRetries), Min: 0, Max: 10},
+	{Key: RecentRequestRetentionSecondsSetting, Type: admin.SettingTypeInt,
+		// 一份诊断用的历史。下限一小时：比这更短的窗口在界面上看不出任何
+		// 东西；上限七天：再长就不再是「最近」，只是把盘占着。
+		Default: jsonInt(defaultRecentRequestRetentionSeconds), Min: 3600, Max: 604800},
 }
 
 var settingDefIndex = func() map[string]*settingDef {
@@ -285,6 +295,8 @@ type RuntimeSettings struct {
 	OriginTimeoutSeconds int
 	// OriginRetries 回源失败重试几次，0 表示不重试。
 	OriginRetries int
+	// RecentRequestRetentionSeconds「最近请求」历史保留多久（秒）。
+	RecentRequestRetentionSeconds int64
 }
 
 // RuntimeSource 运行时设置的来源。
@@ -357,6 +369,8 @@ func (r *RuntimeSettings) assign(key string, value json.RawMessage) error {
 		return json.Unmarshal(value, &r.OriginTimeoutSeconds)
 	case OriginRetriesSetting:
 		return json.Unmarshal(value, &r.OriginRetries)
+	case RecentRequestRetentionSecondsSetting:
+		return json.Unmarshal(value, &r.RecentRequestRetentionSeconds)
 	case PublicHomepageSetting:
 		// 首页是否公开有自己的读法（PublicHomepage），不进这份快照：拉取路径
 		// 用不上它，而接口层要的是那条「读不出来就收口」的语义。

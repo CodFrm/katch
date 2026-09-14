@@ -138,6 +138,11 @@ describe('formatDuration / parseDuration', () => {
     })
   }
 
+  it('认天，一天是 86400 秒', () => {
+    expect(parseDuration('3d')).toBe(259200)
+    expect(parseDuration('1d')).toBe(86400)
+  })
+
   it('不带单位按秒算，认不出来的给 null', () => {
     expect(parseDuration('45')).toBe(45)
     expect(parseDuration('5 分钟')).toBeNull()

@@ -301,6 +301,7 @@
         "site": "站点",
         "cache": "缓存",
         "origin": "拉取",
+        "history": "历史",
         "access": "访问"
       },
       "fields": {
@@ -311,6 +312,7 @@
         "watermark": "回收水位",
         "watermarkShort": "水位",
         "mutableTTL": "可变对象 TTL",
+        "recentRequestRetention": "最近请求保留时长",
         "immutable": "不可变对象",
         "concurrency": "回源并发上限",
         "timeout": "上游超时",
@@ -324,6 +326,7 @@
         "publicHomepage": "关闭后首页只保留输入框，不展示上游和命中率",
         "quota": "超过水位触发 LRU 回收",
         "mutableTTL": "manifest、Release、@latest 这类会变的对象",
+        "recentRequestRetention": "这份历史占用磁盘的唯一闸门：保留期越长，库越大，占用与流量线性相关",
         "immutable": "内容寻址，永不过期，只按 LRU 淘汰",
         "concurrency": "同一上游同时回源的请求数",
         "globalRules": "先于每个上游自己的规则求值"

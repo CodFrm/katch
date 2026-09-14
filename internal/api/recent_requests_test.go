@@ -3,73 +3,64 @@ package api_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
-	"github.com/cago-frame/cago/configs"
 	"github.com/cago-frame/cago/pkg/logger"
 	"github.com/gin-gonic/gin"
 	"github.com/smartystreets/goconvey/convey"
 	"go.uber.org/zap"
 
-	"github.com/CodFrm/katch/internal/bootstrap"
+	"github.com/CodFrm/katch/internal/api/admin"
 	"github.com/CodFrm/katch/internal/metrics"
+	"github.com/CodFrm/katch/internal/model/entity/request_log_entity"
+	"github.com/CodFrm/katch/internal/repository/request_log_repo"
+	"github.com/CodFrm/katch/internal/service/request_svc"
 	"github.com/CodFrm/katch/internal/service/upstream_svc"
 )
 
-// 这一组用例守的是「最近请求读的是结构化日志」这句话的两头：拉取路径**真的**把
-// 那一行写进了配置里那个文件，管理接口**真的**从那个文件的尾部把它读回来。
-//
-// 中间没有替身：日志由计数中间件按 cmd/katch/main.go 的装配写出，文件路径由
-// configs 里的 logger.logFile 决定，读取走 log_svc 的默认实例。任何一头改了字段名，
-// 这组用例当场红——只测读那一半的话，两边各写各的也能全绿。
+// 这一组用例守的是「最近请求读的是库」这句话的两头：拉取路径**真的**把那一行
+// 经中间件与落库服务写进 recent_request，管理接口**真的**把它从库里读回来
+// （TestRecentRequests_ComesFromThePullPath 是那条端到端的）。日志文件是空的
+// 且没有人在里面写拉取行，所以一个还去读日志尾部的实现在这里读不到任何东西——
+// 两边各写各的也能全绿的那种只测读一半的写法，被这几条夹住了。
 
-// startLogKatch 起一套会把日志落到文件上的 katch，返回引擎、假上游和日志文件路径。
-func startLogKatch(t *testing.T) (*gin.Engine, *liveOrigin, string) {
+// startRecentRequestKatch 起一套「最近请求」落在真库上的 katch，返回引擎、假上游和
+// 一个空日志文件。
+func startRecentRequestKatch(t *testing.T) (*gin.Engine, *liveOrigin, string) {
 	t.Helper()
 	engine, origin := startLiveKatch(t)
-
-	dir := t.TempDir()
-	logFile := filepath.Join(dir, "katch.log")
-	// 配置文件是日志路径的唯一出处，用例也走这条路：直接给 log_svc 塞一个路径的话，
-	// 「端点不认调用方给的文件名」这句话就没被任何东西验证过。
-	configPath := filepath.Join(dir, "config.yaml")
-	if err := os.WriteFile(configPath, []byte(`env: TEST
-debug: false
-source: file
-logger:
-  level: info
-  disableConsole: true
-  logFile:
-    enable: true
-    filename: `+logFile+`
-`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	src, err := bootstrap.NewConfigSource(configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := configs.NewConfig("katch", configs.WithSource(src)); err != nil {
-		t.Fatal(err)
-	}
-	log, err := logger.New(logger.AppendCore(logger.NewFileCore(zap.InfoLevel, logFile)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	logger.SetLogger(log)
-	t.Cleanup(func() { logger.SetLogger(zap.NewNop()) })
-
-	// 计数中间件照 main 装配：拉取那一行就是它写的，和指标出自同一个缝。
+	// 仓储与业务层照 cmd/katch/main.go 装配，用的是真 sqlite：拉取那一行经
+	// 中间件进进程内缓冲、经落库服务写进库，再由接口读回来。
+	request_log_repo.RegisterRequestLog(request_log_repo.NewRequestLog())
+	request_svc.Register(request_svc.New(request_svc.Options{}))
+	// 计数中间件也照 main 装配：那一行明细就是它攒进缓冲的。
 	engine.Use(metrics.Default().Middleware(metrics.Hooks{
 		Lookup: func(ctx context.Context, host string) bool {
 			upstream, err := upstream_svc.Upstream().FindByHost(ctx, host)
 			return err == nil && upstream != nil
 		},
 	}))
+
+	// 日志落到一个空文件上：这块面板的数据若还来自日志尾部，写进库的那一行就
+	// 读不回来。文件从头到尾没被写过（只有 ComesFromThePullPath 真拉取，那一条
+	// 用的也是自己那个文件），所以去读日志尾部的实现在这里只会给出空。
+	logFile := filepath.Join(t.TempDir(), "katch.log")
+	if err := os.WriteFile(logFile, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	log, err := logger.New(logger.AppendCore(logger.NewFileCore(zap.DebugLevel, logFile)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.SetLogger(log)
+	t.Cleanup(func() { logger.SetLogger(zap.NewNop()) })
+
 	registerLiveUpstream(t, engine, origin)
 	return engine, origin, logFile
 }
@@ -133,67 +124,137 @@ func recentRequests(t *testing.T, engine *gin.Engine, query string) []recentRequ
 	return resp.Data.List
 }
 
-func TestRecentRequests_ComesFromTheRequestLog(t *testing.T) {
-	convey.Convey("带密钥读某个上游的最近请求", t, func() {
-		engine, _, _ := startLogKatch(t)
+// recentDBRow 一行待入库的明细。
+func recentDBRow(upstreamID, at int64, object, result string, bytes, durationMS int64) *request_log_entity.RecentRequest {
+	return &request_log_entity.RecentRequest{
+		UpstreamID: upstreamID,
+		At:         at,
+		Object:     object,
+		Result:     result,
+		Bytes:      bytes,
+		DurationMS: durationMS,
+	}
+}
+
+// saveRecentRows 直接把明细写进真实库。
+func saveRecentRows(t *testing.T, rows ...*request_log_entity.RecentRequest) {
+	t.Helper()
+	if err := request_log_repo.RecentRequestLog().Save(context.Background(), rows); err != nil {
+		t.Fatalf("写入最近请求失败：%v", err)
+	}
+}
+
+func TestRecentRequests_ComesFromTheDatabase(t *testing.T) {
+	convey.Convey("面板的数据来自库", t, func() {
+		engine, _, _ := startRecentRequestKatch(t)
 		id := liveUpstreamID(t, engine)
 
-		convey.So(livePull(engine, "/pool/recent.deb").Code, convey.ShouldEqual, http.StatusOK)
-		convey.So(livePull(engine, "/pool/recent.deb").Code, convey.ShouldEqual, http.StatusOK)
+		saveRecentRows(t,
+			recentDBRow(id, 1700000100, "/pool/recent.deb", "miss", 4096, 120),
+			recentDBRow(id, 1700000200, "/dists/bookworm/InRelease", "hit", 512, 4),
+			// 同一秒的第二条：顺序靠自增 id 兜底，写入顺序倒过来才是它的先后。
+			recentDBRow(id, 1700000200, "/pool/same-second.deb", "hit", 8, 1),
+		)
 
 		list := recentRequests(t, engine, "upstream_id="+itoa(id))
 
-		convey.Convey("两次拉取都在，最近的在最前，时间/对象/结果/大小/耗时都有", func() {
-			convey.So(len(list), convey.ShouldEqual, 2)
-			convey.So(list[0].Object, convey.ShouldEqual, "/pool/recent.deb")
-			// 第二次由缓存服务，第一次回源取回——这块面板的用处就在这个差别上。
-			convey.So(list[0].Result, convey.ShouldEqual, "hit")
-			convey.So(list[1].Result, convey.ShouldEqual, "miss")
-			convey.So(list[0].Bytes, convey.ShouldEqual, liveObjectSize)
-			convey.So(list[0].At, convey.ShouldBeGreaterThan, 0)
-			convey.So(list[0].DurationMS, convey.ShouldBeGreaterThanOrEqualTo, 0)
+		convey.Convey("最近的在最前，同一秒内按写入顺序倒序，字段都在", func() {
+			convey.So(len(list), convey.ShouldEqual, 3)
+			convey.So(list[0].Object, convey.ShouldEqual, "/pool/same-second.deb")
+			convey.So(list[0].At, convey.ShouldEqual, int64(1700000200))
+			convey.So(list[1].Object, convey.ShouldEqual, "/dists/bookworm/InRelease")
+			convey.So(list[1].Result, convey.ShouldEqual, "hit")
+			convey.So(list[1].Bytes, convey.ShouldEqual, int64(512))
+			convey.So(list[1].DurationMS, convey.ShouldEqual, int64(4))
+			convey.So(list[2].Object, convey.ShouldEqual, "/pool/recent.deb")
+			convey.So(list[2].Result, convey.ShouldEqual, "miss")
+			convey.So(list[2].Bytes, convey.ShouldEqual, int64(4096))
+			convey.So(list[2].DurationMS, convey.ShouldEqual, int64(120))
 		})
 
 		convey.Convey("表里没有这个上游时给空，而不是把别人的行端出来", func() {
-			convey.So(livePull(engine, "/pool/recent.deb").Code, convey.ShouldEqual, http.StatusOK)
-			other := recentRequests(t, engine, "upstream_id=999999")
-			convey.So(other, convey.ShouldBeEmpty)
+			convey.So(recentRequests(t, engine, "upstream_id=999999"), convey.ShouldBeEmpty)
 		})
 	})
 }
 
-func TestRecentRequests_TakesNoFilenameFromCaller(t *testing.T) {
-	convey.Convey("端点不接受调用方给的文件名", t, func() {
-		engine, _, _ := startLogKatch(t)
+// TestRecentRequests_ComesFromThePullPath 拉取路径到面板这一整条链路。
+//
+// 上面那条从仓储起、这里从拉取起：中间件把明细攒进进程内缓冲，落库服务取走
+// 一批批量写进库，面板再按 upstream_id 读回来。中间任何一段的字段名或装配改了，
+// 这里红。
+func TestRecentRequests_ComesFromThePullPath(t *testing.T) {
+	convey.Convey("一次拉取经中间件与落库服务真的进了库", t, func() {
+		engine, _, _ := startRecentRequestKatch(t)
 		id := liveUpstreamID(t, engine)
+
+		// 两次拉取：第一次回源（miss），第二次由缓存服务（hit）——这块面板的
+		// 用处就在这个差别上。
 		convey.So(livePull(engine, "/pool/recent.deb").Code, convey.ShouldEqual, http.StatusOK)
+		convey.So(livePull(engine, "/pool/recent.deb").Code, convey.ShouldEqual, http.StatusOK)
+		// 落库是后台每秒一趟的事，用例自己推一趟，免得等墙钟。
+		convey.So(request_svc.Request().Flush(context.Background()), convey.ShouldBeNil)
 
-		plain := recentRequests(t, engine, "upstream_id="+itoa(id))
-		// 挑几个「像是能指定文件」的参数名一起带上：任何一个被接住，管理接口就成了
-		// 一条任意文件读取的路。
-		crafted := recentRequests(t, engine, "upstream_id="+itoa(id)+
-			"&file=/etc/passwd&filename=/etc/passwd&path=../../../../etc/passwd&log=/etc/passwd")
-
-		convey.So(crafted, convey.ShouldResemble, plain)
-		convey.So(len(crafted), convey.ShouldEqual, 1)
-		convey.So(crafted[0].Object, convey.ShouldEqual, "/pool/recent.deb")
+		list := recentRequests(t, engine, "upstream_id="+itoa(id))
+		convey.So(list, convey.ShouldHaveLength, 2)
+		convey.So(list[0].Object, convey.ShouldEqual, "/pool/recent.deb")
+		convey.So(list[0].Result, convey.ShouldEqual, "hit")
+		convey.So(list[0].Bytes, convey.ShouldEqual, liveObjectSize)
+		convey.So(list[1].Result, convey.ShouldEqual, "miss")
 	})
 }
 
-func TestRecentRequests_DegradesToAbsentWhenLogIsGone(t *testing.T) {
-	convey.Convey("日志被轮转走之后这一块是空的，而不是一个错误", t, func() {
-		engine, _, logFile := startLogKatch(t)
+func TestRecentRequests_IgnoresTheLog(t *testing.T) {
+	convey.Convey("日志里没有拉取行时接口照常给数据", t, func() {
+		engine, _, logFile := startRecentRequestKatch(t)
 		id := liveUpstreamID(t, engine)
-		convey.So(livePull(engine, "/pool/recent.deb").Code, convey.ShouldEqual, http.StatusOK)
-		convey.So(len(recentRequests(t, engine, "upstream_id="+itoa(id))), convey.ShouldEqual, 1)
 
-		if err := os.Remove(logFile); err != nil {
-			t.Fatal(err)
+		// 这条用例自己不拉取，所以这个文件连一行拉取都没有：还去读日志尾部的
+		// 实现只能给出空，而写进库的那一行照样读得回来。
+		content, err := os.ReadFile(logFile)
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(strings.Contains(string(content), metrics.PullLogMessage), convey.ShouldBeFalse)
+
+		saveRecentRows(t, recentDBRow(id, 1700000200, "/version", "hit", 12, 3))
+
+		list := recentRequests(t, engine, "upstream_id="+itoa(id))
+		convey.So(len(list), convey.ShouldEqual, 1)
+		convey.So(list[0].Object, convey.ShouldEqual, "/version")
+	})
+}
+
+func TestRecentRequests_EmptyAndLimitCeiling(t *testing.T) {
+	convey.Convey("无数据给空列表，limit 上限仍是 100", t, func() {
+		engine, _, _ := startRecentRequestKatch(t)
+		id := liveUpstreamID(t, engine)
+
+		convey.Convey("库里没有行时给空列表", func() {
+			w := liveAdmin(engine, http.MethodGet,
+				"/api/v1/admin/logs/requests?upstream_id="+itoa(id), "")
+			convey.So(w.Code, convey.ShouldEqual, http.StatusOK)
+			// 空也得是 []，不是 null：调用方不该多一种情况要处理。
+			convey.So(w.Body.String(), convey.ShouldContainSubstring, `"list":[]`)
+		})
+
+		// 放进超过上限的行数：limit=100 只能给出最近的那 100 条。
+		rows := make([]*request_log_entity.RecentRequest, 0, 150)
+		for i := 0; i < 150; i++ {
+			rows = append(rows, recentDBRow(id, 1700000000+int64(i),
+				fmt.Sprintf("/pool/p-%03d.deb", i), "hit", 1, 1))
 		}
+		saveRecentRows(t, rows...)
 
-		w := liveAdmin(engine, http.MethodGet,
-			"/api/v1/admin/logs/requests?upstream_id="+itoa(id), "")
-		convey.So(w.Code, convey.ShouldEqual, http.StatusOK)
-		convey.So(recentRequests(t, engine, "upstream_id="+itoa(id)), convey.ShouldBeEmpty)
+		convey.Convey("limit=100 给出最近 100 条", func() {
+			list := recentRequests(t, engine, "upstream_id="+itoa(id)+"&limit=100")
+			convey.So(len(list), convey.ShouldEqual, admin.RecentRequestsMaxLimit)
+			convey.So(list[0].Object, convey.ShouldEqual, "/pool/p-149.deb")
+			convey.So(list[len(list)-1].Object, convey.ShouldEqual, "/pool/p-050.deb")
+		})
+
+		convey.Convey("超过 100 的 limit 在请求校验那一关被挡掉", func() {
+			w := liveAdmin(engine, http.MethodGet,
+				"/api/v1/admin/logs/requests?upstream_id="+itoa(id)+"&limit=101", "")
+			convey.So(w.Code, convey.ShouldEqual, http.StatusBadRequest)
+		})
 	})
 }

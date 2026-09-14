@@ -126,13 +126,14 @@ export function formatDuration(seconds: number): string {
   return `${rounded}s`
 }
 
-/** `5m` 解回秒数，不带单位按秒算，认不出来给 null。 */
+/** `5m` 解回秒数，不带单位按秒算，认不出来给 null。也认 `3d` 这样的天：
+ * 保留期上限是 7 天，只能以小时写就得写出 `168h` 这种没人算得过来的数。 */
 export function parseDuration(text: string): number | null {
-  const matched = /^\s*(\d+(?:\.\d+)?)\s*([smh]?)\s*$/.exec(text)
+  const matched = /^\s*(\d+(?:\.\d+)?)\s*([smhd]?)\s*$/.exec(text)
   if (!matched) {
     return null
   }
-  const scale = { '': 1, s: 1, m: 60, h: 3600 }[matched[2]] ?? 1
+  const scale = { '': 1, s: 1, m: 60, h: 3600, d: 86400 }[matched[2]] ?? 1
   return Math.round(Number(matched[1]) * scale)
 }
 

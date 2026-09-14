@@ -28,11 +28,13 @@ import (
 	"github.com/CodFrm/katch/internal/proxy/backoff"
 	"github.com/CodFrm/katch/internal/repository/cache_repo"
 	"github.com/CodFrm/katch/internal/repository/event_repo"
+	"github.com/CodFrm/katch/internal/repository/request_log_repo"
 	"github.com/CodFrm/katch/internal/repository/rollup_repo"
 	"github.com/CodFrm/katch/internal/repository/setting_repo"
 	"github.com/CodFrm/katch/internal/repository/upstream_repo"
 	"github.com/CodFrm/katch/internal/service/cache_svc"
 	"github.com/CodFrm/katch/internal/service/proxy_svc"
+	"github.com/CodFrm/katch/internal/service/request_svc"
 	"github.com/CodFrm/katch/internal/service/setting_svc"
 	"github.com/CodFrm/katch/internal/service/stat_svc"
 	"github.com/CodFrm/katch/internal/service/upstream_svc"
@@ -94,6 +96,16 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
+	// 两个落库服务注册成真组件，而不是挂在 gogo.Go(Run) 上：框架停止时先取消
+	// 所有组件的 ctx，再按注册逆序同步调 CloseHandle，最后才 gogo.Wait()。挂在
+	// Run 的 ctx.Done 分支里落库会和框架关库赛跑（实测报 database is closed 并
+	// 偶发丢最后一批）；作为组件注册在仓储装配之后，CloseHandle 同步落退出那批，
+	// 排在数据库关闭之前。注册顺序仍由下面链条里的位置决定。
+	statSvc := stat_svc.New(stat_svc.Options{Degraded: backoffTracker})
+	stat_svc.Register(statSvc)
+	requestSvc := request_svc.New(request_svc.Options{})
+	request_svc.Register(requestSvc)
+
 	err = cago.New(ctx, cfg).
 		// Core 内部已经初始化了 logger 和 metric，**不要**再单独注册 metric.Metrics：
 		// 那会让 otel 的 prometheus exporter 创建两次、双双注册进默认 registry，
@@ -118,6 +130,7 @@ func main() {
 			setting_repo.RegisterSetting(setting_svc.NewCachedSettingRepo(setting_repo.NewSetting()))
 			cache_repo.RegisterCacheObject(cache_repo.NewCacheObject())
 			rollup_repo.RegisterTrafficRollup(rollup_repo.NewTrafficRollup())
+			request_log_repo.RegisterRequestLog(request_log_repo.NewRequestLog())
 			// 事件仓储不装配的话，退避转换、缓存回收和管理写入都记不下来——
 			// event_svc 遇到 nil 是丢掉事件并留一条日志，不会连累被观察的操作。
 			event_repo.RegisterEvent(event_repo.NewEvent())
@@ -179,17 +192,11 @@ func main() {
 			return nil
 		})).
 		// 统计：拉取路径的计数中间件 + 每分钟把进程内计数器落成分钟桶。
-		// 必须排在仓储装配之后（要写 traffic_rollup），也必须排在 mux 之前
-		// （它注册的是 gin 中间件）。
-		Registry(cago.FuncComponent(func(ctx context.Context, _ *configs.Config) error {
-			stat_svc.Register(stat_svc.New(stat_svc.Options{Degraded: backoffTracker}))
-			gogo.Go(func() error {
-				// ctx 由框架在停止时取消，这个循环随之退出并补落最后一批计数。
-				stat_svc.Stat().Run(ctx)
-				return nil
-			})
-			return nil
-		})).
+		// 必须排在仓储装配之后（要写 traffic_rollup）。
+		Registry(statSvc).
+		// 最近请求：每秒把计数中间件攒下的拉取明细落进 recent_request，
+		// 并按设置里的保留期裁剪。必须排在仓储装配之后（它要写这张表）。
+		Registry(requestSvc).
 		Registry(metrics.Mount(metrics.Hooks{
 			Gate: backoffGate,
 			// 只用来判定「这个主机名该不该有自己的标签」，不是白名单那道闸——

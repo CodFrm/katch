@@ -4,13 +4,20 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/cago-frame/cago/pkg/logger"
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/smartystreets/goconvey/convey"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // 这一层要验的是「拉一次，计数器上多一条什么」。它坐在 SPA/拉取共用的 NoRoute
@@ -383,6 +390,176 @@ func TestRecorder_MissReasonsPartitionEveryRequest(t *testing.T) {
 		convey.So(b.MissChanged, convey.ShouldEqual, 1)
 		convey.So(b.MissFirst+b.MissTTL+b.MissEvicted+b.MissChanged,
 			convey.ShouldEqual, b.Requests-b.Hits-b.Denied-b.OriginErrors)
+	})
+}
+
+// captureLogs 把全局日志换成一个按级别过滤的内存 core。
+//
+// 用 observer 的 core 而不是自己接一个求值函数：级别拦截必须真的走 zap 的
+// level 检查，这样「默认级别下这一行根本不写」才和线上是同一件事。
+func captureLogs(t *testing.T, level zapcore.Level) *observer.ObservedLogs {
+	t.Helper()
+	core, logs := observer.New(level)
+	logger.SetLogger(zap.New(core))
+	t.Cleanup(func() { logger.SetLogger(zap.NewNop()) })
+	return logs
+}
+
+// TestRecorder_PullLogLevel 逐请求的拉取行从 info 降到了 debug（决策 1）。
+//
+// 它唯一的消费者是「最近请求」面板，面板改读库之后这行没有消费者；默认级别
+// 把它整个摘掉，排障时把级别调到 debug 仍要拿回同一行、同样的字段。
+func TestRecorder_PullLogLevel(t *testing.T) {
+	convey.Convey("逐请求的拉取行只在 debug 级别出现，字段一个不少", t, func() {
+		reg := prometheus.NewRegistry()
+		clock := time.Unix(1700000045, 0)
+		rec := New(Options{Registerer: reg, Now: func() time.Time { return clock }})
+		hooks := Hooks{Lookup: knownUpstreams("deb.debian.org")}
+		pull := &upstreamResponse{status: http.StatusOK, cache: "MISS", body: "abcde"}
+
+		convey.Convey("默认级别（info）下这一行整个消失", func() {
+			logs := captureLogs(t, zap.InfoLevel)
+			get(newTestEngine(rec, hooks, pull), "/deb.debian.org/pool/main/a.deb")
+
+			convey.So(logs.FilterMessage(PullLogMessage).Len(), convey.ShouldEqual, 0)
+		})
+
+		convey.Convey("调到 debug 之后同一行的字段与旧行一字不差", func() {
+			logs := captureLogs(t, zap.DebugLevel)
+			get(newTestEngine(rec, hooks, pull), "/deb.debian.org/pool/main/a.deb")
+
+			entries := logs.FilterMessage(PullLogMessage).All()
+			convey.So(entries, convey.ShouldHaveLength, 1)
+			convey.So(entries[0].Level, convey.ShouldEqual, zap.DebugLevel)
+			// 字段名与取值逐个比对，不只看有没有那一行：降级别时最容易
+			// 顺手改掉的就是字段，而面板排障读的就是这几个。
+			convey.So(entries[0].ContextMap(), convey.ShouldResemble, map[string]any{
+				"at":          int64(1700000045),
+				"upstream":    "deb.debian.org",
+				"object":      "/pool/main/a.deb",
+				"result":      "miss",
+				"bytes":       int64(5),
+				"duration_ms": int64(0),
+			})
+		})
+	})
+}
+
+// TestRecorder_RecentBuffer 一次拉取结束后记进进程内的环形缓冲（记录与落库一节）。
+//
+// 热路径在这里只做一次内存写入：不查库、不写库、不等待。落库由 request_svc 每秒
+// 取走一批，因此这一层只负责攒住与交出。
+func TestRecorder_RecentBuffer(t *testing.T) {
+	convey.Convey("拉取结束后记进环形缓冲", t, func() {
+		reg := prometheus.NewRegistry()
+		clock := time.Unix(1700000045, 0)
+		rec := New(Options{Registerer: reg, Now: func() time.Time { return clock }})
+		hooks := Hooks{Lookup: knownUpstreams("deb.debian.org")}
+
+		get(newTestEngine(rec, hooks, &upstreamResponse{status: http.StatusOK, cache: "MISS", body: "abcde"}),
+			"/deb.debian.org/pool/main/a.deb")
+
+		got := rec.DrainRecent()
+		convey.So(got, convey.ShouldHaveLength, 1)
+		// at 是这次拉取**结束**的时刻，与落库用的那一列同源。
+		convey.So(got[0], convey.ShouldResemble, RecentRequest{
+			Upstream: "deb.debian.org",
+			At:       1700000045,
+			Object:   "/pool/main/a.deb",
+			Result:   ResultMiss,
+			Bytes:    5,
+		})
+
+		convey.Convey("取走即清空，落库那一侧不会把同一批落两遍", func() {
+			convey.So(rec.DrainRecent(), convey.ShouldBeEmpty)
+		})
+	})
+
+	convey.Convey("满了丢最旧，剩下的顺序不变", t, func() {
+		rec := New(Options{Registerer: prometheus.NewRegistry()})
+		for i := 0; i < RecentRequestCapacity+3; i++ {
+			rec.appendRecent(RecentRequest{Upstream: "deb.debian.org", DurationMS: int64(i)})
+		}
+
+		got := rec.DrainRecent()
+		convey.So(got, convey.ShouldHaveLength, RecentRequestCapacity)
+		convey.So(got[0].DurationMS, convey.ShouldEqual, 3)
+		convey.So(got[len(got)-1].DurationMS, convey.ShouldEqual, int64(RecentRequestCapacity+2))
+	})
+
+	convey.Convey("并发 append 与 drain 不丢不重", t, func() {
+		rec := New(Options{Registerer: prometheus.NewRegistry()})
+		const writers, perWriter = 8, 500
+
+		var writersDone sync.WaitGroup
+		for w := 0; w < writers; w++ {
+			writersDone.Add(1)
+			go func(base int) {
+				defer writersDone.Done()
+				for i := 0; i < perWriter; i++ {
+					rec.appendRecent(RecentRequest{
+						Upstream:   "deb.debian.org",
+						DurationMS: int64(base*perWriter + i),
+					})
+				}
+			}(w)
+		}
+
+		var (
+			drained []RecentRequest
+			stop    = make(chan struct{})
+			drainer sync.WaitGroup
+		)
+		drainer.Add(1)
+		go func() {
+			defer drainer.Done()
+			for {
+				drained = append(drained, rec.DrainRecent()...)
+				select {
+				case <-stop:
+					drained = append(drained, rec.DrainRecent()...)
+					return
+				default:
+					runtime.Gosched()
+				}
+			}
+		}()
+
+		writersDone.Wait()
+		close(stop)
+		drainer.Wait()
+
+		seen := make(map[int64]bool, writers*perWriter)
+		for _, item := range drained {
+			seen[item.DurationMS] = true
+		}
+		convey.So(drained, convey.ShouldHaveLength, writers*perWriter)
+		convey.So(seen, convey.ShouldHaveLength, writers*perWriter)
+	})
+
+	convey.Convey("超长的 object 截到缓冲/表那一列的宽度", t, func() {
+		// 路径长度由调用方决定：不截的话，一行最长可以是一整条请求行，而缓冲
+		// 按行数封顶、库里的那一列又只有 512——一个超长路径足以让整批插入在
+		// MySQL 上失败，把同一秒里其余的行一起带走。
+		rec := New(Options{Registerer: prometheus.NewRegistry()})
+		hooks := Hooks{Lookup: knownUpstreams("deb.debian.org")}
+		long := "/" + strings.Repeat("a", RecentRequestObjectLimit+200)
+		get(newTestEngine(rec, hooks, &upstreamResponse{status: http.StatusOK, cache: "MISS"}),
+			"/deb.debian.org"+long)
+
+		got := rec.DrainRecent()
+		convey.So(got, convey.ShouldHaveLength, 1)
+		convey.So(got[0].Object, convey.ShouldEqual, long[:RecentRequestObjectLimit])
+	})
+
+	convey.Convey("未知主机不进缓冲", t, func() {
+		// 和日志、分钟桶一致：一个查不到的主机名没有 upstream_id 可挂，
+		// 让任何人往缓冲里写字符串还是一条放大路径。
+		rec := New(Options{Registerer: prometheus.NewRegistry()})
+		hooks := Hooks{Lookup: knownUpstreams("deb.debian.org")}
+		get(newTestEngine(rec, hooks, &upstreamResponse{status: http.StatusNotFound}), "/evil.internal/x")
+
+		convey.So(rec.DrainRecent(), convey.ShouldBeEmpty)
 	})
 }
 

@@ -131,6 +131,7 @@ function settingRows() {
     { key: 'cache_quota_bytes', value: 3 * 1024 * GB, type: 'int' },
     { key: 'cache_reclaim_percent', value: 85, type: 'int' },
     { key: 'mutable_ttl_seconds', value: 300, type: 'int' },
+    { key: 'recent_request_retention_seconds', value: 86400, type: 'int' },
     { key: 'origin_concurrency', value: 64, type: 'int' },
     { key: 'origin_timeout_seconds', value: 30, type: 'int' },
     { key: 'origin_retries', value: 2, type: 'int' },
@@ -645,6 +646,58 @@ describe('后台 · 设置', () => {
     })
     expect(call.body).toEqual({ settings: { origin_concurrency: 128 } })
     expect(await screen.findByRole('status')).toHaveTextContent('已保存')
+  })
+
+  it('最近请求保留时长默认一天，写成 1h 就按秒保存', async () => {
+    renderAdmin('/admin/settings')
+
+    const retention = await screen.findByLabelText('最近请求保留时长')
+    expect(retention).toHaveValue('24h')
+
+    await userEvent.clear(retention)
+    await userEvent.type(retention, '1h')
+    await userEvent.click(screen.getByRole('button', { name: '保存更改' }))
+
+    const call = await vi.waitFor(() => {
+      const found = calls.find(
+        (item) => item.url === '/api/v1/admin/settings' && item.method === 'POST'
+      )
+      expect(found).toBeDefined()
+      return found!
+    })
+    expect(call.body).toEqual({ settings: { recent_request_retention_seconds: 3600 } })
+  })
+
+  it('保留期写成 3d 也认，按三天保存', async () => {
+    renderAdmin('/admin/settings')
+
+    const retention = await screen.findByLabelText('最近请求保留时长')
+    await userEvent.clear(retention)
+    await userEvent.type(retention, '3d')
+    await userEvent.click(screen.getByRole('button', { name: '保存更改' }))
+
+    const call = await vi.waitFor(() => {
+      const found = calls.find(
+        (item) => item.url === '/api/v1/admin/settings' && item.method === 'POST'
+      )
+      expect(found).toBeDefined()
+      return found!
+    })
+    expect(call.body).toEqual({ settings: { recent_request_retention_seconds: 259200 } })
+  })
+
+  it('保留期的写法看不懂时拦住保存，一个字也不发给后端', async () => {
+    renderAdmin('/admin/settings')
+
+    const retention = await screen.findByLabelText('最近请求保留时长')
+    await userEvent.clear(retention)
+    await userEvent.type(retention, '两天')
+    await userEvent.click(screen.getByRole('button', { name: '保存更改' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('有一个值看不懂')
+    expect(
+      calls.some((item) => item.url === '/api/v1/admin/settings' && item.method === 'POST')
+    ).toBe(false)
   })
 
   it('后端拒绝一个值时说的是翻译过的话，不是后端的串', async () => {

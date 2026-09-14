@@ -178,10 +178,10 @@ const events = {
 }
 
 /**
- * 最近请求：后端从结构化日志的尾部读回来的几行，最近的在最前。
+ * 最近请求：后端从 recent_request 这张明细表读回来的几行，最近的在最前。
  *
- * 它不是一张表（决策 16 否掉了每请求写库），所以「读不到」是这块面板的常态之一：
- * 没开日志落盘、文件刚被轮转走，后端都给一个空列表。
+ * 这块面板的数据来自库（决策 2/11），所以「读不到」是它的常态之一：库里还没有
+ * 这个上游的行时，后端给一个空列表。
  */
 const recent = {
   list: [
@@ -488,9 +488,9 @@ describe('后台上游详情', () => {
     expect(within(panel).getByText('这段时间没有回源')).toBeInTheDocument()
   })
 
-  it('最近请求读的是日志的尾部：时间、对象、结果、大小、耗时', async () => {
+  it('最近请求读的是库：时间、对象、结果、大小、耗时', async () => {
     // 这块面板答的是「刚刚发生了什么」——分钟级的 rollup 答不了它，所以它读的是
-    // 结构化日志而不是一张每请求的表（决策 16）。
+    // recent_request 这张每请求一行的明细表（决策 2/11）。
     stubFetch({ recent: () => recent })
     renderAdmin('/admin/upstreams/1')
 
@@ -525,13 +525,13 @@ describe('后台上游详情', () => {
     const call = requests.find((r) => r.url.startsWith('/api/v1/admin/logs/requests'))
     expect(call?.url).toContain('upstream_id=1')
     expect(call?.key).toBe(`Bearer ${KEY}`)
-    // 读哪个文件只由 configs 里的 logger.logFile 决定，界面不带文件名。
+    // 端点不认文件名：数据不来自任何文件，界面也不带这个参数。
     expect(call?.url).not.toMatch(/file|filename|path|log=/)
   })
 
-  it('日志读不到时这一块整个消失，而不是挂一句打不开文件', async () => {
-    // 后端在日志没开、被轮转走、权限变了时给空列表；界面据此让面板消失。
-    // 排障的辅助块消失，好过让整屏管理界面挂在一句错误上。
+  it('库里没有行时这一块整个消失，而不是挂一句读不到数据', async () => {
+    // 后端在库里没有这个上游的行、或库读不出来时给空列表或 503；界面据此让面板
+    // 消失。排障的辅助块消失，好过让整屏管理界面挂在一句错误上。
     stubFetch({ recent: () => ({ list: [] }) })
     renderAdmin('/admin/upstreams/1')
 

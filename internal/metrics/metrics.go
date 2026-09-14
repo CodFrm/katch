@@ -5,7 +5,10 @@
 //   - Prometheus：`/metrics` 上的 katch_* 指标，供外部采集；
 //   - 进程内分钟桶：由 stat_svc 每分钟取走一次落进 traffic_rollup，界面上的
 //     请求量和命中率从那张表聚合——一个自部署的镜像站不该为了看自己的命中率
-//     就要先搭一套监控。
+//     就要先搭一套监控；
+//   - 进程内环形缓冲：由 request_svc 每秒取走一批落进 recent_request，
+//     上游详情的「最近请求」从那张表读。热路径在这里只多一次内存写入，
+//     不查库、不写库、不等待（记录与落库一节）。
 //
 // 回源原因（traffic_rollup 上的四列）只进分钟桶，不在 /metrics 上另开一族：
 // 可观测性一节把要导出的 katch_* 列全了，而这四个数是给界面上那条占比条用的，
@@ -99,6 +102,36 @@ type Event struct {
 	Duration    time.Duration
 }
 
+// RecentRequestCapacity 待落库环形缓冲的硬行数上限（决策 5）。
+//
+// 这是防「库变慢 → 内存涨」的那道闸，和保留期不是一回事：保留期管库里留多久，
+// 这个上限管内存里最多攒多少。1 秒的窗口里只有库卡住时才可能被摸到。
+const RecentRequestCapacity = 20000
+
+// RecentRequestObjectLimit 一行里最多留多长的 object（字节）。
+//
+// 行数有上限不等于内存有上限：object 来自 URL，长度由调用方决定，不截的话
+// 一行可以是一整条请求行。这个数和 recent_request.object 那一列的宽度
+// （VARCHAR(512)）一致，两边一起改：超长的值在 MySQL 严格模式下会让整批插入
+// 失败，把同一秒里其余的行一起带走。
+const RecentRequestObjectLimit = 512
+
+// RecentRequest 一次拉取的明细，环形缓冲里存的就是这个。
+//
+// 它和 Event 分开：Event 是计数需要的那些维度，这里多一个上游内的路径，
+// 而且只有落库那一侧关心。
+//
+// Upstream 是主机名而不是 upstream_id：热路径上不碰库，翻 id 是落库那一侧的事。
+type RecentRequest struct {
+	Upstream string
+	// At 这次拉取**结束**的时刻（秒）。
+	At         int64
+	Object     string
+	Result     Result
+	Bytes      int64
+	DurationMS int64
+}
+
 // Bucket 一个上游在某一整分钟内的累计量，与 traffic_rollup 的列一一对应。
 type Bucket struct {
 	Host   string
@@ -180,6 +213,14 @@ type Recorder struct {
 	// mu 护住分钟桶。
 	mu      sync.Mutex
 	buckets map[bucketKey]*Bucket
+	// recentMu 护住待落库的环形缓冲。
+	//
+	// 两个 mu 而不是一个：分钟桶一分钟才取走一次，而拉取每走一次都要 append，
+	// 共用一个会让落库那一侧在取桶时把整条热路径堵住。
+	recentMu   sync.Mutex
+	recent     []RecentRequest
+	recentHead int
+	recentLen  int
 	// usageMu 护住上一轮缓存占用快照，见 SetCacheUsage。
 	usageMu   sync.Mutex
 	lastUsage map[string]struct{}
@@ -289,6 +330,11 @@ func Drain() []Bucket {
 	return Default().Drain()
 }
 
+// DrainRecent 取走并清空进程级的待落库明细。
+func DrainRecent() []RecentRequest {
+	return Default().DrainRecent()
+}
+
 // Mount 把进程级计数器的中间件挂到 gin 上，由 main 作为组件注册。
 //
 // 和 web.MountSPA 一样走 mux.RegisterMiddleware：中间件必须在 mux.HTTP 启动
@@ -325,6 +371,50 @@ func (r *Recorder) RecordRequest(ev Event) {
 		return
 	}
 	r.addBucket(ev)
+}
+
+// recordRecent 把这次拉取 append 进待落库的环形缓冲。
+//
+// 它和计数、拉取行共用同一个缝，因为三者要的是同一批事实，分开记迟早会出现
+// 「指标上有、库里没有」的那一类对不上。热路径在这里只付一次内存写入：
+// 主机名不翻 id、不查库、不写库、不等待（记录与落库一节）。
+func (r *Recorder) recordRecent(object string, ev Event) {
+	r.appendRecent(RecentRequest{
+		Upstream:   ev.Upstream,
+		At:         r.now().Unix(),
+		Object:     clipObject(object),
+		Result:     ev.Result,
+		Bytes:      ev.BytesServed,
+		DurationMS: ev.Duration.Milliseconds(),
+	})
+}
+
+// clipObject 把上游内的路径截到缓冲/表那一列的宽度以内。
+//
+// EscapedPath 交出来的是转义过的 ASCII，按字节截不会切断一个字符。
+func clipObject(object string) string {
+	if len(object) <= RecentRequestObjectLimit {
+		return object
+	}
+	return object[:RecentRequestObjectLimit]
+}
+
+// appendRecent 往环形缓冲里写一行，满了丢最旧。
+func (r *Recorder) appendRecent(rec RecentRequest) {
+	r.recentMu.Lock()
+	defer r.recentMu.Unlock()
+	if r.recent == nil {
+		// 按上限一次开好：环形缓冲没有扩容，满了只能是丢最旧。
+		r.recent = make([]RecentRequest, RecentRequestCapacity)
+	}
+	if r.recentLen < len(r.recent) {
+		r.recent[(r.recentHead+r.recentLen)%len(r.recent)] = rec
+		r.recentLen++
+		return
+	}
+	// 满了丢最旧：指针往前挪一格，新的一行盖住它。
+	r.recent[r.recentHead] = rec
+	r.recentHead = (r.recentHead + 1) % len(r.recent)
 }
 
 func (r *Recorder) addBucket(ev Event) {
@@ -379,10 +469,31 @@ func (r *Recorder) Drain() []Bucket {
 	return list
 }
 
+// DrainRecent 取走并清空待落库的明细，由旧到新。
+//
+// 取走即清空：落库那一侧每轮拿到的只是「上一轮之后新增的行」，
+// 不清零会让同一批被反复写进去。失败时这一批就没了（决策 9）——
+// 一个不可用的库不该顺带把内存变成一个需要自己设上限的重试队列。
+func (r *Recorder) DrainRecent() []RecentRequest {
+	r.recentMu.Lock()
+	defer r.recentMu.Unlock()
+	if r.recentLen == 0 {
+		return nil
+	}
+	out := make([]RecentRequest, 0, r.recentLen)
+	for i := 0; i < r.recentLen; i++ {
+		idx := (r.recentHead + i) % len(r.recent)
+		out = append(out, r.recent[idx])
+		// 清掉槽位：取走的行不该因为槽位还被占着而挂在环形数组上。
+		r.recent[idx] = RecentRequest{}
+	}
+	r.recentHead, r.recentLen = 0, 0
+	return out
+}
+
 // PullLogMessage 每次拉取写进结构化日志的那一行的 msg。
 //
-// 上游详情上的「最近请求」读的就是这些行（log_svc 按这个 msg 把它们从同一个文件
-// 里的别的日志中挑出来），两边一起改。
+// 这一行是 debug 级别（决策 1）：默认配置下不写，排障时把级别调到 debug 才恢复。
 const PullLogMessage = "拉取"
 
 // Middleware 构造拉取路径的计数中间件。
@@ -419,6 +530,7 @@ func (r *Recorder) Middleware(hooks Hooks) gin.HandlerFunc {
 			}
 		}
 		r.RecordRequest(ev)
+		r.recordRecent(object, ev)
 		r.logPull(c.Request.Context(), object, ev)
 		r.feedGate(hooks.Gate, host, ev.Result)
 	}
@@ -427,11 +539,12 @@ func (r *Recorder) Middleware(hooks Hooks) gin.HandlerFunc {
 // logPull 把这次拉取写成结构化日志的一行。
 //
 // 它和计数共用这一个缝，而不是另起一处埋点：两者要的是同一批事实，分开记迟早会
-// 出现「指标上有、日志里没有」的那一类对不上。界面上的「最近请求」读的就是这些
-// 行的有界尾部——它本来就是日志，不为它另建每请求的表（决策 16）。
+// 出现「指标上有、日志里没有」的那一类对不上。这行本身没有消费者——「最近请求」
+// 面板改读 recent_request 那张表了（决策 2/11），它只留给排障时按级别取用。
 //
-// info 而不是 debug：默认级别看不见的话，那块面板在一台没人调过日志级别的机器上
-// 永远是空的。一行只有这几个字段，既不记请求头也不记 token（可观测性一节）。
+// debug 而不是 info（决策 1）：这一行唯一的消费者是「最近请求」面板，面板改读
+// 库之后它没有消费者；默认级别下把这次写入整个摘掉（zap 在 level 检查处返回），
+// 排障时把级别调到 debug 仍能拿回同一行、同样的六个字段。
 //
 // 只记上游表里有的主机：拉取路径是公开的，把没见过的主机名也写进去，等于让任何
 // 人都能往这台机器的磁盘上写字符串。它们的计数仍然照记，只是折在 unknown 上。
@@ -439,7 +552,7 @@ func (r *Recorder) logPull(ctx context.Context, object string, ev Event) {
 	if ev.Upstream == "" {
 		return
 	}
-	logger.Ctx(ctx).Info(PullLogMessage,
+	logger.Ctx(ctx).Debug(PullLogMessage,
 		// at 是这次拉取**结束**的时刻：日志按结束顺序落盘，用开始时刻会让
 		// 尾部的行在时间上不再单调，而面板就是按文件顺序从新到旧排的。
 		zap.Int64("at", r.now().Unix()),

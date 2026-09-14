@@ -74,6 +74,7 @@ func TestRuntime_FallsBackToDefaults(t *testing.T) {
 		convey.So(rt.OriginConcurrency, convey.ShouldEqual, defaultOriginConcurrency)
 		convey.So(rt.OriginTimeoutSeconds, convey.ShouldEqual, defaultOriginTimeoutSeconds)
 		convey.So(rt.OriginRetries, convey.ShouldEqual, defaultOriginRetries)
+		convey.So(rt.RecentRequestRetentionSeconds, convey.ShouldEqual, int64(86400))
 	})
 }
 

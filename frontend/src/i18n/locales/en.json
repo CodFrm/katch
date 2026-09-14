@@ -301,6 +301,7 @@
         "site": "Site",
         "cache": "Cache",
         "origin": "Origin",
+        "history": "History",
         "access": "Access"
       },
       "fields": {
@@ -311,6 +312,7 @@
         "watermark": "Reclaim watermark",
         "watermarkShort": "watermark",
         "mutableTTL": "Mutable object TTL",
+        "recentRequestRetention": "Recent request retention",
         "immutable": "Immutable objects",
         "concurrency": "Origin concurrency",
         "timeout": "Origin timeout",
@@ -324,6 +326,7 @@
         "publicHomepage": "Off: the homepage keeps only the input box, no upstreams or hit rate",
         "quota": "Crossing the watermark starts LRU reclaim",
         "mutableTTL": "Manifests, Release files, @latest — the objects that change",
+        "recentRequestRetention": "The only gate on how much disk this history takes: the longer the retention, the bigger the database, growing linearly with traffic",
         "immutable": "Content addressed, never expires, evicted by LRU only",
         "concurrency": "Requests hitting one upstream at the same time",
         "globalRules": "Evaluated before every upstream's own rules"

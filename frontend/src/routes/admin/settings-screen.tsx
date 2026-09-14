@@ -101,6 +101,7 @@ export function SettingsScreen({
       : edits.public_homepage === true
   const quota = readIntSetting(list, 'cache_quota_bytes')
   const ttl = readIntSetting(list, 'mutable_ttl_seconds')
+  const retention = readIntSetting(list, 'recent_request_retention_seconds')
   const timeout = readIntSetting(list, 'origin_timeout_seconds')
 
   return (
@@ -273,6 +274,22 @@ export function SettingsScreen({
           </div>
         </Row>
 
+        <Group label={t('admin.settings.groups.history')} />
+        <Row
+          label={t('admin.settings.fields.recentRequestRetention')}
+          htmlFor="setting-retention"
+          hint={t('admin.settings.hints.recentRequestRetention')}
+        >
+          <Input
+            id="setting-retention"
+            value={textValue('recent_request_retention_seconds', formatDuration(retention))}
+            onChange={(event) =>
+              editParsed('recent_request_retention_seconds', event.target.value, parseDuration)
+            }
+            className="w-[120px] rounded-none font-mono text-[13px] md:text-[13px]"
+          />
+        </Row>
+
         <Group label={t('admin.settings.groups.access')} />
         <Row label={t('admin.settings.fields.adminKey')}>
           <RotateKey adminKey={adminKey} onUnauthorized={onUnauthorized} onRotated={onKeyRotated} />
@@ -303,6 +320,7 @@ const NUMERIC_KEYS = new Set([
   'origin_concurrency',
   'origin_timeout_seconds',
   'origin_retries',
+  'recent_request_retention_seconds',
 ])
 
 function nowTime(): string {

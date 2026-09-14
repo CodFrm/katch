@@ -2,6 +2,7 @@ package setting_svc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"testing"
@@ -107,6 +108,45 @@ func TestVerifyAdminKey(t *testing.T) {
 			status, c := statusAndCode(t, Setting().VerifyAdminKey(ctx, "anything"))
 			convey.So(status, convey.ShouldEqual, http.StatusUnauthorized)
 			convey.So(c, convey.ShouldEqual, code.AdminKeyNotInitialized)
+		})
+	})
+}
+
+// TestRecentRequestRetentionSetting 覆盖「最近请求保留时长」这一项：
+// 默认一天，闭区间一小时到七天，写进去下一次读就是新的。
+func TestRecentRequestRetentionSetting(t *testing.T) {
+	convey.Convey("最近请求保留时长", t, func() {
+		repo := newMemorySettingRepo()
+		setting_repo.RegisterSetting(repo)
+		ctx := context.Background()
+
+		convey.Convey("库里没写过时默认一天", func() {
+			rt, err := Setting().Runtime(ctx)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(rt.RecentRequestRetentionSeconds, convey.ShouldEqual, int64(86400))
+		})
+
+		convey.Convey("写进去之后读回来的是新的值", func() {
+			// 界面上写的 `24h` 由前端解成秒，接口收到的是秒。
+			_, err := Setting().Save(ctx, saveRequest(map[string]json.RawMessage{
+				RecentRequestRetentionSecondsSetting: json.RawMessage(`604800`),
+			}))
+			convey.So(err, convey.ShouldBeNil)
+			rt, err := Setting().Runtime(ctx)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(rt.RecentRequestRetentionSeconds, convey.ShouldEqual, int64(604800))
+		})
+
+		convey.Convey("闭区间外（半小时、七天零一秒、0、负数）拦在保存这一步", func() {
+			for _, bad := range []string{`3599`, `604801`, `0`, `-1`} {
+				_, err := Setting().Save(ctx, saveRequest(map[string]json.RawMessage{
+					RecentRequestRetentionSecondsSetting: json.RawMessage(bad),
+				}))
+				_, c := statusAndCode(t, err)
+				convey.So(c, convey.ShouldEqual, code.SettingValueInvalid)
+				// 校验发生在写库之前：被拒的值不该留下一行。
+				convey.So(repo.findCount(RecentRequestRetentionSecondsSetting), convey.ShouldEqual, 0)
+			}
 		})
 	})
 }

@@ -120,6 +120,26 @@ echo "✓ 新上游第二次拉取由缓存服务（HIT），内容与回源逐�
 kill -0 "$PID" 2>/dev/null || fail "拉取过程中服务进程重启过"
 echo "✓ 从注册到命中全程是同一个进程，没有重启"
 
+# 最近请求面板：刚才那一行拉取明细经真实二进制落进真实 sqlite 的 recent_request，
+# 再经管理接口读回来。
+#
+# 落库是每秒一批（决策 4），刚拉完那一行还在进程内的环形缓冲里，所以断言前要
+# 等一拍：睡够一个落库周期再多给一点余量。
+sleep 2
+
+# 面板要 upstream_id。上游列表里字段顺序固定（id 在 host 之前），用 tr 把对象拆行
+# 后按 host 定位、取出同一行里的 id——脚本里没有 jq，只能靠这些文本框工具。
+UPSTREAM_ID=$(curl -s -H "Authorization: Bearer ${ADMIN_KEY}" "${BASE}/api/v1/admin/upstreams" \
+  | tr '{' '\n' \
+  | awk -v host="\"host\":\"${FAKE_HOST}\"" \
+      'index($0, host) && match($0, /"id":[0-9]+/) { print substr($0, RSTART+5, RLENGTH-5); exit }')
+[ -n "$UPSTREAM_ID" ] || fail "没能从上游列表里取出 ${FAKE_HOST} 的 id"
+
+curl -s -H "Authorization: Bearer ${ADMIN_KEY}" \
+  "${BASE}/api/v1/admin/logs/requests?upstream_id=${UPSTREAM_ID}&limit=10" \
+  | grep -q '"/version"' || fail "最近请求面板没有读到刚才那次拉取"
+echo "✓ 最近请求经真实库读得到刚才那次拉取"
+
 diff -q "$workdir/config.expect" "$workdir/config.yaml" > /dev/null \
   || fail "配置文件被进程改写了（只读配置源可能失效）"
 echo "✓ 配置文件未被改写"

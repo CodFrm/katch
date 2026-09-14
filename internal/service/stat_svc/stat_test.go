@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -521,4 +522,240 @@ func TestStat_UpstreamSeriesCarriesMissReasons(t *testing.T) {
 		// 补零的桶四项都是零，不是「没有这个字段」。
 		convey.So(got.List[0].MissFirst, convey.ShouldEqual, 0)
 	})
+}
+
+// TestStat_CloseHandleFlushesOnExit 退出前落一次：Run 的 ctx.Done 分支只 return，
+// 那一批由 CloseHandle 落（失败与降级一节）。周期设成一小时，中途一次 tick 都不会响。
+func TestStat_CloseHandleFlushesOnExit(t *testing.T) {
+	deps := setup(t, nil)
+	svc := New(Options{
+		Now:           func() time.Time { return time.Unix(testNow, 0) },
+		Drainer:       deps,
+		FlushInterval: time.Hour,
+		PruneInterval: time.Hour,
+	})
+	// Flush 顺带刷缓存占用指标，这一组用例验的是退出落库，所以把那条路放行。
+	deps.cache.EXPECT().SizeByUpstream(gomock.Any()).AnyTimes().Return(map[int64]int64{}, nil)
+	deps.cache.EXPECT().CountByUpstream(gomock.Any()).AnyTimes().Return(map[int64]int64{}, nil)
+	deps.upstream.EXPECT().List(gomock.Any()).AnyTimes().
+		Return([]*upstream_entity.Upstream{}, nil)
+
+	deps.drained = []metrics.Bucket{{
+		Host: "deb.debian.org", Bucket: 1700000040, Requests: 10, Hits: 6,
+	}}
+	deps.upstream.EXPECT().FindByHost(gomock.Any(), "deb.debian.org").
+		Return(&upstream_entity.Upstream{ID: 7, Host: "deb.debian.org", Enabled: true}, nil)
+	deps.rollup.EXPECT().FindByBucket(gomock.Any(), int64(7), int64(1700000040)).Return(nil, nil)
+	var saved *rollup_entity.TrafficRollup
+	deps.rollup.EXPECT().Save(gomock.Any(), gomock.Any()).
+		DoAndReturn(func(_ context.Context, row *rollup_entity.TrafficRollup) error {
+			saved = row
+			return nil
+		})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := svc.Start(ctx, nil); err != nil {
+		t.Fatalf("Start 失败：%v", err)
+	}
+	cancel()
+	// 等循环真的退出：此刻还不该有落库，否则就是退出落库没等循环退出。
+	<-svc.(*statSvc).runDone
+	if saved != nil {
+		t.Fatalf("循环退出时就落库了，退出那批应由 CloseHandle 落：%+v", saved)
+	}
+
+	svc.CloseHandle()
+
+	if saved == nil || saved.UpstreamID != 7 || saved.Requests != 10 || saved.Hits != 6 {
+		t.Fatalf("CloseHandle 没有把计数器落库：%+v", saved)
+	}
+}
+
+// TestStat_CloseHandleBoundsTheExitFlush 退出落库有上限（失败与降级一节）。
+//
+// main 里缓存那一趟收尾挂了 cacheDrainTimeout，这里是同一个理由：一个不响应的库
+// 不该把退出拖到只剩 SIGKILL。用例把落库卡在 ctx 上——只有 ctx 带截止时刻才能
+// 把它放走，所以 CloseHandle 能在上限内返回就说明它真的给自己留了那条退路。
+func TestStat_CloseHandleBoundsTheExitFlush(t *testing.T) {
+	deps := setup(t, nil)
+	svc := New(Options{
+		Now:              func() time.Time { return time.Unix(testNow, 0) },
+		Drainer:          deps,
+		FlushInterval:    time.Hour,
+		PruneInterval:    time.Hour,
+		ExitFlushTimeout: 100 * time.Millisecond,
+	})
+	// Flush 顺带刷缓存占用指标，这一组用例验的是退出落库，所以把那条路放行。
+	deps.cache.EXPECT().SizeByUpstream(gomock.Any()).AnyTimes().Return(map[int64]int64{}, nil)
+	deps.cache.EXPECT().CountByUpstream(gomock.Any()).AnyTimes().Return(map[int64]int64{}, nil)
+	deps.upstream.EXPECT().List(gomock.Any()).AnyTimes().
+		Return([]*upstream_entity.Upstream{}, nil)
+
+	deps.drained = []metrics.Bucket{{
+		Host: "deb.debian.org", Bucket: 1700000040, Requests: 10, Hits: 6,
+	}}
+	deps.upstream.EXPECT().FindByHost(gomock.Any(), "deb.debian.org").
+		Return(&upstream_entity.Upstream{ID: 7, Host: "deb.debian.org", Enabled: true}, nil)
+	deps.rollup.EXPECT().FindByBucket(gomock.Any(), int64(7), int64(1700000040)).Return(nil, nil)
+	deps.rollup.EXPECT().Save(gomock.Any(), gomock.Any()).
+		DoAndReturn(func(ctx context.Context, _ *rollup_entity.TrafficRollup) error {
+			// 一个不响应的库：谁来都只能等 ctx。
+			<-ctx.Done()
+			return ctx.Err()
+		})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := svc.Start(ctx, nil); err != nil {
+		t.Fatalf("Start 失败：%v", err)
+	}
+	cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		svc.CloseHandle()
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("库不响应时 CloseHandle 没有上限，把退出挂住了")
+	}
+}
+
+// stuckDrainer 第一趟 Drain 永远不返回（卡住的库/驱动连取消都不理），
+// 之后的趟数照常给空。
+type stuckDrainer struct {
+	entered chan struct{}
+	unblock chan struct{}
+	n       atomic.Int32
+}
+
+func (d *stuckDrainer) Drain() []metrics.Bucket {
+	if d.n.Add(1) == 1 {
+		close(d.entered)
+		<-d.unblock
+	}
+	return nil
+}
+
+// TestStat_CloseHandleBoundsTheLoopWait 循环卡住时退出也不能被挂住。
+//
+// 等循环退出同样有上限：这一趟落库卡在 Drain 里，取消也拉不出来，CloseHandle
+// 不能跟它一起等下去。
+func TestStat_CloseHandleBoundsTheLoopWait(t *testing.T) {
+	deps := setup(t, nil)
+	stuck := &stuckDrainer{entered: make(chan struct{}), unblock: make(chan struct{})}
+	svc := New(Options{
+		Now:              func() time.Time { return time.Unix(testNow, 0) },
+		Drainer:          stuck,
+		FlushInterval:    10 * time.Millisecond,
+		PruneInterval:    time.Hour,
+		ExitFlushTimeout: 100 * time.Millisecond,
+	})
+	// Flush 顺带刷缓存占用指标，这一组用例验的是退出，所以把那条路放行。
+	deps.cache.EXPECT().SizeByUpstream(gomock.Any()).AnyTimes().Return(map[int64]int64{}, nil)
+	deps.cache.EXPECT().CountByUpstream(gomock.Any()).AnyTimes().Return(map[int64]int64{}, nil)
+	deps.upstream.EXPECT().List(gomock.Any()).AnyTimes().
+		Return([]*upstream_entity.Upstream{}, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := svc.Start(ctx, nil); err != nil {
+		t.Fatalf("Start 失败：%v", err)
+	}
+	// 等循环真的进到那一趟落库里再取消：它此刻卡在 Drain 上。
+	select {
+	case <-stuck.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("循环没有按周期进到落库里")
+	}
+	cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		svc.CloseHandle()
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("循环卡住时 CloseHandle 没有上限，把退出挂住了")
+	}
+
+	// 放走卡住的循环再收工：不让它在收尾阶段还停在探针里。
+	close(stuck.unblock)
+	<-svc.(*statSvc).runDone
+}
+
+// TestStat_CloseHandleWithoutStart Start 没跑过时 CloseHandle 是空操作。
+//
+// 没有循环要等，也不该凭空去碰库：这一组用例一个 mock 预期都没给，真的落了库会
+// 因为非预期调用当场失败。
+func TestStat_CloseHandleWithoutStart(t *testing.T) {
+	deps := setup(t, nil)
+	svc := New(Options{
+		Now:           func() time.Time { return time.Unix(testNow, 0) },
+		Drainer:       deps,
+		FlushInterval: time.Hour,
+		PruneInterval: time.Hour,
+	})
+	deps.drained = []metrics.Bucket{{Host: "deb.debian.org", Bucket: 1700000040, Requests: 1}}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		svc.CloseHandle()
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Start 没跑过时 CloseHandle 阻塞了")
+	}
+}
+
+// TestStat_CloseHandleTwice CloseHandle 被调两次：第二次面对的是空计数器，
+// 不重复落库也不阻塞（testDeps.Drain 取走即清空，和 metrics 的约定一致）。
+func TestStat_CloseHandleTwice(t *testing.T) {
+	deps := setup(t, nil)
+	svc := New(Options{
+		Now:              func() time.Time { return time.Unix(testNow, 0) },
+		Drainer:          deps,
+		FlushInterval:    time.Hour,
+		PruneInterval:    time.Hour,
+		ExitFlushTimeout: time.Second,
+	})
+	deps.cache.EXPECT().SizeByUpstream(gomock.Any()).AnyTimes().Return(map[int64]int64{}, nil)
+	deps.cache.EXPECT().CountByUpstream(gomock.Any()).AnyTimes().Return(map[int64]int64{}, nil)
+	deps.upstream.EXPECT().List(gomock.Any()).AnyTimes().
+		Return([]*upstream_entity.Upstream{}, nil)
+
+	deps.drained = []metrics.Bucket{{
+		Host: "deb.debian.org", Bucket: 1700000040, Requests: 10, Hits: 6,
+	}}
+	// 各 Times(1)：第二次 CloseHandle 再去查上游或写库都会当场失败。
+	deps.upstream.EXPECT().FindByHost(gomock.Any(), "deb.debian.org").
+		Return(&upstream_entity.Upstream{ID: 7, Host: "deb.debian.org", Enabled: true}, nil)
+	deps.rollup.EXPECT().FindByBucket(gomock.Any(), int64(7), int64(1700000040)).Return(nil, nil)
+	deps.rollup.EXPECT().Save(gomock.Any(), gomock.Any()).Return(nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := svc.Start(ctx, nil); err != nil {
+		t.Fatalf("Start 失败：%v", err)
+	}
+	cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		svc.CloseHandle()
+		svc.CloseHandle()
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("CloseHandle 调两次时阻塞了")
+	}
 }

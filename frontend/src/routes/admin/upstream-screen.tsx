@@ -165,7 +165,7 @@ export function UpstreamScreen({
               </div>
             )}
             {/* 上面两块答的是「这段时间总共怎么样」，这张表答「刚刚发生了什么」——
-                它读的是结构化日志的尾部，读不到时自己整块消失。 */}
+                它读的是 recent_request 这张明细表，读不到时自己整块消失。 */}
             <RecentRequests
               adminKey={adminKey}
               upstreamID={upstreamID}

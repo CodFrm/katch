@@ -9,8 +9,11 @@ package stat_svc
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 
+	"github.com/cago-frame/cago"
+	"github.com/cago-frame/cago/configs"
 	"github.com/cago-frame/cago/pkg/logger"
 	"go.uber.org/zap"
 
@@ -40,6 +43,12 @@ const (
 	defaultPruneInterval = time.Hour
 	// secondsPerDay 一天有多少秒，逐日序列分桶用。
 	secondsPerDay = 86400
+	// defaultExitFlushTimeout 退出时落最后一批的上限。
+	//
+	// 和 cmd/katch/main.go 里缓存那一趟收尾（cacheDrainTimeout）同一个理由：一个
+	// 卡住的库不该把退出拖到天荒地老。正常收尾只差一条 upsert，是毫秒级的事；
+	// 等满这个上限，说明库真的不响应了，那就记一条日志然后走人。
+	defaultExitFlushTimeout = 30 * time.Second
 )
 
 // rangeSeconds 界面上可选的三个区间。
@@ -78,10 +87,19 @@ type Options struct {
 	// FlushInterval、PruneInterval 两个定时任务的周期，0 按默认值。
 	FlushInterval time.Duration
 	PruneInterval time.Duration
+	// ExitFlushTimeout 退出时等循环收尾、以及落最后一批的上限，0 按默认值。
+	//
+	// 上限是必须的（见 CloseHandle）：一个不响应的库不该把退出拖到只剩 SIGKILL。
+	ExitFlushTimeout time.Duration
 }
 
 // StatSvc 统计的业务操作。
+//
+// 它是一个 cago.Component：Start 起落库循环，CloseHandle 同步落退出那批。
+// 这样它排在了数据库的 CloseHandle 之前（框架按注册逆序关组件），
+// 「退出前落一次」不再和框架关库赛跑。
 type StatSvc interface {
+	cago.Component
 	// Overview 全站区间总览，供公开的首页用。
 	Overview(ctx context.Context, req *stat.OverviewRequest) (*stat.OverviewResponse, error)
 	// ByUpstream 按上游的区间统计，附带此刻的降级状态。
@@ -100,6 +118,13 @@ type StatSvc interface {
 
 type statSvc struct {
 	opt Options
+
+	// startMu 护住 Start 记下的两个字段：CloseHandle 可能从别的 goroutine 读。
+	startMu sync.Mutex
+	// startCtx 是 Start 收到的那个 ctx。CloseHandle 去掉它的取消后落退出那批。
+	startCtx context.Context
+	// runDone 在 Start 起的循环退出后关闭，CloseHandle 先等它。
+	runDone chan struct{}
 }
 
 // New 构造统计层。
@@ -115,6 +140,9 @@ func New(opt Options) StatSvc {
 	}
 	if opt.PruneInterval <= 0 {
 		opt.PruneInterval = defaultPruneInterval
+	}
+	if opt.ExitFlushTimeout <= 0 {
+		opt.ExitFlushTimeout = defaultExitFlushTimeout
 	}
 	return &statSvc{opt: opt}
 }
@@ -516,10 +544,67 @@ func normalizeRange(name string) (string, int64) {
 	return name, seconds
 }
 
+// Start 起落库循环，并记下循环结束的信号，由框架在注册组件时调用。
+//
+// 循环跑在 goroutine 里：Start 必须立刻返回，否则框架的注册会被一个
+// 要跑到进程退出的循环卡住。
+func (s *statSvc) Start(ctx context.Context, _ *configs.Config) error {
+	done := make(chan struct{})
+	s.startMu.Lock()
+	s.startCtx = ctx
+	s.runDone = done
+	s.startMu.Unlock()
+	go func() {
+		defer close(done)
+		s.Run(ctx)
+	}()
+	return nil
+}
+
+// CloseHandle 等循环退出，再用没被取消的 ctx 落最后一次。
+//
+// 框架停止时先取消所有组件的 ctx，再同步调 CloseHandle，最后才 gogo.Wait()：
+// 这里同步落库，排在数据库 CloseHandle 之前，不再和关库赛跑。用
+// context.WithoutCancel 而不是已经取消的 ctx，否则这一批必然写不进去。
+//
+// 等循环与落这一批都带 ExitFlushTimeout：框架调 CloseHandle 没有任何超时，
+// 而 WithoutCancel 又把取消那条退路拿掉了，不留上限的话一个不响应的库会把退出
+// 挂到只剩 SIGKILL（和 main 里缓存收尾的 cacheDrainTimeout 同一条理由）。
+func (s *statSvc) CloseHandle() {
+	s.startMu.Lock()
+	done := s.runDone
+	ctx := s.startCtx
+	s.startMu.Unlock()
+	if ctx == nil {
+		// Start 没跑过，没有循环要等，也没有退出那批要落。
+		return
+	}
+	if done != nil {
+		// 循环自己那一趟落库用的是已经取消的 ctx，正常的库上它是立刻返回的；
+		// 卡在库上时，退出不该跟着一起挂住。
+		timer := time.NewTimer(s.opt.ExitFlushTimeout)
+		defer timer.Stop()
+		select {
+		case <-done:
+		case <-timer.C:
+			logger.Ctx(ctx).Warn("落库循环没能在退出前收尾",
+				zap.Duration("timeout", s.opt.ExitFlushTimeout))
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.opt.ExitFlushTimeout)
+	defer cancel()
+	if err := s.Flush(ctx); err != nil {
+		logger.Ctx(ctx).Error("退出前落分钟桶失败", zap.Error(err))
+	}
+}
+
 // Run 跑定时的落库与裁剪。
 //
 // 用 ticker 而不是 cron 组件：cron 要配置文件里有对应的段，而落库周期是
 // 「进程跑起来就该有」的东西，不该多一个配不好就不统计的开关。
+//
+// 退出那批不在这里落：CloseHandle 等这个循环退出之后才落，那才是
+// 数据库关闭之前的最后一个同步点。
 func (s *statSvc) Run(ctx context.Context) {
 	flush := time.NewTicker(s.opt.FlushInterval)
 	defer flush.Stop()
@@ -528,11 +613,8 @@ func (s *statSvc) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			// 退出前再落一次：否则最后不到一分钟的量会随进程一起消失。
-			// 这里不能再用已经取消的 ctx，落库会当场失败。
-			if err := s.Flush(context.WithoutCancel(ctx)); err != nil {
-				logger.Ctx(ctx).Error("退出前落分钟桶失败", zap.Error(err))
-			}
+			// 退出那批由 CloseHandle 落：它先等这个循环退出，再在数据库
+			// 关闭之前同步落库。
 			return
 		case <-flush.C:
 			if err := s.Flush(ctx); err != nil {

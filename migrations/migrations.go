@@ -13,6 +13,7 @@ import (
 
 	"github.com/CodFrm/katch/internal/model/entity/cache_entity"
 	"github.com/CodFrm/katch/internal/model/entity/event_entity"
+	"github.com/CodFrm/katch/internal/model/entity/request_log_entity"
 	"github.com/CodFrm/katch/internal/model/entity/rollup_entity"
 	"github.com/CodFrm/katch/internal/model/entity/rule_entity"
 	"github.com/CodFrm/katch/internal/model/entity/setting_entity"
@@ -28,6 +29,7 @@ func migrationList() []*gormigrate.Migration {
 		accessRule(),
 		event(),
 		trafficRollupMissReasons(),
+		recentRequest(),
 	}
 }
 
@@ -394,6 +396,62 @@ func trafficRollupMissReasons() *gormigrate.Migration {
 				}
 			}
 			return nil
+		},
+	}
+}
+
+// recentRequest 建「最近请求」明细表。
+//
+// 它和 traffic_rollups 问的不是同一个问题：那张表可加（每分钟一行，留 90 天），
+// 这张表不可加（每请求一行，保留时长由设置决定）。合成一张会让两者互相迁就。
+//
+// 两条索引各有唯一的走法：面板按上游取最近 N 条走 (upstream_id, at)，保留期裁剪
+// 只看 at 走 (at)。没有别的索引——写入发生在每一次拉取之后，多一棵树就是每个
+// 请求多付一次维护成本。
+func recentRequest() *gormigrate.Migration {
+	return &gormigrate.Migration{
+		ID: "20260914000001_recent_request",
+		Migrate: func(tx *gorm.DB) error {
+			table, err := tableName(tx, &request_log_entity.RecentRequest{})
+			if err != nil {
+				return err
+			}
+			autoPK := "BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY"
+			if tx.Name() == "sqlite" {
+				autoPK = "INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT"
+			}
+			stmts := []string{
+				// at 是这次拉取**结束**的时刻（秒），裁剪与排序都按它。
+				// object 取 512，和 upstream.origin 同一个量级：它是上游内的路径，
+				// 不进索引，所以不受 InnoDB 索引键上限的约束。
+				fmt.Sprintf("CREATE TABLE `%s` ("+
+					"`id` %s,"+
+					"`upstream_id` BIGINT NOT NULL DEFAULT 0,"+
+					"`at` BIGINT NOT NULL DEFAULT 0,"+
+					"`object` VARCHAR(512) NOT NULL DEFAULT '',"+
+					"`result` VARCHAR(32) NOT NULL DEFAULT '',"+
+					"`bytes` BIGINT NOT NULL DEFAULT 0,"+
+					"`duration_ms` BIGINT NOT NULL DEFAULT 0,"+
+					"`createtime` BIGINT NOT NULL DEFAULT 0,"+
+					"`updatetime` BIGINT NOT NULL DEFAULT 0)", table, autoPK),
+				// 面板：WHERE upstream_id = ? ORDER BY at DESC, id DESC LIMIT ?。
+				fmt.Sprintf("CREATE INDEX `idx_%s_upstream_at` ON `%s` (`upstream_id`, `at`)", table, table),
+				// 保留期裁剪：WHERE at < ?。跨全部上游，单独一条。
+				fmt.Sprintf("CREATE INDEX `idx_%s_at` ON `%s` (`at`)", table, table),
+			}
+			for _, stmt := range stmts {
+				if err := tx.Exec(stmt).Error; err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			table, err := tableName(tx, &request_log_entity.RecentRequest{})
+			if err != nil {
+				return err
+			}
+			return tx.Exec(fmt.Sprintf("DROP TABLE IF EXISTS `%s`", table)).Error
 		},
 	}
 }
