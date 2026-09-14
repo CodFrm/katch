@@ -1,0 +1,67 @@
+# katch 的单机编排：一个容器 + 一个卷，没有别的。
+#
+#   cp deploy/config.yaml.example deploy/config.yaml   # 改掉 admin.initialKey
+#   docker compose -f deploy/docker-compose.yml up -d
+#
+# 前端是 //go:embed 进二进制的，由 katch 自己同源提供——**不需要再配 nginx**。
+# 要 TLS 的话在前面加一层反代或 Cloudflare 之类，注意那一层必须关掉响应缓冲，
+# 理由见 docs/deploy.md 的「放在反代后面」。
+#
+# 这里没有 MySQL：默认 sqlite 就是单文件，而切 MySQL 也换不来多副本
+# （docs/deploy.md 的「为什么只能一个副本」），编排里摆一个只会让人误以为可以。
+
+name: katch
+
+services:
+  katch:
+    image: ghcr.io/codfrm/katch:0.1.0
+    container_name: katch
+    restart: unless-stopped
+
+    ports:
+      # 只发布到回环上会让同网段的机器用不了；要对公网暴露就把左边换成 80/443
+      # 那一侧的反代，别直接把 8080 甩出去——katch 自己不做 TLS。
+      - "8080:8080"
+
+    volumes:
+      # 配置是只读挂载：进程本来就不该写它（bootstrap 那个只读配置源就是为此存在），
+      # :ro 让「万一写了」在文件系统这一层就失败，而不是悄悄把注释擦掉。
+      - ./config.yaml:/app/configs/config.yaml:ro
+      # 库文件、缓存对象、日志全在这一个卷里（见 config.yaml.example 里日志路径的注释）。
+      - katch-data:/app/data
+
+    # 根文件系统只读：katch 要写的地方只有上面那个卷。这不是纯粹的洁癖——
+    # 一个把公网内容拉进来的进程，能写的面越小越好。
+    read_only: true
+    tmpfs:
+      # sqlite 在排序、VACUUM 这类操作上可能落临时文件到 TMPDIR。缓存对象的临时
+      # 文件不走这里（它们在缓存目录下的 tmp/，见 internal/cache/store.go）。
+      - /tmp
+
+    # 45 秒不是随手写的：进程退出时会给「脱离客户端在后台跑的回源下载」一个
+    # 收尾窗口，上限是 cmd/katch/main.go 里的 cacheDrainTimeout = 30s。
+    # compose 默认只给 10 秒就 SIGKILL，正好会把那段收尾拦腰砍断，
+    # 盘上留下一个刚提交、记录还没写完的对象。
+    stop_grace_period: 45s
+
+    healthcheck:
+      # 探针打的是 /api/v1/system/version：它只读编译期注入的 buildinfo，一个字节
+      # 都不碰数据库。这是刻意的——库挂掉时拉取路径仍然靠磁盘缓存服务，那时候
+      # 把容器判死并重启，反而是把唯一还能用的那部分也弄没了。
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/api/v1/system/version"]
+      interval: 30s
+      timeout: 3s
+      # 起步宽松一点：首次启动要跑完全部迁移。
+      start_period: 20s
+      retries: 3
+
+    logging:
+      # 不限制的话，一台忙的镜像站能把宿主机磁盘写满——容器的 stdout 默认是
+      # 无上限的 json 文件。文件日志那一份由 lumberjack 自己轮转，不受这里管。
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  katch-data:

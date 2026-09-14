@@ -1,0 +1,47 @@
+katch {{ .Chart.AppVersion }} 已装到 {{ .Release.Namespace }}/{{ include "katch.fullname" . }}。
+
+{{- if not .Values.existingSecret }}
+{{- if not .Values.config.admin.initialKey }}
+
+⚠️  admin.initialKey 是空的，管理接口现在**全量 401**，你登不进后台。
+    拉取路径不受影响，照常服务。补上：
+
+      helm upgrade {{ .Release.Name }} ... --set config.admin.initialKey=$(openssl rand -hex 24)
+
+    注意它只在库中尚无密钥时生效一次。
+{{- else if eq .Values.config.admin.initialKey "change-me-before-exposing-katch" }}
+
+⚠️  admin.initialKey 还是模板里的占位值，等于后台没有密码。现在就换掉：
+
+      helm upgrade {{ .Release.Name }} ... --set config.admin.initialKey=$(openssl rand -hex 24)
+{{- end }}
+{{- end }}
+
+1. 打开界面：
+{{- if .Values.ingress.enabled }}
+{{- range $host := .Values.ingress.hosts }}
+{{- range .paths }}
+     http{{ if $.Values.ingress.tls }}s{{ end }}://{{ $host.host }}{{ .path }}
+{{- end }}
+{{- end }}
+{{- else }}
+     kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "katch.fullname" . }} 8080:{{ .Values.service.port }}
+     # 然后开 http://127.0.0.1:8080 ，后台在 /admin
+{{- end }}
+
+2. 上游表出厂是空的，而它同时就是白名单——不加记录，任何主机都是 404。
+   在后台「上游 → 添加上游」里加，或者：
+
+     curl -X POST http://<katch>/api/v1/admin/upstreams \
+       -H "Authorization: Bearer <管理密钥>" -H 'Content-Type: application/json' \
+       -d '{"host":"docker.io","kind":"registry","origin":"https://registry-1.docker.io",
+            "enabled":true,"library_completion":true,"mutable_ttl_seconds":300}'
+
+3. 这个 release 恒为 1 个副本，chart 也没有 replicaCount。
+   原因见 docs/deploy.md 的「为什么只能一个副本」——简单说：进程内的上游白名单
+   和设置缓存没有 TTL，只在本进程写入时失效，多副本会让「停用了却还在回源」
+   永久存在。
+{{- if not .Values.persistence.enabled }}
+
+4. persistence.enabled=false：Pod 一重建，缓存、库、统计历史全没。别这么上生产。
+{{- end }}

@@ -1,0 +1,195 @@
+# katch 的 Helm values。
+#
+# 注意这个 chart **没有 replicaCount**。不是漏了——katch 现在只能跑一个副本，
+# 理由见 docs/deploy.md 的「为什么只能一个副本」和 templates/deployment.yaml 里
+# replicas 那一行的注释。
+
+image:
+  repository: ghcr.io/codfrm/katch
+  # 留空则用 Chart.yaml 的 appVersion。
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# ── 配置 ────────────────────────────────────────────────────────────────
+# 下面整个 config 段会被原样序列化成容器里的 /app/configs/config.yaml，
+# 装在一个 Secret 里（里面有管理密钥和 DSN，所以是 Secret 不是 ConfigMap）。
+#
+# 只想改其中一项就用 --set，比如：
+#   --set config.admin.initialKey=$(openssl rand -hex 24)
+#
+# 想完全自己管这份文件，就用 existingSecret（键名必须是 config.yaml），
+# 那时下面的 config 段整个不参与渲染。
+existingSecret: ""
+
+config:
+  # debug 决定 gin 的模式（cago 的 mux.HTTP 只看这一个字段，不看 env）。
+  # 留 true 会给每个请求多打一行日志——一次 docker pull 是几十上百个请求。
+  env: prod
+  debug: false
+  # source 不能省，cago 的 Config.init() 会无条件读这个键。
+  source: file
+
+  http:
+    address:
+      - "0.0.0.0:8080"
+
+  logger:
+    level: info
+    # 不关 console：kubectl logs 是排障的第一现场。
+    disableConsole: false
+    logFile:
+      # 后台的「最近请求」读的就是这个文件的有界尾部，关掉那一块会整块消失。
+      enable: true
+      # 落在数据卷里：根文件系统是只读的，而且容器重建后那块界面还得看得见。
+      filename: ./data/logs/katch.log
+      errorFilename: ./data/logs/katch.err.log
+
+  db:
+    # sqlite 驱动是纯 Go 的 modernc.org/sqlite，落地就是数据卷里的一个文件。
+    # 切 mysql 改这一段即可，但**换不来多副本**，见 docs/deploy.md。
+    driver: sqlite
+    dsn: "file:./data/katch.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+    prefix: katch_
+    debug: false
+    maxOpenConns: 8
+    maxIdleConns: 4
+    connMaxLifetime: 30m
+    connMaxIdleTime: 5m
+
+  cache:
+    # cache/ 和 logs/ 进程自己建，但 ./data 本身必须存在——sqlite 不建父目录，
+    # 缺了它启动就 panic（报的是 "out of memory (14)"，一个字都没提目录）。
+    # /app/data 是挂载点，所以正常情况下总是在的。
+    # 缓存目录单独不可写是另一回事：那时降级为纯透传，命中率一直是 0 但不崩。
+    dir: ./data/cache
+
+  admin:
+    # **装之前改掉**：--set config.admin.initialKey=$(openssl rand -hex 24)
+    # 这是初始密钥，只在库中尚无密钥时落一次；之后的轮换在界面上完成。
+    # 留空则不设密钥：管理接口全量 401，拉取路径照常服务。
+    initialKey: ""
+
+# ── 存储 ────────────────────────────────────────────────────────────────
+persistence:
+  # 关掉就是 emptyDir：Pod 一重建，缓存、库、日志全没。只适合拿来试一下。
+  enabled: true
+  existingClaim: ""
+  # 留空用集群默认 StorageClass。
+  storageClass: ""
+  # 只能是 ReadWriteOnce：副本恒为 1，RWX 除了更难要到没有任何收益。
+  accessModes:
+    - ReadWriteOnce
+  # 缓存配额是在界面「设置」里配的运行时项，它必须留在这个数字**以下**——
+  # katch 按配额回收，撑破的是卷而不是配额。
+  size: 50Gi
+  annotations: {}
+
+# ── 网络 ────────────────────────────────────────────────────────────────
+service:
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: nginx
+  annotations:
+    # 下面这几条不是可选的调优，装 ingress 时基本都得有——理由见
+    # docs/deploy.md 的「放在反代后面」。默认写的是 ingress-nginx 的键名，
+    # 换别的 controller 要翻成对应的写法。
+    #
+    # 关响应缓冲：不关的话，一个几 GB 的镜像层会先被 ingress 整个收下来再转给
+    # 客户端，既把首字节推迟到整体下载完成，又能把 ingress 的盘写满。
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    # 0 = 不限。大对象在慢网络上会传很久，默认 60s 会在中途把连接切断。
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "900"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "900"
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+  hosts:
+    - host: katch.example.com
+      paths:
+        # 必须是整个 /：路径的第一段是上游主机名，按前缀挑路径等于把上游挑着代理。
+        - path: /
+          pathType: Prefix
+  tls: []
+  #  - secretName: katch-tls
+  #    hosts:
+  #      - katch.example.com
+
+# ── 运行 ────────────────────────────────────────────────────────────────
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    # 不设 cpu limit 是有意的：回源是 IO 密集的，节流只会让拉取变慢而不省什么。
+    # 内存要给够——响应体是 io.Copy 流式转发的，但并发拉取时每条连接都有缓冲。
+    memory: 1Gi
+
+# 45 秒不是随手写的：进程退出时会给后台回源下载一个收尾窗口，上限是
+# cmd/katch/main.go 里的 cacheDrainTimeout = 30s。k8s 默认 30s 会正好把它砍断。
+terminationGracePeriodSeconds: 45
+
+podSecurityContext:
+  # 镜像里没有建非 root 用户，/app 是 root 的。能以 65532 跑起来全靠 fsGroup：
+  # kubelet 会把卷 chgrp 成这个组并加上组写权限，而进程要写的只有那个卷。
+  # 改 runAsUser 时 fsGroup 要跟着改，否则新用户写不进数据卷。
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  # 根文件系统只读：katch 要写的地方只有数据卷。一个把公网内容拉进来的进程，
+  # 能写的面越小越好。
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+livenessProbe:
+  # 探针打 /api/v1/system/version：它只读编译期注入的 buildinfo，不碰数据库。
+  # 这是刻意的——库挂掉时拉取路径仍然靠磁盘缓存服务，那时把 Pod 判死重启，
+  # 等于把唯一还能用的那部分也弄没了。
+  initialDelaySeconds: 5
+  periodSeconds: 30
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+readinessProbe:
+  initialDelaySeconds: 3
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+startupProbe:
+  # 首次启动要跑完全部迁移，给足时间：30 × 2s = 60s。
+  periodSeconds: 2
+  failureThreshold: 30
+
+# ── 监控 ────────────────────────────────────────────────────────────────
+metrics:
+  # /metrics 一直都在，不需要开关——这里开的只是 Prometheus Operator 的采集对象。
+  # 界面上的命中率不依赖它（走的是库里的分钟桶），装不装都不影响后台能看。
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    # 有些 Prometheus 实例靠标签挑 ServiceMonitor，按你集群的约定填。
+    labels: {}
+    relabelings: []
+    metricRelabelings: []
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""

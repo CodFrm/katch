@@ -1,0 +1,114 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: katch
+  labels:
+    app.kubernetes.io/name: katch
+    app.kubernetes.io/instance: katch
+spec:
+  # replicas 恒为 1。
+  #
+  # katch 在进程内缓存了上游白名单和设置表（proxy_svc.NewCachedUpstreamRepo /
+  # setting_svc.NewCachedSettingRepo），这两层缓存都**没有 TTL**，只在本进程写入时
+  # 失效。多开一个副本，在 A 上停用的上游会在 B 上一直活着——不是延迟几秒，是永远，
+  # 直到那个 Pod 被重建。「界面上停了但还在回源」在生产上极难发现。
+  # 换 MySQL 也解决不了：失效是进程内的事，和存哪没关系。
+  replicas: 1
+  strategy:
+    # 必须是 Recreate。RWO 的 PVC 同一时刻只能被一个节点挂上，滚动更新会让新 Pod
+    # 卡在 ContainerCreating 等旧 Pod 放开卷，而旧 Pod 要等新 Pod 就绪才会退——
+    # 死锁，且表现为「升级卡住了」而不是任何一条明确的报错。
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: katch
+      app.kubernetes.io/instance: katch
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: katch
+        app.kubernetes.io/instance: katch
+    spec:
+      securityContext:
+        # 镜像里没有建非 root 用户，/app 是 root 的。能以 65532 跑起来全靠 fsGroup：
+        # kubelet 会把卷 chgrp 成这个组并加上组写权限，而进程要写的只有那个卷。
+        # 改 runAsUser 时 fsGroup 要跟着改。
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      # 45 秒不是随手写的：进程退出时会给后台回源下载一个收尾窗口，上限是
+      # cmd/katch/main.go 里的 cacheDrainTimeout = 30s。k8s 默认 30s 会正好砍断它。
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: katch
+          image: ghcr.io/codfrm/katch:0.1.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            # 根文件系统只读：katch 要写的地方只有数据卷。
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          # 三个探针打的都是 /api/v1/system/version：它只读编译期注入的 buildinfo，
+          # 一个字节都不碰数据库。这是刻意的——库挂掉时拉取路径仍然靠磁盘缓存服务，
+          # 那时候把 Pod 判死重启，等于把唯一还能用的那部分也弄没了。
+          startupProbe:
+            httpGet:
+              path: /api/v1/system/version
+              port: http
+            # 首次启动要跑完全部迁移，给足 30 × 2s = 60s。
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /api/v1/system/version
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /api/v1/system/version
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              # 不设 cpu limit 是有意的：回源是 IO 密集的，节流只会让拉取变慢。
+              memory: 1Gi
+          volumeMounts:
+            - name: config
+              mountPath: /app/configs
+              readOnly: true
+            # 库文件、缓存对象、日志都在这一个卷里。不用 subPath 是因为 kubelet
+            # 建出来的 subPath 目录是 root:root 0755，fsGroup 管不到它，
+            # 而容器以 65532 跑——写不进去，症状是启动即 panic。
+            - name: data
+              mountPath: /app/data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          secret:
+            secretName: katch
+        - name: data
+          persistentVolumeClaim:
+            claimName: katch-data
+        - name: tmp
+          # 根文件系统只读，而 sqlite 在排序、VACUUM 这类操作上可能落临时文件到
+          # TMPDIR。缓存对象的临时文件不走这里（在缓存目录下的 tmp/）。
+          emptyDir: {}

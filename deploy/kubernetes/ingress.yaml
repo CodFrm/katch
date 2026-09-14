@@ -1,0 +1,38 @@
+# 改掉 host 之后，在 kustomization.yaml 的 resources 里放开这一条。
+#
+# 注解写的是 ingress-nginx 的键名，换别的 controller 要翻成对应写法。
+# 这几条不是可选的调优，理由见 docs/deploy.md 的「放在反代后面」。
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: katch
+  labels:
+    app.kubernetes.io/name: katch
+    app.kubernetes.io/instance: katch
+  annotations:
+    # 关响应缓冲：不关的话，一个几 GB 的镜像层会先被 ingress 整个收下来再转给
+    # 客户端，既把首字节推迟到整体下载完成，又能把 ingress 的盘写满。
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    # 大对象在慢网络上会传很久，默认 60s 会在中途把连接切断。
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "900"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "900"
+    # 0 = 不限。
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: katch.example.com
+      http:
+        paths:
+          # 必须是整个 /：路径的第一段是上游主机名，按前缀挑路径等于把上游挑着代理。
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: katch
+                port:
+                  number: 8080
+  # tls:
+  #   - secretName: katch-tls
+  #     hosts:
+  #       - katch.example.com

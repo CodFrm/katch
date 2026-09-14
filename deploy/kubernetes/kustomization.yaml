@@ -1,0 +1,30 @@
+# 不想用 Helm 时的那条路：
+#
+#   kubectl apply -k deploy/kubernetes/
+#
+# 这一组 YAML 和 deploy/helm/katch 默认值渲染出来的东西是等价的，只是把值写死了。
+# 两边是**两份**，改了一边记得看另一边——deploy/kubernetes/ 里所有非显然的取值
+# （replicas: 1、Recreate、探针打 version、grace period 45s）在 chart 的模板里都有
+# 同样的注释，那边是解释得更全的一份。
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: katch
+
+resources:
+  - namespace.yaml
+  - secret.yaml
+  - pvc.yaml
+  - deployment.yaml
+  - service.yaml
+  # ingress.yaml 默认不在这里：里面的 host 是 katch.example.com，照着 apply
+  # 只会建出一条谁也访问不到的规则。改掉 host 之后把下面这行放开。
+  # - ingress.yaml
+
+# 这里**不**用 commonLabels/labels 转换器：它会把标签一并注进 Deployment 的
+# spec.selector.matchLabels，而 selector 装上之后就是不可变字段——以后想加一个
+# 公共标签，得先把 Deployment 删掉重建。标签直接写在各个资源的 metadata 里。
+
+images:
+  - name: ghcr.io/codfrm/katch
+    newTag: "0.1.0"

@@ -1,0 +1,123 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "katch.fullname" . }}
+  labels:
+    {{- include "katch.labels" . | nindent 4 }}
+spec:
+  # replicas 写死 1，**不开放成 values**。
+  #
+  # katch 在进程内缓存了上游白名单和设置表（proxy_svc.NewCachedUpstreamRepo /
+  # setting_svc.NewCachedSettingRepo），这两层缓存都**没有 TTL**，只在本进程写入时
+  # 失效。多开一个副本，在 A 上停用的上游会在 B 上一直活着——不是延迟几秒，是永远，
+  # 直到那个 Pod 被重建。「界面上停了但还在回源」在生产上极难发现。
+  #
+  # 换 MySQL 也解决不了：失效是进程内的事，和存哪没关系。要横向扩，得先让这两层
+  # 缓存能跨进程失效。
+  replicas: 1
+  strategy:
+    # 必须是 Recreate。RWO 的 PVC 同一时刻只能被一个节点挂上，滚动更新会让新 Pod
+    # 卡在 ContainerCreating 等旧 Pod 放开卷，而旧 Pod 要等新 Pod 就绪才会退——
+    # 死锁，且表现为「升级卡住了」而不是任何一条明确的报错。
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "katch.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        # 配置变了就重建 Pod。没有这一条，helm upgrade 改掉密钥或 DSN 之后
+        # Pod 照旧跑着老配置，而 helm 会告诉你升级成功了。
+        checksum/config: {{ include "katch.configYaml" . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "katch.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      containers:
+        - name: katch
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          # 三个探针打的都是 /api/v1/system/version：它只读编译期注入的 buildinfo，
+          # 一个字节都不碰数据库。这是刻意的——库挂掉时拉取路径仍然靠磁盘缓存服务，
+          # 那时候把 Pod 判死重启，等于把唯一还能用的那部分也弄没了。
+          # 库的健康状况在界面上看（管理接口那时会答 503），不在探针上看。
+          startupProbe:
+            httpGet:
+              path: /api/v1/system/version
+              port: http
+            {{- toYaml .Values.startupProbe | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /api/v1/system/version
+              port: http
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /api/v1/system/version
+              port: http
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            # 整个目录挂进去而不是 subPath：subPath 的内容不会跟着 Secret 更新，
+            # 而这里正好相反——上面那条 checksum 注解已经保证配置一变就重建 Pod，
+            # 目录挂载读到的必然是新的那份。
+            - name: config
+              mountPath: /app/configs
+              readOnly: true
+            # 库文件、缓存对象、日志都在这一个卷里。不用 subPath 是因为 kubelet
+            # 建出来的 subPath 目录是 root:root 0755，fsGroup 管不到它，
+            # 而容器以 65532 跑——写不进去，症状是启动即 panic。
+            - name: data
+              mountPath: /app/data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          secret:
+            secretName: {{ include "katch.secretName" . }}
+        - name: data
+        {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "katch.claimName" . }}
+        {{- else }}
+          # 没开持久化：Pod 一重建，缓存、库、统计历史全没。
+          emptyDir: {}
+        {{- end }}
+        - name: tmp
+          # 根文件系统只读，而 sqlite 在排序、VACUUM 这类操作上可能落临时文件到
+          # TMPDIR。缓存对象的临时文件不走这里（在缓存目录下的 tmp/）。
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

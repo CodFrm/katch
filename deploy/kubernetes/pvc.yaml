@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: katch-data
+  labels:
+    app.kubernetes.io/name: katch
+    app.kubernetes.io/instance: katch
+spec:
+  accessModes:
+    # ReadWriteOnce 就够了：副本恒为 1（见 deployment.yaml），
+    # RWX 除了更难要到没有任何收益。
+    - ReadWriteOnce
+  resources:
+    requests:
+      # 界面「设置」里的缓存配额必须留在这个数字**以下**：katch 按配额回收，
+      # 撑破的是卷而不是配额。
+      storage: 50Gi
+  # storageClassName 留空用集群默认的，要指定就放开下面这行。
+  # storageClassName: fast-ssd

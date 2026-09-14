@@ -1,0 +1,20 @@
+apiVersion: v2
+name: katch
+description: 多上游镜像代理站——container registry、APT 源、Go module proxy、GitHub 静态资源统一收到一个域名下，带内容寻址缓存
+type: application
+
+# chart 自己的版本。改模板、改默认值都要动它。
+version: 0.1.0
+# 默认部署的 katch 版本。values 里 image.tag 留空时用的就是它。
+appVersion: "0.1.0"
+
+home: https://github.com/CodFrm/katch
+sources:
+  - https://github.com/CodFrm/katch
+keywords:
+  - mirror
+  - proxy
+  - registry
+  - apt
+  - goproxy
+  - cache
