@@ -26,7 +26,6 @@ const digestAlgorithm = "sha256"
 // 两者同在一个文件系统下，提交时的 rename 因此是原子的——跨文件系统的 rename
 // 会退化成复制，那就不再有「要么完整要么没有」这个性质了。
 type Store struct {
-	root  string
 	blobs string
 	tmp   string
 }
@@ -37,7 +36,6 @@ type Store struct {
 // 整体失败。这道判定放在启动时，而不是等第一次拉取才发现写不进去。
 func NewStore(root string) (*Store, error) {
 	s := &Store{
-		root:  root,
 		blobs: filepath.Join(root, "blobs"),
 		tmp:   filepath.Join(root, "tmp"),
 	}
@@ -52,11 +50,6 @@ func NewStore(root string) (*Store, error) {
 		return nil, err
 	}
 	return s, nil
-}
-
-// Root 返回缓存目录，供日志与界面显示。
-func (s *Store) Root() string {
-	return s.root
 }
 
 func (s *Store) cleanTemp() error {

@@ -71,6 +71,11 @@ type fakeRepo struct {
 	rows   map[int64]*cache_entity.CacheObject
 	// stampAccess 为真时由内存表接管 last_access_at，见上。
 	stampAccess bool
+	// totalSizeGate 非 nil 时，TotalSize 会先等它。
+	//
+	// TotalSize 只有 enforceQuota 一个调用方，而 enforceQuota 只跑在 pump 那个
+	// 后台协程上，所以它是「后台写缓存这件事还没做完」唯一一个不靠睡眠就按得住的缝。
+	totalSizeGate chan struct{}
 }
 
 func newFakeRepo(t *testing.T, stampAccess bool) *fakeRepo {
@@ -142,6 +147,12 @@ func newFakeRepo(t *testing.T, stampAccess bool) *fakeRepo {
 			return nil
 		})
 	m.EXPECT().TotalSize(gomock.Any()).AnyTimes().DoAndReturn(func(_ any) (int64, error) {
+		f.mu.Lock()
+		gate := f.totalSizeGate
+		f.mu.Unlock()
+		if gate != nil {
+			<-gate
+		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		total := int64(0)

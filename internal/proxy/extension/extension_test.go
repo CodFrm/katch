@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/cago-frame/cago/database/db"
 	"github.com/cago-frame/cago/pkg/logger"
@@ -157,7 +158,19 @@ func startKatch(t *testing.T) (*gin.Engine, *fakeOrigin) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cache_svc.Register(cache_svc.New(store, cache_svc.Options{}))
+	svc := cache_svc.New(store, cache_svc.Options{})
+	cache_svc.Register(svc)
+	// 回源下载脱离客户端跑（决策 9）：客户端收完响应体之后，这一层还要提交文件、
+	// 写记录、按配额回收。不等它收尾就散场，这趟活会踩着下一条用例——库、缓存目录
+	// 和全局日志那时都已经换人了。注册在这里而不是更早：清理按后进先出跑，
+	// 它必须排在上面那个关库的清理**之前**执行。
+	t.Cleanup(func() {
+		drainCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := svc.Quiesce(drainCtx); err != nil {
+			t.Errorf("后台缓存写入没能在用例结束前收尾：%v", err)
+		}
+	})
 	tracker := backoff.New(backoff.Options{})
 	proxy_svc.Register(proxy_svc.New(proxy_svc.Options{Gate: tracker}))
 

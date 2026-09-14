@@ -21,9 +21,15 @@ import (
 // 的通路。代价是任何一次写入都丢掉整张快照，而写入是运维动作，不在热路径上。
 type cachedUpstreamRepo struct {
 	inner upstream_repo.UpstreamRepo
-	// mu 只护 byHost 这个指针本身；byHost 一旦发布就不再改，读侧因此不必持锁读表。
+	// mu 只护 byHost 与 generation；byHost 一旦发布就不再改，读侧因此不必持锁读表。
 	mu     sync.RWMutex
 	byHost map[string]*upstream_entity.Upstream
+	// generation 每次失效自增。装载期间它变了就说明这份读数已经过期，不能再发布。
+	//
+	// 冷装载是「查库 → 发布」两步，中间不持锁。少了这道判定，一次正好落在两步
+	// 之间的写入会先失效、后被过期读数盖回去，而这层缓存没有 TTL——盖回去的那份
+	// 会一直用到下一次有人写上游表为止，表现成「界面上停用了但还在回源」。
+	generation uint64
 	// loadMu 把并发的冷启动装载串起来，避免一堆请求同时撞上空缓存时齐刷刷查库。
 	loadMu sync.Mutex
 }
@@ -77,6 +83,7 @@ func (c *cachedUpstreamRepo) Delete(ctx context.Context, id int64) error {
 func (c *cachedUpstreamRepo) invalidate() {
 	c.mu.Lock()
 	c.byHost = nil
+	c.generation++
 	c.mu.Unlock()
 }
 
@@ -91,6 +98,10 @@ func (c *cachedUpstreamRepo) table(ctx context.Context) (map[string]*upstream_en
 	if table := c.snapshot(); table != nil {
 		return table, nil
 	}
+	c.mu.RLock()
+	generation := c.generation
+	c.mu.RUnlock()
+
 	list, err := c.inner.List(ctx)
 	if err != nil {
 		return nil, err
@@ -99,10 +110,22 @@ func (c *cachedUpstreamRepo) table(ctx context.Context) (map[string]*upstream_en
 	for _, v := range list {
 		table[v.Host] = v
 	}
-	c.mu.Lock()
-	c.byHost = table
-	c.mu.Unlock()
+	c.publish(table, generation)
+	// 交出去的是这次读到的表，哪怕它已经过期：这次调用问的就是「刚才库里是什么」，
+	// 而过期的那份不会被留下来给下一个人。
 	return table, nil
+}
+
+// publish 把一次读数发布成快照，除非它已经被一次写入作废。
+//
+// 和 setting_svc.cachedSettingRepo.publish 是同一道判定，理由见 generation 那里。
+func (c *cachedUpstreamRepo) publish(table map[string]*upstream_entity.Upstream, generation uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.generation != generation {
+		return
+	}
+	c.byHost = table
 }
 
 func (c *cachedUpstreamRepo) snapshot() map[string]*upstream_entity.Upstream {

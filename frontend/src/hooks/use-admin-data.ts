@@ -4,6 +4,7 @@ import {
   fetchAdminEvents,
   fetchAdminOverview,
   fetchAdminUpstreams,
+  fetchRecentRequests,
   fetchRules,
   fetchSettings,
   fetchUpstreamCacheSizes,
@@ -15,6 +16,7 @@ import {
   type AdminUpstreamItem,
   type CacheSearchResult,
   type EventItem,
+  type RecentRequestItem,
   type SettingItem,
   type StatRange,
   type UpstreamSeriesPoint,
@@ -164,9 +166,10 @@ export function useOverviewExtras(
       }
       const next: Record<number, UpstreamSeriesPoint[]> = {}
       results.forEach((result, index) => {
-        const points = unwrap(result, () => reject.current())?.list
-        if (points) {
-          next[upstreamIDs[index]] = points
+        // 同 useUpstreamSeries：判的是「这次问到了没有」，空列表也是一个答复。
+        const data = unwrap(result, () => reject.current())
+        if (data) {
+          next[upstreamIDs[index]] = data.list ?? []
         }
       })
       setSeries(next)
@@ -201,9 +204,12 @@ export function useUpstreamSeries(
       if (controller.signal.aborted) {
         return
       }
-      const points = unwrap(result, () => reject.current())?.list
-      if (points) {
-        setLoaded({ id: upstreamID, points })
+      const data = unwrap(result, () => reject.current())
+      if (data) {
+        // 判的是「这次问到了没有」，不是「列表里有没有东西」。拿 list 本身当条件的话，
+        // 后端哪天给回一个 null 列表，这里就永远停在「还没问到」——图和回源原因那块
+        // 都不画，也不说任何话，而且不会重试。空列表是一个答复，要收下。
+        setLoaded({ id: upstreamID, points: data.list ?? [] })
       }
     })
     return () => controller.abort()
@@ -212,6 +218,48 @@ export function useUpstreamSeries(
   // 上一个上游的序列不许在这一个的图上出现：切换上游时手里那份数据属于别人，
   // 所以这里比对 id 而不是在 effect 里先把状态清空。
   return loaded && loaded.id === upstreamID ? loaded.points : null
+}
+
+/**
+ * 一个上游最近的几次拉取，还没取到时是 null。
+ *
+ * 和 useUpstreamSeries 同一套约定：null 是「还没问到」，空数组是「问到了，没有内容」。
+ * 「读不到」不再往下细分——没开日志落盘、文件被轮转走、够不到后端，对调用方是同一
+ * 件事；只有 401 单独交回去，那是密钥的事。怎么呈现由调用方决定（最近请求那块面板
+ * 的选择是整块不渲染）。
+ *
+ * 它和 useUpstreamSeries 放在一起，是因为两者要的是同一套机制：id 不合法就不取、
+ * 取数可取消、401 单独交回、切换上游时上一个的数据不许留在这一个的界面上。各写一份
+ * 的代价不是多几行，而是两份会分家——它们确实分过一次家：一边把 null 列表当成
+ * 「没有内容」，另一边当成「还没问到」并从此停在那里。
+ */
+export function useRecentRequests(
+  adminKey: string,
+  upstreamID: number,
+  onUnauthorized: () => void
+): RecentRequestItem[] | null {
+  const reject = useRejectOnUnauthorized(onUnauthorized)
+  const [loaded, setLoaded] = useState<{ id: number; list: RecentRequestItem[] } | null>(null)
+
+  useEffect(() => {
+    if (!Number.isFinite(upstreamID) || upstreamID <= 0) {
+      return
+    }
+    const controller = new AbortController()
+    void fetchRecentRequests(adminKey, upstreamID, controller.signal).then((result) => {
+      if (controller.signal.aborted) {
+        return
+      }
+      const data = unwrap(result, () => reject.current())
+      if (data) {
+        setLoaded({ id: upstreamID, list: data.list ?? [] })
+      }
+    })
+    return () => controller.abort()
+  }, [adminKey, upstreamID, reject])
+
+  // 上一个上游的行不许留在这一个的表上：手里那份数据属于别人。
+  return loaded && loaded.id === upstreamID ? loaded.list : null
 }
 
 /**

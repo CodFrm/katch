@@ -137,6 +137,15 @@ type CacheSvc interface {
 	// 顺带在这里再跑一次配额回收：原先只有「写进一个新对象」才会触发，于是站长
 	// 在设置页把配额改小之后，要等到下一次回源才开始削——决策 3/4 说的是改完立刻生效。
 	Sweep(ctx context.Context) (int64, error)
+	// Quiesce 等到此刻还在跑的后台下载全部收尾为止，ctx 结束时带着 ctx 的错误返回。
+	//
+	// 回源下载是脱离客户端跑的（决策 9），所以「响应体被收完」不代表这个对象已经
+	// 落进缓存：提交文件、写记录、按配额回收都排在那之后。要在拆掉这一层脚下的
+	// 库与缓存目录之前确保不会再有人碰它们，就得有一个等得到的入口。
+	//
+	// 它不阻止新的下载开始，只等已经起来的那些：关停时的顺序是先停止收新请求
+	// （mux 自己负责），再在这里等存量收尾。
+	Quiesce(ctx context.Context) error
 }
 
 type cacheSvc struct {
@@ -150,6 +159,13 @@ type cacheSvc struct {
 	evictMu sync.Mutex
 	// forgot 被我们自己收走的键，供下一次未命中归因，见 miss.go。
 	forgot *forgotten
+	// pending 还没跑完的后台下载，供 Quiesce 等。
+	//
+	// 下载脱离客户端跑（决策 9），于是「响应体被收完」和「这趟活干完了」是两件事：
+	// 提交文件、写记录、回收配额都排在客户端拿到最后一个字节之后。没有这个计数，
+	// 这批活就是不可观测也不可等待的——进程退出会把它们当场抛下，而任何一个
+	// 重新装配全局的调用方都会在它们脚下换掉库、缓存目录与日志。
+	pending sync.WaitGroup
 }
 
 // New 构造缓存层。store 为 nil 表示磁盘不可用——此时它是一个纯透传的实现，
@@ -209,6 +225,23 @@ func (c *cacheSvc) Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCl
 	// 归因收口在这一处：它必须在第一个字节发出去之前定下来，而「上游那份还是
 	// 不是我们手上那份」要等回源的响应头到手才知道（见 miss.stamp）。
 	return body, m.stamp(meta), nil
+}
+
+// Quiesce 等存量的后台下载收尾，见接口上的说明。
+func (c *cacheSvc) Quiesce(ctx context.Context) error {
+	done := make(chan struct{})
+	// WaitGroup.Wait 自己不认识 context，套一层才能让调用方按自己的时限抽身。
+	// 这个协程在存量收尾之后一定会退出，不会留住任何东西。
+	go func() {
+		c.pending.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (c *cacheSvc) usable() bool {
@@ -405,6 +438,9 @@ func (c *cacheSvc) fetchAndCache(ctx context.Context, target *proxy_svc.Target,
 		return body, meta, nil
 	}
 	current.start(meta, writer.Name())
+	// 计数要在起协程**之前**加：加在 pump 里面的话，Quiesce 可能刚好在协程还没
+	// 被调度到的时候看到一个空计数，于是「等干完」等了个寂寞。
+	c.pending.Add(1)
 	go c.pump(fetchCtx, flightKey, current, body, writer, upstream, key, meta)
 	return c.attachOrFetch(ctx, current, target)
 }
@@ -438,6 +474,8 @@ func (c *cacheSvc) pump(ctx context.Context, flightKey string, current *flight,
 	defer func() {
 		_ = body.Close()
 		_ = writer.Close()
+		// 放在最后：这趟活到这里才算真的干完，Quiesce 等的就是这一刻。
+		c.pending.Done()
 	}()
 
 	failure := c.copyToCache(current, body, writer)

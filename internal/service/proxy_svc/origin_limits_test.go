@@ -2,10 +2,18 @@ package proxy_svc
 
 import (
 	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/smartystreets/goconvey/convey"
+	"go.uber.org/mock/gomock"
+
+	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
+	"github.com/CodFrm/katch/internal/proxy/dispatch"
+	"github.com/CodFrm/katch/internal/service/setting_svc"
 )
 
 // acquired 在后台取一个名额，返回一个「取到了」的信号与还名额的动作。
@@ -123,4 +131,78 @@ func mustAcquire(t *testing.T, slots *originSlots, ctx context.Context, limit in
 		t.Fatalf("取名额失败：%v", err)
 	}
 	return release
+}
+
+// TestFetch_QueueWaitIsBounded 排队等回源名额必须有上限。
+//
+// 名额从开始回源一直占到响应体被关闭，所以一个卡在上游那边的大对象会把名额攥住
+// 很久。排在它后面的人等多久，取决于传进来那个 context——而拉取路径传进来的恰恰是
+// 一个**不会结束**的 context：cache_svc 用 context.WithoutCancel 把客户端的取消摘掉
+// （决策 9：客户端断开也要把这趟下载跑完），那种 context 的 Done() 是 nil，
+// acquire 里那条 select 因此永远等不到第二个分支。
+//
+// 于是：上游卡住 + 并发上限用满，后面每一个请求都会永久挂死在取名额这一步，
+// 连 gin 的处理器和客户端的连接一起攥着，客户端断开也解不开。超时也救不了——
+// 那个计时器装在 fetchWithRetry 里，是取到名额**之后**才开始走的。
+func TestFetch_QueueWaitIsBounded(t *testing.T) {
+	convey.Convey("上游卡住时，排队的回源会超时退出而不是永久挂死", t, func() {
+		stall := make(chan struct{})
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			<-stall // 响应头发了，响应体一直不结束：名额就这么被攥着。
+		}))
+		// 先放开卡住的处理器再关服务器：反过来的话 Close 会等在那个还没返回的处理器上。
+		defer srv.Close()
+		defer close(stall)
+
+		repo := setupRepo(t)
+		repo.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{
+			{ID: 1, Host: "deb.debian.org", Kind: upstream_entity.KindStatic,
+				Origin: srv.URL, Enabled: true},
+		}, nil).AnyTimes()
+
+		svc := New(Options{Runtime: singleSlotRuntime{}})
+
+		pull := func(ctx context.Context) (io.ReadCloser, error) {
+			body, _, err := svc.Fetch(ctx, &Target{
+				Kind: dispatch.KindStatic, Host: "deb.debian.org",
+				Path: "/dists/stable/InRelease", Method: http.MethodGet,
+			})
+			return body, err
+		}
+
+		// 第一个请求拿到名额并把它攥住：响应体一直没关。
+		first, err := pull(context.Background())
+		convey.So(err, convey.ShouldBeNil)
+		defer func() { _ = first.Close() }()
+
+		// 第二个请求传的是一个永远不会结束的 context，正是拉取路径的形态。
+		second := make(chan error, 1)
+		go func() {
+			body, err := pull(context.Background())
+			if body != nil {
+				_ = body.Close()
+			}
+			second <- err
+		}()
+		select {
+		case err := <-second:
+			// 要的就是「带着错误回来」，而不是一直不回来。
+			convey.So(err, convey.ShouldNotBeNil)
+		case <-time.After(10 * time.Second):
+			t.Fatal("排队的回源永久挂死了：取名额这一步既没有上限也取消不掉")
+		}
+	})
+}
+
+// singleSlotRuntime 并发上限 1、超时 1 秒：用最小的配置把「排队」这件事逼出来。
+type singleSlotRuntime struct{}
+
+func (singleSlotRuntime) Runtime(context.Context) (*setting_svc.RuntimeSettings, error) {
+	return &setting_svc.RuntimeSettings{
+		OriginConcurrency:    1,
+		OriginTimeoutSeconds: 1,
+		OriginRetries:        0,
+	}, nil
 }

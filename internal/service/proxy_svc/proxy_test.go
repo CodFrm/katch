@@ -139,3 +139,44 @@ func TestFetch_UnreachableOriginIsNotA404(t *testing.T) {
 		convey.So(errors.Is(err, ErrUpstreamNotAllowed), convey.ShouldBeFalse)
 	})
 }
+
+// TestFetch_DropsAuthenticationChallenge 上游的鉴权挑战不许出现在 katch 的响应里。
+//
+// registry 那一侧已经明说过这条规则（registry.strip：「任何一条从 katch 出去的
+// WWW-Authenticate 都是在请客户端向 katch 鉴权，而 katch 是一个公开的镜像站，
+// 没有账号可以给它」），但那只盖住了两条回源方式里的一条。
+//
+// static 那一条同样会遇到 401：一个挂在 basic auth 后面的 apt 源、一台配错了权限的
+// 对象存储，都会把 WWW-Authenticate 原样送回来。它抵达客户端之后，浏览器会为
+// **katch 的域名**弹一个账号密码框——用户敲进去的凭据是交给 katch 的，而 katch 既
+// 没有账号体系，也不该收到任何人的密码。
+//
+// 收口放在这一层而不是 origin：registry 适配器要靠这个头解析出 realm 才换得到
+// token（决策 5），在 origin 那里摘掉会把 token 交换整个打断。这里是两条回源方式
+// 汇合、且适配器已经用完这个头之后的那一点。
+func TestFetch_DropsAuthenticationChallenge(t *testing.T) {
+	convey.Convey("static 上游的 WWW-Authenticate 不跟着响应出去", t, func() {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("WWW-Authenticate", `Basic realm="private apt"`)
+			w.WriteHeader(http.StatusUnauthorized)
+		}))
+		defer srv.Close()
+
+		repo := setupRepo(t)
+		repo.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{
+			{ID: 1, Host: "apt.private.test", Kind: upstream_entity.KindStatic,
+				Origin: srv.URL, Enabled: true},
+		}, nil).AnyTimes()
+
+		body, meta, err := Proxy().Fetch(context.Background(), &Target{
+			Kind: dispatch.KindStatic, Host: "apt.private.test",
+			Path: "/dists/stable/InRelease", Method: http.MethodGet,
+		})
+		convey.So(err, convey.ShouldBeNil)
+		defer func() { _ = body.Close() }()
+		// 401 本身照常透传：那是上游对这个对象的判断，katch 不替它改口径。
+		convey.So(meta.StatusCode, convey.ShouldEqual, http.StatusUnauthorized)
+		// 摘掉的只是「向谁鉴权」这句话。
+		convey.So(meta.Header.Get("WWW-Authenticate"), convey.ShouldEqual, "")
+	})
+}

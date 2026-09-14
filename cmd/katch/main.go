@@ -165,6 +165,15 @@ func main() {
 				// 没有这一趟，一个再也没人来取的过期对象会连记录带字节一直留着，
 				// 还一直算进配额，而它又进不了 LRU 的候选（只挑不可变的）。
 				runCacheSweep(ctx)
+				// ctx 结束就是进程要停了。回源下载脱离客户端跑（决策 9），此刻
+				// 盘上可能正躺着一个刚提交、记录还没写完的对象；直接退出会把它
+				// 留成一份谁也查不到的字节。给存量一个有上限的收尾窗口——
+				// 上限是必须的：一个卡在上游那边的大对象不该把退出拖到天荒地老。
+				drainCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cacheDrainTimeout)
+				defer cancel()
+				if err := cache_svc.Cache().Quiesce(drainCtx); err != nil {
+					logger.Ctx(ctx).Warn("仍有后台缓存写入没能在退出前收尾", zap.Error(err))
+				}
 				return nil
 			})
 			return nil
@@ -205,6 +214,12 @@ func main() {
 // 比分钟桶疏得多：过期对象晚几分钟被收走没有任何坏处，而每分钟扫一次
 // cache_object 只是在给库添活。
 const cacheSweepInterval = 10 * time.Minute
+
+// cacheDrainTimeout 退出时留给存量后台缓存写入的收尾窗口。
+//
+// 取一个比回源超时略长的值：正常收尾只差提交文件与写一条记录，是毫秒级的事；
+// 真的等满这段时间，说明有一趟下载卡在上游那边，那就该记一条日志然后走人。
+const cacheDrainTimeout = 30 * time.Second
 
 // runCacheSweep 跑定时的过期清理，直到 ctx 结束。
 //

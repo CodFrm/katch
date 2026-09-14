@@ -160,7 +160,23 @@ func (p *proxySvc) Fetch(ctx context.Context, target *Target) (io.ReadCloser, *M
 	}
 	// 并发上限、超时与重试都在这里现读：站长在设置页改完，下一次回源就按新值走。
 	rt := p.settings(ctx)
-	release, err := p.slots.acquire(ctx, rt.OriginConcurrency)
+	// 排队等名额这一步自己要有上限，不能只靠调用方那个 context。
+	//
+	// 名额一直占到响应体被关闭，所以一个卡在上游那边的对象会把它攥很久；而拉取
+	// 路径传进来的是一个**不会结束**的 context——cache_svc 用 context.WithoutCancel
+	// 摘掉了客户端的取消（决策 9：断线也要把下载跑完），那种 context 的 Done() 是
+	// nil，acquire 里那条 select 因此只剩下「等名额」一个分支。上游一卡，后面每个
+	// 请求都会永久挂死在这里，连处理器和客户端连接一起攥着。
+	//
+	// 下面那个超时救不了这件事：它装在 fetchWithRetry 里，是取到名额**之后**才开始
+	// 走的。用同一个时限来盖排队这一段——连名额都排不到的请求，快速失败远好过堆积。
+	acquireCtx := ctx
+	if timeout := time.Duration(rt.OriginTimeoutSeconds) * time.Second; timeout > 0 {
+		var cancel context.CancelFunc
+		acquireCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	release, err := p.slots.acquire(acquireCtx, rt.OriginConcurrency)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -179,6 +195,18 @@ func (p *proxySvc) Fetch(ctx context.Context, target *Target) (io.ReadCloser, *M
 		inflightDone()
 		release()
 	}}
+	// 上游的鉴权挑战到此为止。任何一条从 katch 出去的 WWW-Authenticate 都是在请
+	// 客户端向 **katch** 鉴权，而 katch 是一个公开的镜像站，没有账号可以给它：
+	// 浏览器会为 katch 的域名弹账号密码框，用户敲进去的凭据是交给 katch 的。
+	// 一个把别人的登录框挂在自己域名下的代理是在钓鱼，不是在镜像。
+	//
+	// registry 那一侧本来就摘（registry.strip，决策 5），但那只盖住了两条回源方式
+	// 里的一条：挂在 basic auth 后面的 apt 源走的是 static 这条。收在这里而不是
+	// origin，是因为 registry 适配器要先靠这个头解析出 realm 才换得到 token——
+	// 在 origin 那里摘掉会把 token 交换整个打断。这一点两条路都会经过，且适配器
+	// 已经用完了它。401 本身照常透传：那是上游对这个对象的判断，katch 不替它改
+	// 口径，摘掉的只是「向谁鉴权」这句话。
+	resp.Header.Del("WWW-Authenticate")
 	return body, &Meta{
 		StatusCode:    resp.StatusCode,
 		Header:        resp.Header,

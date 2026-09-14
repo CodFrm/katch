@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
-import { fetchRecentRequests, type RecentRequestItem } from '@/lib/api'
+import { useRecentRequests } from '@/hooks/use-admin-data'
+import { type RecentRequestItem } from '@/lib/api'
 import { formatBytes, formatClock, formatLatency } from '@/lib/format'
 
 /** 没量到的那一格用破折号：它和 `0 B` / `0 ms` 是两句话。 */
@@ -27,12 +27,13 @@ const RESULT_TONE: Record<RecentRequestItem['result'], string> = {
  * （那会把拉取热路径拖进事务），而分钟级的 rollup 答得了「这段时间总共怎么样」，
  * 答不了「刚刚发生了什么」。堆叠图和占比条说的是前一个问题，这张表说的是后一个。
  *
- * **读不到就整块消失**：日志没开落盘、文件刚被轮转走、够不到后端，后端都给一个
- * 空列表或一次失败，这里一律什么都不渲染。排障的辅助块消失，好过在管理界面上挂
- * 一句「打不开文件」——那句话既没有出口，也解释不了任何事。
+ * **读不到就整块消失**：日志没开落盘、文件刚被轮转走、够不到后端，还没问到——
+ * 这些对这块面板是同一件事，一律什么都不渲染。排障的辅助块消失，好过在管理界面上
+ * 挂一句「打不开文件」——那句话既没有出口，也解释不了任何事。
  *
- * 取数写在这里而不是抽成公共钩子：只有这一块面板读这个端点，而它和「读不到就
- * 不渲染」是同一个决定的两半，分开放会让下一个人以为空列表也要画个空表头。
+ * 取数本身交给 use-admin-data 的 useRecentRequests：那套「id 不合法就不取、取数可
+ * 取消、401 单独交回、切上游时上一个的数据不许留下」的机制，和按上游取时序的那个
+ * 钩子是同一套，各写一份只会让两份分家。留在这里的只有上面那个呈现决定。
  */
 export function RecentRequests({
   adminKey,
@@ -46,7 +47,8 @@ export function RecentRequests({
   const { t } = useTranslation()
   const list = useRecentRequests(adminKey, upstreamID, onUnauthorized)
 
-  if (list.length === 0) {
+  // null 是「还没问到」，空数组是「问到了但没有内容」——这块面板对两者是同一个答复。
+  if (!list || list.length === 0) {
     return null
   }
 
@@ -111,46 +113,4 @@ function RequestRow({ item }: { item: RecentRequestItem }) {
       </td>
     </tr>
   )
-}
-
-/**
- * 一个上游最近的几次拉取，读不到时是空数组。
- *
- * 「读不到」不再细分：没开日志落盘、文件被轮转走、够不到后端，对这块面板是同一
- * 件事——这次没有内容。只有 401 单独交回去，那是密钥的事，不是这块面板的事。
- */
-function useRecentRequests(
-  adminKey: string,
-  upstreamID: number,
-  onUnauthorized: () => void
-): RecentRequestItem[] {
-  const [loaded, setLoaded] = useState<{ id: number; list: RecentRequestItem[] } | null>(null)
-  // 回调的身份每次渲染都可能变，跟着它进依赖数组就成了一个永不停的取数循环。
-  const reject = useRef(onUnauthorized)
-  useEffect(() => {
-    reject.current = onUnauthorized
-  }, [onUnauthorized])
-
-  useEffect(() => {
-    if (!Number.isFinite(upstreamID) || upstreamID <= 0) {
-      return
-    }
-    const controller = new AbortController()
-    void fetchRecentRequests(adminKey, upstreamID, controller.signal).then((result) => {
-      if (controller.signal.aborted) {
-        return
-      }
-      if (!result.ok) {
-        if (result.reason === 'unauthorized') {
-          reject.current()
-        }
-        return
-      }
-      setLoaded({ id: upstreamID, list: result.data.list ?? [] })
-    })
-    return () => controller.abort()
-  }, [adminKey, upstreamID])
-
-  // 上一个上游的行不许留在这一个的表上：手里那份数据属于别人。
-  return loaded && loaded.id === upstreamID ? loaded.list : []
 }
