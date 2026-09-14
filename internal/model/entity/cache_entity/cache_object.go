@@ -11,6 +11,11 @@ type CacheObject struct {
 	ID         int64 `gorm:"column:id;primary_key" json:"id"`
 	UpstreamID int64 `gorm:"column:upstream_id" json:"upstream_id"`
 	// Key 上游内路径（含查询串），与 UpstreamID 一起唯一确定一个对象。
+	//
+	// 少数请求的键末尾还缀着一段变体：同一个 manifest 路径，docker 与 OCI 的
+	// 客户端靠 Accept 各要各的那一份，两份内容不能共用一条记录（键怎么拼见
+	// cache_svc 的 variant.go）。没有变体可言的请求落的是路径本身，所以这一列
+	// 里绝大多数行的形态和它一直以来的样子没有分别。
 	Key string `gorm:"column:key" json:"key"`
 	// Digest 内容摘要 sha256:<hex>，同时就是文件在缓存目录里的位置。
 	Digest string `gorm:"column:digest" json:"digest"`

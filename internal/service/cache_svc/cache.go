@@ -283,14 +283,24 @@ func cacheableResponse(meta *proxy_svc.Meta) bool {
 	return !strings.Contains(cc, "no-store") && !strings.Contains(cc, "private")
 }
 
-// cacheKey 缓存键：上游内路径加查询串。
+// cacheKey 缓存键：上游内路径加查询串，末尾按需缀上这次请求的变体。
 //
 // 带上查询串是因为它会改变返回的内容；上游 ID 不进键里，它是表上的另一列。
+//
+// 变体那一段管的是「请求头也会改变返回的内容」这件事：registry 靠 Accept 决定
+// 给哪个版本的 manifest，只按路径存的话，先到的 docker 客户端会把自己那份留下，
+// 后到的 OCI 客户端拿到一次命中——收到的是别人那一份，而且它不会报错。哪些请求
+// 算有变体、怎么归一，见 variant.go；没有变体可言的请求落的还是**逐字不变**的
+// 老键，库里改动之前写下的行因此照旧命中得到。
 func cacheKey(target *proxy_svc.Target) string {
-	if target.RawQuery == "" {
-		return target.Path
+	key := target.Path
+	if target.RawQuery != "" {
+		key += "?" + target.RawQuery
 	}
-	return target.Path + "?" + target.RawQuery
+	if variant := cacheVariant(target); variant != "" {
+		key += variantMarker + variant
+	}
+	return key
 }
 
 // serveFromDisk 命中则由磁盘服务。
