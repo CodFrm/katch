@@ -151,6 +151,11 @@ sqlite 的 DSN 里两个 pragma 不能省（见 `configs/config.yaml` 的注释�
 ——数据库连不上时界面本身就不可用，所以 DSN 必须在文件里；配额、TTL、并发这些
 进程跑起来之后才生效的参数一律落 `setting` 表，改完不用重启。
 
+入库的只有 `configs/config.yaml.example`；进程实际读的 `configs/config.yaml` 从它拷
+一份，被 `.gitignore` 挡着。这不是洁癖——配置文件里有初始管理密钥和 DSN，入库那份
+一旦成为大家实际编辑的文件，真密钥进历史就只是时间问题。`make dev` 在缺失时自动拷
+一份（已存在的不覆盖），`scripts/smoke.sh` 和 Docker 镜像都直接用 `.example`。
+
 上游同理：上游是 `upstream` 表里的记录，不是配置项。增删上游、暂停上游是运维日常
 动作，做成配置项意味着每次变更都要改文件并重启。这张表同时就是白名单——不在表里
 或 `enabled` 为假的主机一律 404，否则 katch 就是一个开放代理。

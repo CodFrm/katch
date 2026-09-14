@@ -34,7 +34,9 @@ FROM alpine:3.21
 RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /app
 COPY --from=build /out/katch /app/katch
-COPY configs/config.yaml /app/configs/config.yaml
+# 拷的是入库的 .example：configs/config.yaml 是开发者本地那一份，被 .gitignore 和
+# .dockerignore 一起挡在构建上下文外，镜像里放的必须是出厂默认值。
+COPY configs/config.yaml.example /app/configs/config.yaml
 # sqlite 库文件与缓存都落在这里，部署时挂卷。
 VOLUME ["/app/data"]
 EXPOSE 8080

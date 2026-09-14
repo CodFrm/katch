@@ -12,7 +12,14 @@ LDFLAGS := -s -w \
 install-deps:
 	cd frontend && pnpm install
 
-dev:
+# 本地配置：入库的是 configs/config.yaml.example，configs/config.yaml 是每个人自己的
+# 那一份（.gitignore 挡着）。新克隆下来没有它，go run 会直接 load config 失败。
+# 只在缺失时拷：已经改过的本地配置绝不能被覆盖回出厂值，所以这是一个文件目标而不是
+# 每次都执行的 phony。
+configs/config.yaml: configs/config.yaml.example
+	@test -f $@ || cp $< $@
+
+dev: configs/config.yaml
 	@trap 'kill 0' INT; \
 	  (cd frontend && pnpm install --silent && pnpm dev) & \
 	  go run ./cmd/katch & wait

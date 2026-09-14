@@ -8,3 +8,7 @@ internal/web/dist
 bin
 data
 runtime
+
+# 开发者本地的配置（可能带真的管理密钥和 DSN）不进构建上下文；
+# 镜像里那份由 Dockerfile 从 configs/config.yaml.example 拷。
+configs/config.yaml

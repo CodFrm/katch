@@ -11,8 +11,15 @@
 *.db-wal
 /runtime/
 
-# 本地配置覆盖（configs/config.yaml 是入库的默认值，本地改动走这个文件）
-/configs/config.local.yaml
+# 本地配置。入库的是 configs/config.yaml.example（出厂默认值 + 注释），每个人从它
+# 拷一份 configs/config.yaml 自己改：管理密钥、DSN、监听地址这些一旦改在入库的文件上，
+# 工作区就长期是脏的，改到一半的真密钥也就随时可能被顺手提交进去。
+/configs/config.yaml
+
+# 部署那一份同理。deploy/config.yaml.example 和 compose 的用法都让使用者把它拷成
+# deploy/config.yaml 再往里填真密钥，漏掉这条就等于在 deploy/ 下摆一个等着被
+# git add . 收走的密钥文件。
+/deploy/config.yaml
 
 # 前端
 /frontend/node_modules/

@@ -24,10 +24,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# 用临时配置副本跑，同时保留一份原始配置用于比对是否被改写
+# 用临时配置副本跑，同时保留一份原始配置用于比对是否被改写。
+# 模板取入库的 .example 而不是 configs/config.yaml——后者是开发者本地那一份，
+# 被 .gitignore 挡着，CI 的干净检出里根本不存在。
 sed "s#0.0.0.0:8080#0.0.0.0:${PORT}#; s#./data/katch.db#${workdir}/katch.db#; \
      s#./data/cache#${workdir}/cache#; s#./runtime/logs#${workdir}/logs#g" \
-  configs/config.yaml > "$workdir/config.yaml"
+  configs/config.yaml.example > "$workdir/config.yaml"
 cp "$workdir/config.yaml" "$workdir/config.expect"
 
 "$BIN" -config "$workdir/config.yaml" > "$workdir/out.log" 2>&1 &
