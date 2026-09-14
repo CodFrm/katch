@@ -207,11 +207,44 @@ func (p *proxySvc) Fetch(ctx context.Context, target *Target) (io.ReadCloser, *M
 	// 已经用完了它。401 本身照常透传：那是上游对这个对象的判断，katch 不替它改
 	// 口径，摘掉的只是「向谁鉴权」这句话。
 	resp.Header.Del("WWW-Authenticate")
+	stripUpstreamAccountHeaders(resp.Header)
 	return body, &Meta{
 		StatusCode:    resp.StatusCode,
 		Header:        resp.Header,
 		ContentLength: resp.ContentLength,
 	}, nil
+}
+
+// upstreamAccountHeaders 上游用来描述**katch 这个调用方**、而不是这次内容的响应头。
+//
+// 分两类。一类是上游对 katch 账户的记账：docker.io 每个响应都贴 Docker-Ratelimit-Source
+// （这台镜像站的出口 IP）与一组 Ratelimit-*（这台镜像站的配额余量）。它们说的不是客户端
+// 拿到的这个对象，转出去等于把出口 IP 和剩余额度播给每一个匿名客户端；而且缓存命中时它们
+// 不会出现，留着还会让同一个 URL 的响应头随缓存状态漂移。
+//
+// 另一类是源站对**自己那个域名**的传输策略：Strict-Transport-Security 会被客户端安到
+// katch 的域名上，Alt-Svc 更会把客户端指向源站的备用端点。Set-Cookie 同理——镜像站没有
+// 会话，源站的 cookie 落在 katch 的域名下只会跟着此后每一次拉取发回来。
+//
+// Retry-After 不在表里：它是上游对「什么时候再来问」的答复，删掉会让客户端在 429/503
+// 之后立刻重试。Date、Server 这类描述本次响应本身的头同样留着。
+var upstreamAccountHeaders = []string{
+	"Docker-Ratelimit-Source",
+	"Ratelimit-Limit", "Ratelimit-Remaining", "Ratelimit-Reset",
+	"X-Ratelimit-Limit", "X-Ratelimit-Remaining", "X-Ratelimit-Reset",
+	"Strict-Transport-Security",
+	"Alt-Svc",
+	"Set-Cookie",
+}
+
+// stripUpstreamAccountHeaders 摘掉 upstreamAccountHeaders 里的每一条。
+//
+// 和 WWW-Authenticate 收在同一处，理由是同一条：这里是两条回源方式汇合、且适配器
+// 已经用完这些头之后的那一点，摘在 origin 里会把 registry 的 token 交换打断。
+func stripUpstreamAccountHeaders(header http.Header) {
+	for _, name := range upstreamAccountHeaders {
+		header.Del(name)
+	}
 }
 
 // settings 读一次运行时设置。

@@ -357,12 +357,27 @@ func (c *cacheSvc) serveFromDisk(ctx context.Context, upstream *upstream_entity.
 		// 命中已经成立了，访问时间没更新上只影响淘汰顺序，不该让这次拉取失败。
 		logger.Ctx(ctx).Warn("更新缓存访问时间失败", zap.Int64("id", object.ID), zap.Error(err))
 	}
-	header := make(http.Header, 3)
+	header := make(http.Header, 5)
 	if object.ContentType != "" {
 		header.Set("Content-Type", object.ContentType)
 	}
 	header.Set("Content-Length", strconv.FormatInt(object.Size, 10))
 	header.Set(cacheStatusHeader, cacheStatusHit)
+	// registry 的摘要头补在这里：未命中时它们来自上游，命中时若没有人补，同一个
+	// URL 的响应头就随「这次有没有命中」而变，而摘要是 registry 协议里客户端可以
+	// 依赖的字段。
+	//
+	// 值是推导出来的，不是从上游那份拷贝存下来的：上面几行刚刚校验过盘上的字节与
+	// Digest 相符，推导出来的头因此不可能和发出去的字节对不上；存一份副本则会多出
+	// 一个能和字节分叉的事实，而那正是这段校验要防的东西。
+	//
+	// 只给 registry 补。static 那一侧的 Etag 在未命中时是**上游那一串**，命中时换成
+	// katch 自己的摘要，同一份内容就有了两个互不相认的强校验符——客户端拿着后者去做
+	// 条件请求，只会换回一次整份重传。那一侧要一致得把上游的头存下来，是另一条路。
+	if upstream.Kind == upstream_entity.KindRegistry && object.Digest != "" {
+		header.Set("Docker-Content-Digest", object.Digest)
+		header.Set("Etag", `"`+object.Digest+`"`)
+	}
 	return file, &proxy_svc.Meta{
 		StatusCode:    http.StatusOK,
 		Header:        header,
