@@ -1,0 +1,146 @@
+name: Release
+
+# 发版的唯一动作就是打一个 tag 并推上去：
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# 先验证再发布，而不是「先推出去再看 CI 红不红」：镜像一旦推上去就可能被人拉走，
+# 而 :latest 被一个坏版本占过之后，撤回并不能把已经拉走的人弄回来。
+on:
+  push:
+    tags:
+      # 只有 v 开头的 tag 才发版。给某个提交做记号的 tag 不该触发一次镜像发布。
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  # 版本写死，与 ci.yml 保持一致：工具链漂移会让「CI 绿、本地红」变成猜谜。
+  PNPM_VERSION: 10.11.0
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - run: make test
+      # make build 是唯一设了 CGO_ENABLED=0 的地方，也就是「sqlite 驱动必须保持
+      # 纯 Go」那道闸。发布一个引进了 cgo 的产物，比发布一个跑不通的产物更糟：
+      # 它在一部分机器上跑得通。
+      - run: make build
+      - name: smoke
+        run: make smoke
+      - name: 确认产物是静态链接
+        run: |
+          file bin/katch
+          ! ldd bin/katch 2>/dev/null | grep -q "=>" || (echo "产物含动态链接依赖，CGO 可能被意外打开" && exit 1)
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: 取版本号
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          # buildinfo.Commit 是给人看短号，不是给 git 用的完整 sha。
+          echo "commit=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      # ghcr 的镜像路径必须全小写，而 github.repository 会保留账号的大小写
+      # （CodFrm/katch），直接拼上去会被 ghcr 拒掉。bash 的 ${VAR,,} 转小写。
+      - name: 取镜像名
+        id: meta
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # flavor 的 latest=auto 是默认值，也是这里要的：预发布版本（v0.2.0-rc1）
+      # 得到自己的标签，但顶不掉 latest——latest 永远指向最后一个正式版本。
+      # 语义化版本号取自 tag，所以 buildinfo 与镜像标签对得上。
+      - name: 生成标签
+        id: tags
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.meta.outputs.image }}
+          tags: |
+            type=semver,pattern={{version}}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          # arm64 走 QEMU：产物是 CGO_ENABLED=0 的静态二进制，模拟只花在镜像构建
+          # 本身那几步上，不值得为此把构建拆成两个 runner 再合 manifest。
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: ${{ steps.tags.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
+            COMMIT=${{ steps.version.outputs.commit }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # --generate-notes 要拿上一个 tag 比对，浅克隆里没有它。
+          fetch-depth: 0
+      - name: 建 GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          IMAGE: ${{ needs.publish.outputs.image }}
+          VERSION: ${{ needs.publish.outputs.version }}
+        run: |
+          # 重跑同一个 tag 时不该红：镜像已经发布成功了，这里只是把 Release 补上。
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "release $TAG 已存在，跳过"
+            exit 0
+          fi
+
+          # 预发布版本（v0.2.0-rc1）在 GitHub 上也要标出来，理由和镜像不打
+          # latest 一样：别让人把候选版本当成正式版本。
+          flags=()
+          case "$VERSION" in *-*) flags+=(--prerelease) ;; esac
+          gh release create "$TAG" --title "$TAG" --generate-notes "${flags[@]}" > /dev/null
+
+          # 「制品在哪」写进正文而不是只留在 Action 日志里。没把这段一并交给
+          # --notes：--generate-notes 与手写 notes 一起给时的拼接规则不值得依赖。
+          {
+            echo '```'
+            echo "docker pull ${IMAGE}:${VERSION}"
+            echo '```'
+            echo
+            gh release view "$TAG" --json body -q .body
+          } > notes.md
+          gh release edit "$TAG" --notes-file notes.md
