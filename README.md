@@ -50,12 +50,24 @@ cgo），落地就是一个文件；缓存对象按内容摘要落在磁盘目�
 
 ## 跑起来
 
-### Docker
+### Docker Compose
 
 ```bash
-make docker
-docker run -d --name katch -p 8080:8080 -v katch-data:/app/data katch/katch:0.1.0
+cp deploy/config.yaml.example deploy/config.yaml   # 改掉 admin.initialKey
+docker compose -f deploy/docker-compose.yml up -d
 ```
+
+### Kubernetes
+
+```bash
+helm install katch deploy/helm/katch --namespace katch --create-namespace \
+  --set config.admin.initialKey=$(openssl rand -hex 24)
+```
+
+不想用 Helm 就 `kubectl apply -k deploy/kubernetes/`（先改 `secret.yaml` 里的密钥）。
+
+两条路的细节、以及**为什么只能跑一个副本**，都在
+[docs/deploy.md](docs/deploy.md)。
 
 ### 从源码
 
@@ -168,6 +180,7 @@ make mock       # go generate ./...（mockgen）
 ## 文档
 
 - [AGENTS.md](AGENTS.md) — 工程约定（硬约束，包括测试先行、产物不引入 cgo、分层单向）
+- [docs/deploy.md](docs/deploy.md) — 部署（compose / helm / 裸 manifests）、反代要调什么、排障对照表
 - [docs/architecture.md](docs/architecture.md) — 分层、路由命名空间、拉取路径、数据库
 - [docs/frontend.md](docs/frontend.md) — 前端目录、i18n、静态资源缓存
 - [docs/observability.md](docs/observability.md) — 日志与指标
