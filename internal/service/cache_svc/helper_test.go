@@ -242,7 +242,12 @@ func newFakeRepo(t *testing.T, stampAccess bool) *fakeRepo {
 			}
 			return list, nil
 		})
+	// 用完还原。cache_repo 的注册是进程级的一份，只写不还的话，用例之间就靠
+	// 「谁后跑谁说了算」联系在一起：这个用例留下的后台协程会拿着**下一个**用例的
+	// 仓储去读写，而两边的断言各自看起来都还成立。由 harness_test.go 守着。
+	prev := cache_repo.CacheObject()
 	cache_repo.RegisterCacheObject(m)
+	t.Cleanup(func() { cache_repo.RegisterCacheObject(prev) })
 	return f
 }
 
@@ -318,15 +323,43 @@ func setupSvc(t *testing.T, o *originStub, up *upstream_entity.Upstream, opt Opt
 	up.Origin = o.srv.URL
 	up.Enabled = true
 	// 装配形态与 main 一致：读路径走带进程内缓存的那一层。
+	// 同样是进程全局，同样要还原，理由见 newFakeRepo 里那段。
+	prevUpstream := upstream_repo.Upstream()
 	upstream_repo.RegisterUpstream(proxy_svc.NewCachedUpstreamRepo(upRepo))
+	t.Cleanup(func() { upstream_repo.RegisterUpstream(prevUpstream) })
 	upRepo.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{up}, nil).AnyTimes()
 
 	store, err := cache.NewStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("建缓存目录失败：%v", err)
 	}
-	return New(store, opt), repo, store
+	svc := New(store, opt)
+	// 等后台下载收尾再让用例结束。
+	//
+	// 缓存写入是脱离客户端跑的，所以「客户端收完了」不等于「这趟活干完了」：
+	// pump 在 finish 之后还要跑一趟 enforceQuota，而那里读的是进程全局的
+	// cache_repo。不等它，这个协程就会活到下一个用例里去读写上面刚刚还原过的
+	// 那份全局——CI 上的 DATA RACE 就是这么来的。
+	//
+	// 这条 Cleanup 注册在两条还原之后，于是 LIFO 下它**先**跑：先把人等回来，
+	// 再把全局换回去，顺序反了等于没等。
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), quiesceTimeout)
+		defer cancel()
+		if err := svc.Quiesce(ctx); err != nil {
+			// 不是 Fatal：Cleanup 里 FailNow 不会中断别的收尾，而这条信息本身
+			// 就够定位了——有一趟后台下载在这个时限内没能收尾。
+			t.Errorf("后台缓存写入没能在 %s 内收尾：%v", quiesceTimeout, err)
+		}
+	})
+	return svc, repo, store
 }
+
+// quiesceTimeout 用例结束时留给后台缓存写入的收尾窗口。
+//
+// 取一个明显大于任何一条用例正常耗时的值：这里等满了只说明有协程卡住了，
+// 那是缺陷而不是慢，应该把用例判红而不是接着等。
+const quiesceTimeout = 30 * time.Second
 
 func staticUpstream(host string) *upstream_entity.Upstream {
 	return &upstream_entity.Upstream{
