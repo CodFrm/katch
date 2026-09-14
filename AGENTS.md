@@ -65,4 +65,4 @@ make mock           # go generate ./...（mockgen）
 
 ## 提交
 
-gitmoji 风格，提交信息用中文。
+gitmoji 风格，提交信息用中文。**开头写 emoji 字符本身（✨ 🐛 🔧 📝 ✅ 🎉），不要写 `:sparkles:` 这类 shortcode**——shortcode 只有在 GitHub 网页上才会被渲染成图形，`git log`、终端和大多数客户端里看到的是原样的冒号串。
