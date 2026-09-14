@@ -1,0 +1,168 @@
+name: Nightly
+
+# nightly 分支是 `main` 的每日快照：定时把 main 合进来，合出来的提交跑测试与 smoke，
+# 然后推 ghcr.io/codfrm/katch:nightly 与 :nightly-<UTC 日期>。
+#
+# 它不是发版：不碰 latest，也不建 GitHub Release。要一个能回看的正式版本就推一个
+# v 开头的 tag，走 release.yml。
+#
+# 两个别忘了的前提：
+#   1. `nightly` 分支要先存在（git push origin main:nightly）。它不存在时 sync 作业
+#      的 checkout 会直接失败——比「安静地不构建」好，但仍然不会自己把分支建出来。
+#   2. 仓库连续 60 天没有活动时，GitHub 会静默停掉定时任务，而 nightly 镜像停更不会
+#      报任何错，只会不再更新。发现的办法只有去 Actions 页面看它是不是 disabled。
+on:
+  # 手动跑一次：要马上验一个提交时用得上。
+  workflow_dispatch:
+  schedule:
+    # cron 一律按 UTC 算：18:00 UTC = 北京时间凌晨 2:00。
+    - cron: "0 18 * * *"
+  # 有人手动往 nightly 推东西时也构建一次。自己推的那次不会触发：Actions 用它自己
+  # 的 GITHUB_TOKEN 推的分支不会产生新的 workflow 运行，所以不会自激。
+  push:
+    branches: [nightly]
+
+permissions:
+  contents: read
+
+concurrency:
+  # 定时与手动可能撞在一起。取消旧的而不是排队：这两个跑的是同一份东西，晚的那个
+  # 手上的提交更新。
+  group: nightly
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    name: 把 main 合进 nightly
+    # 只有定时与手动触发才合并。push 触发的那次是「nightly 刚被人推过」，再合并一次
+    # 没有意义。
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      changed: ${{ steps.merge.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # fetch-depth: 0 同时把全部远端分支取下来，下面那个 origin/main 才有得合。
+          ref: nightly
+          fetch-depth: 0
+      - name: 合并 main
+        id: merge
+        run: |
+          # 合并提交需要一个身份，用 Actions 自己的那个。
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          before=$(git rev-parse HEAD)
+          # 冲突就停在这里：nightly 保持原样，等一个人来看。不替人挑版本，也不推一个
+          # 半合起来的树上去——那会让 nightly 上多出一个既不是 main 也不是任何人写过
+          # 的提交。
+          #
+          # 显式判失败而不是靠 Actions 默认的 `bash -e`：那个默认值一改（或者哪天有人
+          # 给这一步加了 shell:）就会变成「冲突后什么都没推，却报 changed=false 然后
+          # 跳过构建」，一次安静的假成功。
+          if ! git merge origin/main --no-edit; then
+            echo "::error::nightly 与 main 合并冲突，nightly 未改动，请人工处理"
+            exit 1
+          fi
+          after=$(git rev-parse HEAD)
+
+          if [ "$before" = "$after" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "nightly 已经包含 main 的全部提交，这次不构建镜像。" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git push
+          fi
+
+  prepare:
+    name: 算版本
+    needs: [sync]
+    # sync 在 push 触发时是被跳过的，而那种情况恰恰要构建，所以这里不能因为依赖被
+    # 跳过就跟着跳过。
+    if: ${{ always() && !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      commit: ${{ steps.ver.outputs.commit }}
+      skip: ${{ steps.ver.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: nightly
+          fetch-depth: 0
+      - name: 算版本
+        id: ver
+        env:
+          # 走 env 而不是把 ${{ }} 直接写进脚本里：空值在 shell 里的引号形态不值得
+          # 每次重新想一遍。
+          CHANGED: ${{ needs.sync.outputs.changed }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          # 短号是给人看的：它在界面的版本那一栏里和 version 并排显示。
+          commit=$(git rev-parse --short=7 HEAD)
+          echo "version=nightly-$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          echo "commit=${commit}" >> "$GITHUB_OUTPUT"
+
+          # 定时/手动触发，而 sync 说 main 没有新东西：整条流水线短路。每天重建一份
+          # 一模一样的镜像没有意义。
+          if [ "$EVENT" != "push" ] && [ "$CHANGED" != "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "nightly 没有新提交，跳过构建。" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  publish:
+    name: 构建并推送镜像
+    needs: [prepare]
+    if: ${{ always() && !failure() && !cancelled() && needs.prepare.outputs.skip != 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: nightly
+      - name: 取镜像名
+        id: image
+        run: |
+          # ghcr 的镜像路径必须全小写，而 github.repository 会保留账号的大小写
+          # （CodFrm/katch），直接拼上去会被拒。
+          echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # 两个标签各有各的用处：
+      #   nightly             跟着走的那个。清单里写 :nightly 会每天换一份内容。
+      #   nightly-<UTC 日期>  钉住某一天的，回看与回滚时用得上；日期与 cron 同一个
+      #                       时区，免得「凌晨那次算哪天」变成一个要查的问题。
+      # 注解写在 with 外面：那是 YAML 注释，不是塞进 tags 输入里的字符串。
+      - name: 生成标签
+        id: tags
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=nightly
+            type=raw,value=${{ needs.prepare.outputs.version }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: ${{ steps.tags.outputs.labels }}
+          build-args: |
+            VERSION=${{ needs.prepare.outputs.version }}
+            COMMIT=${{ needs.prepare.outputs.commit }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
