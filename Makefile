@@ -78,7 +78,12 @@ fmt:
 mock:
 	go generate ./...
 
+# 镜像名和 deploy/ 下的编排文件保持一致：compose、helm values、裸 manifests 引用的
+# 都是 IMAGE。本地 build 出来的 tag 要是对不上，compose up 会去拉一个远端的同名镜像，
+# 而你以为它跑的是刚编的那个。
+IMAGE ?= ghcr.io/codfrm/katch
+
 docker:
-	docker build -f deploy/Dockerfile -t katch/katch:$(VERSION) \
+	docker build -f deploy/Dockerfile -t $(IMAGE):$(VERSION) \
 	  --build-arg VERSION=$(VERSION) \
 	  --build-arg COMMIT=$(COMMIT) .
