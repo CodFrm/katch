@@ -65,7 +65,7 @@ func Router(_ context.Context, root *mux.Router) error {
 	// httputils.HandleError，中间没有别的钩子可挂，见 storage.go。
 	adminGroup := r.Group("/", requireAdminKey)
 	adminGroup.Bind(storageAware(upstreamCtr.List), storageAware(upstreamCtr.Save),
-		storageAware(upstreamCtr.Delete))
+		storageAware(upstreamCtr.Update), storageAware(upstreamCtr.Delete))
 	adminGroup.Bind(storageAware(statCtr.ByUpstream), storageAware(statCtr.UpstreamSeries))
 	ruleCtr := rule_ctr.NewRule()
 	adminGroup.Bind(storageAware(ruleCtr.List), storageAware(ruleCtr.Save),

@@ -373,11 +373,11 @@ func TestEventFeed_RecordsUpstreamChanges(t *testing.T) {
 		convey.So(testMux.Do(context.Background(), create, &admin.SaveUpstreamResponse{},
 			adminHeader(adminKey)), convey.ShouldBeNil)
 
-		update := &admin.SaveUpstreamRequest{
+		update := &admin.UpdateUpstreamRequest{
 			ID: 7, Host: "deb.debian.org", Kind: upstream_entity.KindStatic,
 			Origin: "https://deb.debian.org", Enabled: false,
 		}
-		convey.So(testMux.Do(context.Background(), update, &admin.SaveUpstreamResponse{},
+		convey.So(testMux.Do(context.Background(), update, &admin.UpdateUpstreamResponse{},
 			adminHeader(adminKey)), convey.ShouldBeNil)
 
 		convey.So(testMux.Do(context.Background(), &admin.DeleteUpstreamRequest{ID: 7},

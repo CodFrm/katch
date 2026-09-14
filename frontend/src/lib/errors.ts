@@ -11,6 +11,7 @@ import type { MutationResult } from './api'
 
 /** 后端 internal/pkg/code 里的业务码。只列界面真会分支的那几个。 */
 const MESSAGES: Record<number, string> = {
+  10001: 'admin.error.upstreamNotFound',
   10002: 'admin.error.upstreamHostExists',
   10004: 'admin.error.ruleNotFound',
   10005: 'admin.error.cacheObjectNotFound',

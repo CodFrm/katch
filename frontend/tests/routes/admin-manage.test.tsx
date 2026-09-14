@@ -323,20 +323,25 @@ function stubFetch() {
       }
       if (path === '/api/v1/admin/upstreams') {
         if (method === 'POST') {
-          const id = Number(body.id) || 9
-          const existing = backend.upstreams.find((item) => item.id === id)
-          if (existing) {
-            Object.assign(existing, body, { id })
-          } else {
-            backend.upstreams.push({
-              ...(backend.upstreams[0] as unknown as Record<string, unknown>),
-              ...body,
-              id,
-            } as unknown as (typeof backend.upstreams)[number])
-          }
+          const id = 9
+          backend.upstreams.push({
+            ...(backend.upstreams[0] as unknown as Record<string, unknown>),
+            ...body,
+            id,
+          } as unknown as (typeof backend.upstreams)[number])
           return envelope({ id })
         }
         return envelope({ list: backend.upstreams })
+      }
+      // 改一条已存在的上游：id 在路径上，请求体是它接下来的全貌。
+      if (path.startsWith('/api/v1/admin/upstreams/') && method === 'PUT') {
+        const id = Number(path.slice('/api/v1/admin/upstreams/'.length))
+        const existing = backend.upstreams.find((item) => item.id === id)
+        if (!existing) {
+          return rejected(10001, 'upstream not found')
+        }
+        Object.assign(existing, body, { id })
+        return envelope({ id })
       }
       if (path === '/api/v1/admin/events') {
         return envelope({ list: [] })
@@ -546,9 +551,9 @@ describe('后台 · 访问规则', () => {
     await userEvent.click(await screen.findByRole('radio', { name: '仅允许命中规则' }))
 
     const call = calls.find(
-      (item) => item.url === '/api/v1/admin/upstreams' && item.method === 'POST'
+      (item) => item.url === '/api/v1/admin/upstreams/1' && item.method === 'PUT'
     )
-    expect(call?.body).toMatchObject({ id: 1, default_policy: 'deny_unless_matched' })
+    expect(call?.body).toMatchObject({ default_policy: 'deny_unless_matched' })
   })
 })
 
@@ -715,7 +720,6 @@ describe('后台 · 上游的增改与启停', () => {
       return found!
     })
     expect(call.body).toMatchObject({
-      id: 0,
       host: 'ghcr.io',
       origin: 'https://ghcr.io',
       kind: 'registry',
@@ -730,19 +734,69 @@ describe('后台 · 上游的增改与启停', () => {
 
     const call = await vi.waitFor(() => {
       const found = calls.find(
-        (item) => item.url === '/api/v1/admin/upstreams' && item.method === 'POST'
+        (item) => item.url === '/api/v1/admin/upstreams/1' && item.method === 'PUT'
       )
       expect(found).toBeDefined()
       return found!
     })
+    // enabled 必须真的是 false 而不是缺省：两者在 JSON 里长得一样，
+    // 少了这个字段，后端看到的就是一次「没提启停」的改动。
+    expect(call.body.enabled).toBe(false)
     expect(call.body).toMatchObject({
-      id: 1,
       host: 'docker.io',
       origin: 'https://registry-1.docker.io',
-      enabled: false,
       library_completion: true,
       mutable_ttl_seconds: 300,
     })
+  })
+
+  it('暂停之后按钮变成恢复，再按一次写的是 enabled=true', async () => {
+    renderAdmin('/admin/upstreams/1')
+
+    await userEvent.click(await screen.findByRole('button', { name: '暂停' }))
+    await userEvent.click(await screen.findByRole('button', { name: '恢复' }))
+
+    const resumed = await vi.waitFor(() => {
+      const found = calls.filter(
+        (item) => item.url === '/api/v1/admin/upstreams/1' && item.method === 'PUT'
+      )
+      expect(found).toHaveLength(2)
+      return found[1]!
+    })
+    expect(resumed.body.enabled).toBe(true)
+  })
+
+  it('编辑表单保存时改的是这一条，而不是再登记一条新的', async () => {
+    renderAdmin('/admin/upstreams/1/edit')
+
+    const origin = await screen.findByLabelText('回源地址')
+    await userEvent.clear(origin)
+    await userEvent.type(origin, 'https://mirror.example.com')
+    await userEvent.click(screen.getByRole('button', { name: '保存上游' }))
+
+    const call = await vi.waitFor(() => {
+      const found = calls.find(
+        (item) => item.url === '/api/v1/admin/upstreams/1' && item.method === 'PUT'
+      )
+      expect(found).toBeDefined()
+      return found!
+    })
+    expect(call.body).toMatchObject({ host: 'docker.io', origin: 'https://mirror.example.com' })
+    expect(
+      calls.some((item) => item.url === '/api/v1/admin/upstreams' && item.method === 'POST')
+    ).toBe(false)
+  })
+
+  it('这条上游已经被别人删掉时，暂停按钮说的是它不在了，而不是一句泛泛的失败', async () => {
+    renderAdmin('/admin/upstreams/1')
+
+    // 界面手上这份列表是刚才拉的，而这条上游此刻已经不在后端了。
+    await screen.findByRole('button', { name: '暂停' })
+    backend.upstreams = backend.upstreams.filter((item) => item.id !== 1)
+
+    await userEvent.click(screen.getByRole('button', { name: '暂停' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('这条上游已经不在了')
   })
 
   it('编辑一个上游时表单里是它自己的登记信息', async () => {

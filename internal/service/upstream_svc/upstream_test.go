@@ -56,7 +56,8 @@ func TestFindByHost(t *testing.T) {
 	})
 }
 
-func TestSaveUpdate(t *testing.T) {
+// TestUpdate 改一条已存在的上游：整条替换，且这一条上游停用之后必须真的停着。
+func TestUpdate(t *testing.T) {
 	convey.Convey("更新已有上游", t, func() {
 		repo := setupUpstreamTest(t)
 		ctx := context.Background()
@@ -74,7 +75,7 @@ func TestSaveUpdate(t *testing.T) {
 					return nil
 				})
 
-			resp, err := Upstream().Save(ctx, &admin.SaveUpstreamRequest{
+			resp, err := Upstream().Update(ctx, &admin.UpdateUpstreamRequest{
 				ID: 7, Host: "docker.io", Kind: upstream_entity.KindRegistry,
 				Origin: "https://registry-1.docker.io", Enabled: false,
 			})
@@ -93,7 +94,7 @@ func TestSaveUpdate(t *testing.T) {
 			repo.EXPECT().FindByHost(gomock.Any(), "deb.debian.org").Return(
 				&upstream_entity.Upstream{ID: 9, Host: "deb.debian.org"}, nil)
 
-			_, err := Upstream().Save(ctx, &admin.SaveUpstreamRequest{
+			_, err := Upstream().Update(ctx, &admin.UpdateUpstreamRequest{
 				ID: 7, Host: "deb.debian.org", Kind: upstream_entity.KindStatic,
 				Origin: "https://deb.debian.org",
 			})
@@ -102,7 +103,7 @@ func TestSaveUpdate(t *testing.T) {
 
 		convey.Convey("id 不存在时报错，而不是悄悄新建一条", func() {
 			repo.EXPECT().Find(gomock.Any(), int64(404)).Return(nil, nil)
-			_, err := Upstream().Save(ctx, &admin.SaveUpstreamRequest{
+			_, err := Upstream().Update(ctx, &admin.UpdateUpstreamRequest{
 				ID: 404, Host: "docker.io", Kind: upstream_entity.KindRegistry,
 				Origin: "https://registry-1.docker.io",
 			})

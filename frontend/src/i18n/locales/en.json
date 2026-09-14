@@ -188,6 +188,7 @@
     "error": {
       "unreachable": "Cannot reach this katch, so nothing was saved. Check that the service is still running.",
       "rejected": "The backend did not accept this change.",
+      "upstreamNotFound": "This upstream no longer exists. Refresh and try again.",
       "upstreamHostExists": "An upstream with this host already exists.",
       "ruleNotFound": "That rule is gone. Refresh and try again.",
       "cacheObjectNotFound": "That cache object is gone.",

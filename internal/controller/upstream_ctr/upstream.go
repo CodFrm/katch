@@ -55,29 +55,46 @@ func (u *Upstream) PublicList(ctx context.Context, req *api_upstream.ListRequest
 	return resp, nil
 }
 
-// Save 新增或更新一条上游。
+// Save 新登记一条上游。
 //
-// 写成功之后往事件流里记一条：一个上游是谁在什么时候停掉的，恰恰是
-// 「拉取突然全挂了」之后第一个要查的东西，而那时界面上只剩下现在的状态。
+// 写成功之后往事件流里记一条：一个上游是谁在什么时候加进来的，和它是谁停掉的
+// 一样，事后只能从这条时间线上查——界面上只剩下现在的状态。
 func (u *Upstream) Save(ctx context.Context, req *admin.SaveUpstreamRequest) (*admin.SaveUpstreamResponse, error) {
 	resp, err := upstream_svc.Upstream().Save(ctx, req)
 	if err != nil {
 		return nil, err
 	}
-	kind := event_entity.KindUpstreamCreated
-	if req.ID != 0 {
-		kind = event_entity.KindUpstreamUpdated
+	u.record(ctx, event_entity.KindUpstreamCreated, resp.ID, req.Spec())
+	return resp, nil
+}
+
+// Update 整条替换一条已存在的上游，含启停。
+//
+// 「拉取突然全挂了」之后第一个要查的就是这条上游是谁在什么时候停掉的，而那时
+// 界面上只剩下现在的状态，所以启停必须和其余改动一样落进事件流。
+func (u *Upstream) Update(ctx context.Context, req *admin.UpdateUpstreamRequest) (*admin.UpdateUpstreamResponse, error) {
+	resp, err := upstream_svc.Upstream().Update(ctx, req)
+	if err != nil {
+		return nil, err
 	}
+	u.record(ctx, event_entity.KindUpstreamUpdated, resp.ID, req.Spec())
+	return resp, nil
+}
+
+// record 把一次上游写入记进事件流。
+//
+// 细节里带上 enabled：启停和改登记信息是同一个端点，少了这个字段，时间线上就分不
+// 出「改了回源地址」和「把它停了」——而后者才是运维要找的那一条。
+func (u *Upstream) record(ctx context.Context, kind string, id int64, spec *admin.UpstreamSpec) {
 	event_svc.Event().Record(ctx, &event_svc.RecordInput{
-		Kind: kind, Actor: event_entity.ActorAdmin, UpstreamID: resp.ID,
+		Kind: kind, Actor: event_entity.ActorAdmin, UpstreamID: id,
 		Detail: map[string]any{
-			"host":    req.Host,
-			"kind":    req.Kind,
-			"origin":  req.Origin,
-			"enabled": req.Enabled,
+			"host":    spec.Host,
+			"kind":    spec.Kind,
+			"origin":  spec.Origin,
+			"enabled": spec.Enabled,
 		},
 	})
-	return resp, nil
 }
 
 // Delete 删除一条上游。

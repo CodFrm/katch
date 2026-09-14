@@ -38,17 +38,39 @@ type ListUpstreamsResponse struct {
 	List []*UpstreamItem `json:"list"`
 }
 
-// SaveUpstreamRequest 新增或更新一条上游。ID 为 0 时新增，否则更新该条。
+// UpstreamSpec 一条上游的可写字段，新增与整条替换共用的那一份。
 //
-// 新增和更新合成一个接口：两者的字段集合完全相同，拆开只会有两份等价的校验。
+// 它没有标签，也不出现在任何请求体上：业务层只认这一个结构，于是「一次写入要落
+// 哪些字段」在这一层只有一处定义。两个请求结构体各自平铺一份带标签的字段，是被
+// 框架逼出来的——muxclient 只遍历顶层带 json/form/uri 标签的字段，嵌进去的结构体
+// 在序列化请求时会被整个跳过，那会让所有 Go 侧调用方发出空请求体。
+type UpstreamSpec struct {
+	Host string
+	Kind string
+	// Origin 回源地址。
+	Origin string
+	// Enabled 为 false 等同于不在白名单里：既不回源，也不在拉取路径上回显，
+	// 连已经躺在缓存里的副本都不再发出去。
+	Enabled           bool
+	ImmutablePatterns []string
+	MutableTTLSeconds int
+	DefaultPolicy     string
+	LibraryCompletion bool
+	Note              string
+}
+
+// SaveUpstreamRequest 新登记一条上游。
+//
+// 只负责新增：改一条已存在的上游走 PUT /admin/upstreams/:id。两者分开是因为
+// 「这条记录必须已经存在」是更新独有的前提——合成一个接口时，一个拿着过期列表的
+// 调用方本想改第 7 条，id 对不上就会悄悄多出一条新上游。
 type SaveUpstreamRequest struct {
 	mux.Meta `path:"/admin/upstreams" method:"POST"`
-	ID       int64  `json:"id"`
 	Host     string `json:"host" binding:"required" label:"上游主机名"`
 	// Kind 只有两种。其余差异靠本记录上的字段表达，而不是给每类上游写一个适配器。
 	Kind   string `json:"kind" binding:"required,oneof=registry static" label:"上游类别"`
 	Origin string `json:"origin" binding:"required,url" label:"回源地址"`
-	// Enabled 为 false 等同于不在白名单里：既不回源，也不在拉取路径上回显。
+	// Enabled 见 UpstreamSpec.Enabled。
 	Enabled           bool     `json:"enabled"`
 	ImmutablePatterns []string `json:"immutable_patterns"`
 	MutableTTLSeconds int      `json:"mutable_ttl_seconds" binding:"gte=0" label:"可变对象缓存时长"`
@@ -58,8 +80,54 @@ type SaveUpstreamRequest struct {
 	Note              string `json:"note"`
 }
 
+// Spec 这次请求要落的字段。
+func (r *SaveUpstreamRequest) Spec() *UpstreamSpec {
+	return &UpstreamSpec{
+		Host: r.Host, Kind: r.Kind, Origin: r.Origin, Enabled: r.Enabled,
+		ImmutablePatterns: r.ImmutablePatterns, MutableTTLSeconds: r.MutableTTLSeconds,
+		DefaultPolicy: r.DefaultPolicy, LibraryCompletion: r.LibraryCompletion, Note: r.Note,
+	}
+}
+
 // SaveUpstreamResponse 返回该条上游的 id，新增时这是调用方唯一能拿到 id 的地方。
 type SaveUpstreamResponse struct {
+	ID int64 `json:"id"`
+}
+
+// UpdateUpstreamRequest 整条替换一条已存在的上游，启停也走它。
+//
+// 是 PUT 而不是 PATCH：请求体就是这条上游接下来的**全貌**，服务端不必去分辨
+// 「这个字段是没给，还是给了零值」。停用因此不需要第二个端点——把 enabled 翻过来
+// 连同整条写回去即可，而按字段打补丁的 PATCH 恰恰会在 enabled=false 这里踩中零值：
+// 缺省与 false 在 JSON 里长得一样，停用会被静默丢掉，界面上停了、拉取路径上还活着。
+//
+// 字段与 SaveUpstreamRequest 逐字相同，理由见 UpstreamSpec。
+type UpdateUpstreamRequest struct {
+	mux.Meta `path:"/admin/upstreams/:id" method:"PUT"`
+	ID       int64  `uri:"id"`
+	Host     string `json:"host" binding:"required" label:"上游主机名"`
+	Kind     string `json:"kind" binding:"required,oneof=registry static" label:"上游类别"`
+	Origin   string `json:"origin" binding:"required,url" label:"回源地址"`
+	// Enabled 见 UpstreamSpec.Enabled。
+	Enabled           bool     `json:"enabled"`
+	ImmutablePatterns []string `json:"immutable_patterns"`
+	MutableTTLSeconds int      `json:"mutable_ttl_seconds" binding:"gte=0" label:"可变对象缓存时长"`
+	DefaultPolicy     string   `json:"default_policy" binding:"omitempty,oneof=allow_all deny_unless_matched" label:"默认策略"`
+	LibraryCompletion bool     `json:"library_completion"`
+	Note              string   `json:"note"`
+}
+
+// Spec 这次请求要落的字段。
+func (r *UpdateUpstreamRequest) Spec() *UpstreamSpec {
+	return &UpstreamSpec{
+		Host: r.Host, Kind: r.Kind, Origin: r.Origin, Enabled: r.Enabled,
+		ImmutablePatterns: r.ImmutablePatterns, MutableTTLSeconds: r.MutableTTLSeconds,
+		DefaultPolicy: r.DefaultPolicy, LibraryCompletion: r.LibraryCompletion, Note: r.Note,
+	}
+}
+
+// UpdateUpstreamResponse 返回被改的那条上游的 id。
+type UpdateUpstreamResponse struct {
 	ID int64 `json:"id"`
 }
 

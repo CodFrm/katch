@@ -192,6 +192,65 @@ func TestUpstreamAdminAuth(t *testing.T) {
 	})
 }
 
+// TestUpstreamUpdate 覆盖 PUT /admin/upstreams/:id：id 取自路径，请求体是这条上游
+// 接下来的全貌，停用（enabled=false）必须原样落到仓储上。
+//
+// 停用是这个端点上最要紧的一次写：它等同于把这台镜像站的白名单改小一条，而
+// 「enabled 是 false」和「enabled 没给」在 JSON 里长得一样——任何一处把零值当成
+// 「没给」的实现，都会让界面上停掉的上游在拉取路径上继续活着。
+func TestUpstreamUpdate(t *testing.T) {
+	upRepo, _, testMux, engine := setupAdminTest(t)
+	convey.Convey("改一条已存在的上游", t, func() {
+		convey.Convey("id 取自路径，停用原样落库", func() {
+			exist := &upstream_entity.Upstream{
+				ID: 7, Host: "deb.debian.org", Kind: "static",
+				Origin: "https://deb.debian.org", Enabled: true, Createtime: 111,
+			}
+			upRepo.EXPECT().Find(gomock.Any(), int64(7)).Return(exist, nil)
+			upRepo.EXPECT().FindByHost(gomock.Any(), "deb.debian.org").Return(exist, nil)
+			var stored *upstream_entity.Upstream
+			upRepo.EXPECT().Save(gomock.Any(), gomock.Any()).DoAndReturn(
+				func(_ context.Context, up *upstream_entity.Upstream) error {
+					stored = up
+					return nil
+				})
+
+			resp := &admin.UpdateUpstreamResponse{}
+			convey.So(testMux.Do(context.Background(), &admin.UpdateUpstreamRequest{
+				ID: 7, Host: "deb.debian.org", Kind: "static",
+				Origin: "https://ftp.cn.debian.org", Enabled: false, MutableTTLSeconds: 60,
+			}, resp, adminHeader(adminKey)), convey.ShouldBeNil)
+			convey.So(resp.ID, convey.ShouldEqual, 7)
+			convey.So(stored.ID, convey.ShouldEqual, 7)
+			convey.So(stored.Origin, convey.ShouldEqual, "https://ftp.cn.debian.org")
+			convey.So(stored.MutableTTLSeconds, convey.ShouldEqual, 60)
+			convey.So(stored.Enabled, convey.ShouldBeFalse)
+			// 请求里没有的只读字段不该被这次写入抹掉。
+			convey.So(stored.Createtime, convey.ShouldEqual, 111)
+		})
+
+		convey.Convey("不存在的 id 不会被悄悄新建成一条上游", func() {
+			upRepo.EXPECT().Find(gomock.Any(), int64(404)).Return(nil, nil)
+			convey.So(testMux.Do(context.Background(), &admin.UpdateUpstreamRequest{
+				ID: 404, Host: "deb.debian.org", Kind: "static",
+				Origin: "https://deb.debian.org", Enabled: true,
+			}, &admin.UpdateUpstreamResponse{}, adminHeader(adminKey)), convey.ShouldNotBeNil)
+		})
+
+		convey.Convey("没有密钥时 401，且一个字段都写不进去", func() {
+			// upRepo 上没有任何 EXPECT：一旦鉴权放行进 service，mock 会当场让用例失败。
+			req, err := testMux.Request(context.Background(), &admin.UpdateUpstreamRequest{
+				ID: 7, Host: "deb.debian.org", Kind: "static",
+				Origin: "https://deb.debian.org", Enabled: false,
+			})
+			convey.So(err, convey.ShouldBeNil)
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, req)
+			convey.So(w.Code, convey.ShouldEqual, http.StatusUnauthorized)
+		})
+	})
+}
+
 // TestUpstreamSaveDuplicateHost host 是白名单的 key，重复注册必须被挡住，
 // 否则同一个 host 会有两条记录，分发时命中哪条取决于查询顺序。
 func TestUpstreamSaveDuplicateHost(t *testing.T) {

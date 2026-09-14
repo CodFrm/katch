@@ -188,6 +188,7 @@
     "error": {
       "unreachable": "连不上这台 katch，改动没有保存。确认一下服务还在运行。",
       "rejected": "这次改动后端没有接受。",
+      "upstreamNotFound": "这条上游已经不在了，刷新一下再试。",
       "upstreamHostExists": "这个主机名已经有一条上游了。",
       "ruleNotFound": "这条规则已经不在了，刷新一下再试。",
       "cacheObjectNotFound": "这个缓存对象已经不在了。",

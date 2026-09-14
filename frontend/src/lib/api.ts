@@ -305,7 +305,7 @@ export type MutationResult<T> =
 async function adminSend<T>(
   path: string,
   key: string,
-  method: 'POST' | 'DELETE',
+  method: 'POST' | 'PUT' | 'DELETE',
   payload?: unknown
 ): Promise<MutationResult<T>> {
   try {
@@ -454,8 +454,18 @@ export function testRule(key: string, host: string, path: string) {
   return adminSend<RuleTestResult>('/api/v1/admin/rules/test', key, 'POST', { host, path })
 }
 
+/**
+ * 写一条上游。
+ *
+ * 没有 id 是新登记（POST /admin/upstreams），有 id 是整条替换那一条
+ * （PUT /admin/upstreams/:id）——启停也走后者：把 enabled 翻过来，连同其余登记字段
+ * 一起写回去。请求体里不带 id：要改哪一条由路径说了算，body 说的是它接下来的全貌。
+ */
 export function saveUpstream(key: string, upstream: UpstreamDraft) {
-  return adminSend<{ id: number }>('/api/v1/admin/upstreams', key, 'POST', upstream)
+  const { id, ...spec } = upstream
+  return id > 0
+    ? adminSend<{ id: number }>(`/api/v1/admin/upstreams/${id}`, key, 'PUT', spec)
+    : adminSend<{ id: number }>('/api/v1/admin/upstreams', key, 'POST', spec)
 }
 
 export function searchCacheObjects(
