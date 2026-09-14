@@ -22,6 +22,9 @@
 # dev-kit 的中间产物（mockup、草稿），不入库；正式 spec 在 docs/specs/
 /.dev-kit/
 
+# 运行时验证的现场产物（日志、缓存目录、报告），不入库
+/e2e/scratch/
+
 # 编辑器与系统
 .DS_Store
 .idea/
