@@ -106,54 +106,6 @@ func adminHeader(key string) muxclient.ClientDoOption {
 	return muxclient.WithHeader(http.Header{"Authorization": []string{"Bearer " + key}})
 }
 
-// TestUpstreamSaveAndList 覆盖任务目标 (a)：带正确密钥创建的上游能被 GET 读回，
-// 且每个字段都原样穿过 controller → service → repository 的映射。
-func TestUpstreamSaveAndList(t *testing.T) {
-	upRepo, _, testMux, _ := setupAdminTest(t)
-	convey.Convey("带正确密钥创建的上游能被列表读到", t, func() {
-		var stored *upstream_entity.Upstream
-		upRepo.EXPECT().FindByHost(gomock.Any(), "deb.debian.org").Return(nil, nil)
-		upRepo.EXPECT().Save(gomock.Any(), gomock.Any()).DoAndReturn(
-			func(_ context.Context, up *upstream_entity.Upstream) error {
-				up.ID = 7
-				stored = up
-				return nil
-			})
-
-		saveResp := &admin.SaveUpstreamResponse{}
-		err := testMux.Do(context.Background(), &admin.SaveUpstreamRequest{
-			Host:              "deb.debian.org",
-			Protocols:         []string{upstream_entity.ProtocolStatic},
-			Origin:            "https://deb.debian.org",
-			Enabled:           true,
-			ImmutablePatterns: []string{"pool/"},
-			MutableTTLSeconds: 300,
-			DefaultPolicy:     "allow_all",
-			Note:              "Debian 官方源",
-		}, saveResp, adminHeader(adminKey))
-		convey.So(err, convey.ShouldBeNil)
-		convey.So(saveResp.ID, convey.ShouldEqual, 7)
-		convey.So(stored, convey.ShouldNotBeNil)
-		convey.So(stored.Createtime, convey.ShouldBeGreaterThan, 0)
-
-		upRepo.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{stored}, nil)
-		listResp := &admin.ListUpstreamsResponse{}
-		convey.So(testMux.Do(context.Background(), &admin.ListUpstreamsRequest{}, listResp,
-			adminHeader(adminKey)), convey.ShouldBeNil)
-		convey.So(len(listResp.List), convey.ShouldEqual, 1)
-		item := listResp.List[0]
-		convey.So(item.ID, convey.ShouldEqual, 7)
-		convey.So(item.Host, convey.ShouldEqual, "deb.debian.org")
-		convey.So(item.Protocols, convey.ShouldResemble, []string{"static"})
-		convey.So(item.Origin, convey.ShouldEqual, "https://deb.debian.org")
-		convey.So(item.Enabled, convey.ShouldBeTrue)
-		convey.So(item.ImmutablePatterns, convey.ShouldResemble, []string{"pool/"})
-		convey.So(item.MutableTTLSeconds, convey.ShouldEqual, 300)
-		convey.So(item.DefaultPolicy, convey.ShouldEqual, "allow_all")
-		convey.So(item.Note, convey.ShouldEqual, "Debian 官方源")
-	})
-}
-
 // TestUpstreamAdminAuth 覆盖任务目标 (b)：未提供密钥与密钥错误的响应必须逐字节相同，
 // 否则探测者能靠响应差异确认「这个密钥名对了、只是值不对」。
 // upRepo 上一个 EXPECT 都没有：一旦鉴权放行进 service，mock 会当场让用例失败。

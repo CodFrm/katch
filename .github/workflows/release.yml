@@ -43,23 +43,19 @@ jobs:
       - run: make build
       - name: smoke
         run: make smoke
-      - name: 确认产物是静态链接
+      - name: Verify the binary is statically linked
         run: |
           file bin/katch
-          ! ldd bin/katch 2>/dev/null | grep -q "=>" || (echo "产物含动态链接依赖，CGO 可能被意外打开" && exit 1)
+          ! ldd bin/katch 2>/dev/null | grep -q "=>" || (echo "binary has dynamic link dependencies, CGO may have been enabled by accident" && exit 1)
 
-  publish:
-    needs: verify
+  prepare:
+    name: Compute version
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
     outputs:
-      image: ${{ steps.meta.outputs.image }}
       version: ${{ steps.version.outputs.version }}
+      commit: ${{ steps.version.outputs.commit }}
     steps:
-      - uses: actions/checkout@v4
-      - name: 取版本号
+      - name: Read the version
         id: version
         env:
           TAG: ${{ github.ref_name }}
@@ -67,46 +63,23 @@ jobs:
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
           # buildinfo.Commit 是给人看短号，不是给 git 用的完整 sha。
           echo "commit=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-      # ghcr 的镜像路径必须全小写，而 github.repository 会保留账号的大小写
-      # （CodFrm/katch），直接拼上去会被 ghcr 拒掉。bash 的 ${VAR,,} 转小写。
-      - name: 取镜像名
-        id: meta
-        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      # flavor 的 latest=auto 是默认值，也是这里要的：预发布版本（v0.2.0-rc1）
-      # 得到自己的标签，但顶不掉 latest——latest 永远指向最后一个正式版本。
-      # 语义化版本号取自 tag，所以 buildinfo 与镜像标签对得上。
-      - name: 生成标签
-        id: tags
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ steps.meta.outputs.image }}
-          tags: |
-            type=semver,pattern={{version}}
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: deploy/Dockerfile
-          # arm64 走 QEMU：产物是 CGO_ENABLED=0 的静态二进制，模拟只花在镜像构建
-          # 本身那几步上，不值得为此把构建拆成两个 runner 再合 manifest。
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.tags.outputs.tags }}
-          labels: ${{ steps.tags.outputs.labels }}
-          build-args: |
-            VERSION=${{ steps.version.outputs.version }}
-            COMMIT=${{ steps.version.outputs.commit }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+
+  publish:
+    # 双架构并发构建 + 合 manifest list 的细节都在被调用的那个 workflow 里，
+    # nightly.yml 调的是同一个。语义化版本号取自 tag，所以 buildinfo 与镜像标签对得上。
+    needs: [verify, prepare]
+    uses: ./.github/workflows/docker-publish.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      ref: ${{ github.ref }}
+      version: ${{ needs.prepare.outputs.version }}
+      commit: ${{ needs.prepare.outputs.commit }}
+      tags: type=semver,pattern={{version}}
 
   release:
-    needs: publish
+    needs: [prepare, publish]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -115,16 +88,16 @@ jobs:
         with:
           # --generate-notes 要拿上一个 tag 比对，浅克隆里没有它。
           fetch-depth: 0
-      - name: 建 GitHub Release
+      - name: Create the GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
           IMAGE: ${{ needs.publish.outputs.image }}
-          VERSION: ${{ needs.publish.outputs.version }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           # 重跑同一个 tag 时不该红：镜像已经发布成功了，这里只是把 Release 补上。
           if gh release view "$TAG" > /dev/null 2>&1; then
-            echo "release $TAG 已存在，跳过"
+            echo "release $TAG already exists, skipping"
             exit 0
           fi
 

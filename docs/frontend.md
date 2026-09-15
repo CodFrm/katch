@@ -8,10 +8,12 @@ React 19 + TypeScript + Vite + Tailwind v4 + shadcn/ui，构建产物经 `//go:e
 ```
 frontend/
   src/
-    components/ui/   # shadcn 生成的组件，视作上游代码，不手改
-    i18n/            # i18next 初始化与语言资源
-    lib/             # 纯函数工具（shadcn 的 cn 等）
-  tests/             # vitest 用例与 setup
+    components/     # 界面组件；其中 ui/ 是 shadcn 生成的，视作上游代码，不手改
+    hooks/          # 取数、会话、写操作的 React 钩子
+    i18n/           # i18next 初始化与语言资源
+    lib/            # 非组件逻辑：接口客户端、参照识别、格式化、主题
+    routes/         # 页面级组件
+  tests/            # vitest 用例与 setup
 ```
 
 ## 命令

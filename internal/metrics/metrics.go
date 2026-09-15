@@ -1,6 +1,6 @@
 // Package metrics 是拉取路径的计数器：一次拉取结束后，它记下这次的结果、耗时和字节数。
 //
-// 两个出口共用同一批计数（决策 16）：
+// 三个出口共用同一批计数（决策 16）：
 //
 //   - Prometheus：`/metrics` 上的 katch_* 指标，供外部采集；
 //   - 进程内分钟桶：由 stat_svc 每分钟取走一次落进 traffic_rollup，界面上的
@@ -585,8 +585,8 @@ func (r *Recorder) logPull(ctx context.Context, object string, ev Event) {
 		return
 	}
 	logger.Ctx(ctx).Debug(PullLogMessage,
-		// at 是这次拉取**结束**的时刻：日志按结束顺序落盘，用开始时刻会让
-		// 尾部的行在时间上不再单调，而面板就是按文件顺序从新到旧排的。
+		// at 是这次拉取**结束**的时刻：一次拉取的结果要到这时才成立，
+		// recent_request 的 at 列用的是同一个时刻，面板也按它从新到旧排。
 		zap.Int64("at", r.now().Unix()),
 		zap.String("upstream", ev.Upstream),
 		zap.String("object", object),

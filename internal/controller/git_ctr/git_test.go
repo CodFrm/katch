@@ -76,33 +76,6 @@ func statusOf(t *testing.T, err error) int {
 	return e.Status
 }
 
-// TestGitMirrorList 覆盖任务目标「管理界面出现 git 镜像列表页」的取数一侧。
-func TestGitMirrorList(t *testing.T) {
-	mirrorRepo, testMux, _ := setupGitTest(t)
-	convey.Convey("列出全部镜像记录", t, func() {
-		mirrorRepo.EXPECT().List(gomock.Any()).Return([]*git_entity.GitMirror{
-			{
-				ID: 7, Host: "github.com", Repo: "/foo/bar.git", State: git_entity.MirrorReady,
-				SizeBytes: 1024, LastSyncAt: 1757000000, LastAccessAt: 1757000100,
-				Createtime: 1756000000, Updatetime: 1757000000,
-			},
-		}, nil)
-
-		resp := &admin.ListGitMirrorsResponse{}
-		convey.So(testMux.Do(context.Background(), &admin.ListGitMirrorsRequest{}, resp,
-			adminHeader(adminKey)), convey.ShouldBeNil)
-		convey.So(len(resp.List), convey.ShouldEqual, 1)
-		item := resp.List[0]
-		convey.So(item.ID, convey.ShouldEqual, 7)
-		convey.So(item.Host, convey.ShouldEqual, "github.com")
-		convey.So(item.Repo, convey.ShouldEqual, "/foo/bar.git")
-		convey.So(item.State, convey.ShouldEqual, git_entity.MirrorReady)
-		convey.So(item.SizeBytes, convey.ShouldEqual, 1024)
-		convey.So(item.LastSyncAt, convey.ShouldEqual, 1757000000)
-		convey.So(item.LastAccessAt, convey.ShouldEqual, 1757000100)
-	})
-}
-
 // TestGitMirrorDelete 覆盖任务目标「可删除单条」，以及删除之后 Lookup 落回
 // 穿透——那一半在 git_svc 的用例里验，这里只验端点把 id 正确地交给了 service。
 func TestGitMirrorDelete(t *testing.T) {

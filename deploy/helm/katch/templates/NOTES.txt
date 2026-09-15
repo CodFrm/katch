@@ -34,7 +34,7 @@ katch {{ .Chart.AppVersion }} 已装到 {{ .Release.Namespace }}/{{ include "kat
 
      curl -X POST http://<katch>/api/v1/admin/upstreams \
        -H "Authorization: Bearer <管理密钥>" -H 'Content-Type: application/json' \
-       -d '{"host":"docker.io","kind":"registry","origin":"https://registry-1.docker.io",
+       -d '{"host":"docker.io","protocols":["registry"],"origin":"https://registry-1.docker.io",
             "enabled":true,"library_completion":true,"mutable_ttl_seconds":300}'
 
 3. 这个 release 恒为 1 个副本，chart 也没有 replicaCount。

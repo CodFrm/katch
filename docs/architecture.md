@@ -114,9 +114,9 @@ sqlite 的 DSN 里两个 pragma 不能省（见 `configs/config.yaml` 的注释�
 
 ## 上游适配
 
-第一版覆盖 container registry、APT、Go module proxy、GitHub 静态资源，共用一套
-「按上游主机名分发 + 内容寻址缓存」的骨架；registry 因为鉴权和路径形态特殊，
-单独成一类。具体的接口形态、缓存键与回源策略由该轮的 spec 确定，这里不预先假定。
+container registry、APT、Go module proxy、GitHub 静态资源共用一套「按上游主机名
+分发 + 内容寻址缓存」的骨架；registry 因为鉴权和路径形态特殊，单独成一类，
+git 因为要处理带请求体的协商，是另一个适配器（见下）。
 
 一条已经确定的原则：上游配置以**主机名**为 key，加一个新上游应当是加一行配置，
 而不是加一个新的路径前缀约定。

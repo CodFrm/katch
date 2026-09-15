@@ -79,9 +79,9 @@ logger:
 - **只记上游表里有的主机**。拉取路径是公开的，把没见过的主机名也写进去，等于让任何人
   都能往这台机器的磁盘上写字符串——和指标那边把未知主机折成 `unknown` 是同一条理由。
   它们的计数照记，只是不落日志；
-- **`at` 是这次拉取结束的时刻**，单位是秒。日志按结束顺序落盘，用开始时刻会让尾部的行
-  在时间上不再单调，而面板就是按文件顺序从新到旧排的。它和 zap 自己的 `ts` 并存，是因为
-  `ts` 的格式由 cago 的 encoder 决定，那不是本仓说了算的东西；
+- **`at` 是这次拉取结束的时刻**，单位是秒。一次拉取的结果要到这一刻才成立，
+  `recent_request` 的 `at` 列用的是同一个时刻，面板按它从新到旧排。它和 zap 自己的
+  `ts` 并存，是因为 `ts` 的格式由 cago 的 encoder 决定，那不是本仓说了算的东西；
 - **`result` 与 `katch_requests_total` 的 `result` 同一套取值**：`hit` / `miss` /
   `denied` / `origin_error`，git 的拉取另有 `local` / `passthrough`，判定也是同一处。
 
@@ -163,12 +163,12 @@ exporter 创建两次、双双注册进 prometheus 的默认 registry，于是 `
 采样窗口不一致时给出两个互相矛盾的数字。界面上的命中率同样是推导值，
 `traffic_rollup` 里也没有 `misses` 列——它是 `requests` 减去其余三项。
 
-以下指标在 spec 的可观测性一节里列出，但它们的埋点在别的缝上（回源客户端、
-缓存淘汰、规则求值、token 交换），由对应的任务补齐，这里不先占名字：
-`katch_origin_requests_total`、`katch_origin_duration_seconds`、
-`katch_origin_inflight`、`katch_cache_objects`、`katch_cache_bytes`、
-`katch_cache_evictions_total`、`katch_cache_integrity_failures_total`、
-`katch_rule_decisions_total`、`katch_token_exchanges_total`。
+其余指标的埋点在别的缝上：回源客户端给 `katch_origin_requests_total`、
+`katch_origin_duration_seconds`、`katch_origin_inflight`；
+缓存侧的 `katch_cache_objects`、`katch_cache_bytes`、`katch_cache_evictions_total`、
+`katch_cache_integrity_failures_total` 分别由 `stat_svc` 与 `cache_svc` 写；
+`katch_rule_decisions_total` 在 `rulegate`，`katch_token_exchanges_total` 在
+`registry`。指标本身都注册在 `internal/metrics` 上。
 
 ### git 的应答来源头
 

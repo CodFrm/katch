@@ -120,9 +120,8 @@ Deployment 上有一条 `checksum/config` 注解：配置一变 Pod 就重建。
 
 一个 PVC 挂在 `/app/data`，里面是 sqlite 库文件、缓存对象、日志三样。
 
-- **日志也在卷里**（`config.logger.logFile.filename: ./data/logs/katch.log`），
-  有两个原因：根文件系统是只读的，进程能写的地方只剩这一个挂载点；后台的
-  「最近请求」读的就是这个文件的有界尾部，放在 emptyDir 里每次升级那一块都是空的。
+- **日志也在卷里**（`config.logger.logFile.filename: ./data/logs/katch.log`）：
+  根文件系统是只读的，进程能写的地方只剩这一个挂载点。
 - **没有用 subPath。** kubelet 建出来的 subPath 目录是 `root:root 0755`，
   `fsGroup` 管不到它，而容器以 65532 跑——写不进去，症状是启动即 panic。
 - PVC 带 `helm.sh/resource-policy: keep`：一次手滑的 `helm uninstall` 不该把攒了
@@ -200,7 +199,7 @@ nginx.ingress.kubernetes.io/proxy-body-size: "0"
 ```bash
 curl -X POST http://<katch>/api/v1/admin/upstreams \
   -H "Authorization: Bearer <管理密钥>" -H 'Content-Type: application/json' \
-  -d '{"host":"docker.io","kind":"registry","origin":"https://registry-1.docker.io",
+  -d '{"host":"docker.io","protocols":["registry"],"origin":"https://registry-1.docker.io",
        "enabled":true,"library_completion":true,"mutable_ttl_seconds":300}'
 ```
 
@@ -243,7 +242,7 @@ helm upgrade katch deploy/helm/katch --reuse-values --set image.tag=0.2.0
 | 服务正常，命中率一直是 0 | 缓存目录不可写。katch 会降级成纯透传（拉取照常，只是不缓存）而不是崩掉，所以只能从这个数字上看出来 |
 | 拉取全是 404，响应体是空的 | 主机不在上游表里，或者被停用了。这三种情况对外故意长得一模一样——任何可观察的差别都在告诉探测者「这台主机存在，只是被停用了」 |
 | 后台全是 401 | `admin.initialKey` 没配，或者库里已经有一个轮换过的密钥了（配置文件覆盖不了它） |
-| 后台「最近请求」整块是空的 | `logger.logFile.enable` 被关了，或者日志文件不在卷里、Pod 重建后没了 |
+| 后台「最近请求」整块是空的 | 这个上游确实没被拉过，或者历史已经被 `recent_request_retention_seconds` 裁掉。日志开关、日志文件在不在卷里都不影响这块面板 |
 | 升级卡在 `ContainerCreating` | `strategy` 不是 `Recreate`，RWO 的卷把新旧 Pod 锁死了 |
 | 界面上停用了上游，可还在回源 | 开了多副本。见「为什么只能一个副本」 |
 | 大文件传一半断 / 首字节特别慢 | 反代的响应缓冲没关、超时没调大。见「放在反代后面」 |

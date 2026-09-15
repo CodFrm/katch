@@ -32,13 +32,11 @@ logger:
   # 关掉就只能进容器捞文件了。
   disableConsole: false
   logFile:
-    # 这个开关不只是「留一份文件」：后台的「最近请求」读的就是这个文件的有界尾部
-    # （决策 16 否掉了每请求写库）。关掉它，界面上那一块会整块消失。
+    # 关掉就只剩 stdout：容器里由 runtime 收走，捞历史要去容器的日志存储里翻。
     enable: true
-    # 日志落在数据卷里而不是 ./runtime/logs：
-    #   1. 容器根文件系统可以整个只读（compose 的 read_only、k8s 的
-    #      readOnlyRootFilesystem），进程要写的地方就只剩这一个挂载点；
-    #   2. 「最近请求」在容器重建之后还看得见，否则每次升级那一块都是空的。
+    # 日志落在数据卷里而不是 ./runtime/logs：容器根文件系统可以整个只读
+    # （compose 的 read_only、k8s 的 readOnlyRootFilesystem），进程要写的地方
+    # 就只剩这一个挂载点。
     filename: ./data/logs/katch.log
     errorFilename: ./data/logs/katch.err.log
 

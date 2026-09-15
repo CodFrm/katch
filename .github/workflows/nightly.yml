@@ -33,7 +33,7 @@ concurrency:
 
 jobs:
   sync:
-    name: 把 main 合进 nightly
+    name: Merge main into nightly
     # 只有定时与手动触发才合并。push 触发的那次是「nightly 刚被人推过」，再合并一次
     # 没有意义。
     if: github.event_name != 'push'
@@ -48,7 +48,7 @@ jobs:
           # fetch-depth: 0 同时把全部远端分支取下来，下面那个 origin/main 才有得合。
           ref: nightly
           fetch-depth: 0
-      - name: 合并 main
+      - name: Merge main
         id: merge
         run: |
           # 合并提交需要一个身份，用 Actions 自己的那个。
@@ -64,21 +64,21 @@ jobs:
           # 给这一步加了 shell:）就会变成「冲突后什么都没推，却报 changed=false 然后
           # 跳过构建」，一次安静的假成功。
           if ! git merge origin/main --no-edit; then
-            echo "::error::nightly 与 main 合并冲突，nightly 未改动，请人工处理"
+            echo "::error::nightly conflicts with main, nightly left untouched, manual resolution required"
             exit 1
           fi
           after=$(git rev-parse HEAD)
 
           if [ "$before" = "$after" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "nightly 已经包含 main 的全部提交，这次不构建镜像。" >> "$GITHUB_STEP_SUMMARY"
+            echo "nightly already contains every commit from main, skipping the image build." >> "$GITHUB_STEP_SUMMARY"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
             git push
           fi
 
   prepare:
-    name: 算版本
+    name: Compute version
     needs: [sync]
     # sync 在 push 触发时是被跳过的，而那种情况恰恰要构建，所以这里不能因为依赖被
     # 跳过就跟着跳过。
@@ -93,7 +93,7 @@ jobs:
         with:
           ref: nightly
           fetch-depth: 0
-      - name: 算版本
+      - name: Compute version
         id: ver
         env:
           # 走 env 而不是把 ${{ }} 直接写进脚本里：空值在 shell 里的引号形态不值得
@@ -110,59 +110,29 @@ jobs:
           # 一模一样的镜像没有意义。
           if [ "$EVENT" != "push" ] && [ "$CHANGED" != "true" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "nightly 没有新提交，跳过构建。" >> "$GITHUB_STEP_SUMMARY"
+            echo "no new commits on nightly, skipping the build." >> "$GITHUB_STEP_SUMMARY"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
   publish:
-    name: 构建并推送镜像
+    name: Publish the image
     needs: [prepare]
     if: ${{ always() && !failure() && !cancelled() && needs.prepare.outputs.skip != 'true' }}
-    runs-on: ubuntu-latest
+    # 双架构并发构建 + 合 manifest list 的细节都在被调用的那个 workflow 里，
+    # release.yml 调的是同一个——nightly 和发版镜像的结构因此不会各走各的。
+    uses: ./.github/workflows/docker-publish.yml
     permissions:
       contents: read
       packages: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: nightly
-      - name: 取镜像名
-        id: image
-        run: |
-          # ghcr 的镜像路径必须全小写，而 github.repository 会保留账号的大小写
-          # （CodFrm/katch），直接拼上去会被拒。
-          echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+    with:
+      ref: nightly
+      version: ${{ needs.prepare.outputs.version }}
+      commit: ${{ needs.prepare.outputs.commit }}
       # 两个标签各有各的用处：
       #   nightly             跟着走的那个。清单里写 :nightly 会每天换一份内容。
       #   nightly-<UTC 日期>  钉住某一天的，回看与回滚时用得上；日期与 cron 同一个
       #                       时区，免得「凌晨那次算哪天」变成一个要查的问题。
-      # 注解写在 with 外面：那是 YAML 注释，不是塞进 tags 输入里的字符串。
-      - name: 生成标签
-        id: tags
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ steps.image.outputs.name }}
-          tags: |
-            type=raw,value=nightly
-            type=raw,value=${{ needs.prepare.outputs.version }}
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: deploy/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.tags.outputs.tags }}
-          labels: ${{ steps.tags.outputs.labels }}
-          build-args: |
-            VERSION=${{ needs.prepare.outputs.version }}
-            COMMIT=${{ needs.prepare.outputs.commit }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      tags: |
+        type=raw,value=nightly
+        type=raw,value=${{ needs.prepare.outputs.version }}

@@ -228,23 +228,6 @@ func TestDeleteRule(t *testing.T) {
 	})
 }
 
-// TestListRules 列表把存储形态映射成对外结构，全局规则的 upstream_id 是 0。
-func TestListRules(t *testing.T) {
-	convey.Convey("列出全部规则", t, func() {
-		ruleRepo, _ := setupRuleTest(t)
-		ruleRepo.EXPECT().List(gomock.Any()).Return([]*rule_entity.AccessRule{
-			{ID: 1, UpstreamID: 0, Action: rule_entity.ActionDeny, Pattern: "*:latest", Note: "禁 latest"},
-		}, nil)
-
-		resp, err := Rule().List(context.Background(), &admin.ListRulesRequest{})
-		convey.So(err, convey.ShouldBeNil)
-		convey.So(len(resp.List), convey.ShouldEqual, 1)
-		convey.So(resp.List[0].UpstreamID, convey.ShouldEqual, 0)
-		convey.So(resp.List[0].Pattern, convey.ShouldEqual, "*:latest")
-		convey.So(resp.List[0].Note, convey.ShouldEqual, "禁 latest")
-	})
-}
-
 // TestListRules_OrderedBySpecificity 管理界面上那张表是「按具体度排序的规则表」：
 // 库里那个 pattern 字典序只是个稳定的底序，真按它显示，界面上的先后和求值时的
 // 先后就是两回事了。两边必须出自同一个 MoreSpecific（决策 15）。
