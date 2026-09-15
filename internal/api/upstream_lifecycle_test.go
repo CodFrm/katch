@@ -36,7 +36,7 @@ const lifecycleHost = "packages.upstream-lifecycle.invalid"
 type lifecycleUpstream struct {
 	ID                int64    `json:"id"`
 	Host              string   `json:"host"`
-	Kind              string   `json:"kind"`
+	Protocols         []string `json:"protocols"`
 	Origin            string   `json:"origin"`
 	Enabled           bool     `json:"enabled"`
 	ImmutablePatterns []string `json:"immutable_patterns"`
@@ -47,7 +47,7 @@ type lifecycleUpstream struct {
 func upstreamBody(origin string, enabled bool, ttl int) string {
 	return `{
 		"host": "` + lifecycleHost + `",
-		"kind": "static",
+		"protocols": ["static"],
 		"origin": "` + origin + `",
 		"enabled": ` + boolLiteral(enabled) + `,
 		"immutable_patterns": ["/pool/"],

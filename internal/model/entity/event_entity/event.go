@@ -34,6 +34,24 @@ const (
 	KindUpstreamRecovered = "upstream_recovered"
 	// KindCacheReclaimed 缓存超配额，跑了一次回收。
 	KindCacheReclaimed = "cache_reclaimed"
+	// KindGitMirrorPending 某个 git 仓库被拉到了，登记为待建镜像。
+	//
+	// 四种状态各一个类别，而不是一个 git_mirror_state 加一个 to 字段：
+	// 界面上的时间线按类别取文案，合成一个类别就得在文案里再分一次支，
+	// 而「建成了」和「建不了」本来就是两件该分开说的事。
+	KindGitMirrorPending = "git_mirror_pending"
+	// KindGitMirrorReady 镜像建成，盘上有一份可用的裸仓库。
+	KindGitMirrorReady = "git_mirror_ready"
+	// KindGitMirrorFailed 建镜像失败，原因在细节里。
+	KindGitMirrorFailed = "git_mirror_failed"
+	// KindGitMirrorRejected 仓库体积超过单仓上限，此后永久穿透。
+	KindGitMirrorRejected = "git_mirror_rejected"
+	// KindGitMirrorEvicted 镜像总量超过配额，这个仓库整份被回收掉。
+	//
+	// 和 cache_reclaimed 分开：那一条说的是一轮回收删了多少个对象，而镜像按
+	// 仓库粒度整个删，站长要知道的恰恰是「消失的是哪个仓库」——合成一个汇总
+	// 数字，时间线就答不出「我的 clone 为什么又开始穿透了」。
+	KindGitMirrorEvicted = "git_mirror_evicted"
 )
 
 // 操作人。同样是稳定枚举，界面据此把人为变更和自动事件在同一条时间线上区分开。

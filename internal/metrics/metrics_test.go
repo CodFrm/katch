@@ -585,3 +585,79 @@ func TestRecorder_HitRecordsNoMissReason(t *testing.T) {
 		convey.So(got[0].MissChanged, convey.ShouldEqual, 0)
 	})
 }
+
+// gitResponse 假的 git 应答：拉取路径在 git 的响应上留下的是 X-Katch-Git。
+func gitEngine(r *Recorder, hooks Hooks, source string) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.Use(r.Middleware(hooks))
+	engine.NoRoute(func(c *gin.Context) {
+		if source != "" {
+			c.Header(GitSourceHeader, source)
+		}
+		c.Data(http.StatusOK, "application/x-git-upload-pack-advertisement", []byte("0000"))
+	})
+	return engine
+}
+
+// TestRecorder_GitPullsCarryTheirOwnDimension 目标 (e)：git 的拉取和静态对象分得开，
+// 而且本地应答与穿透各自成一档（可观测性一节）。
+//
+// 没有这一维时，一次由本地镜像答完、一个字节都没问上游的 clone，在指标上和一次
+// 打穿到上游的拉取长得一模一样——镜像到底有没有在干活就无从回答。
+func TestRecorder_GitPullsCarryTheirOwnDimension(t *testing.T) {
+	convey.Convey("git 的拉取带自己的类别与来源", t, func() {
+		reg := prometheus.NewRegistry()
+		rec := New(Options{Registerer: reg})
+		hooks := Hooks{Lookup: knownUpstreams("git.example.com")}
+		advertise := "/git.example.com/foo/bar/info/refs?service=git-upload-pack"
+
+		get(gitEngine(rec, hooks, "local"), advertise)
+		get(gitEngine(rec, hooks, "local"), advertise)
+		get(gitEngine(rec, hooks, "passthrough"), advertise)
+
+		body := scrape(reg)
+		convey.So(body, convey.ShouldContainSubstring,
+			`katch_requests_total{kind="git",result="local",upstream="git.example.com"} 2`)
+		convey.So(body, convey.ShouldContainSubstring,
+			`katch_requests_total{kind="git",result="passthrough",upstream="git.example.com"} 1`)
+		convey.Convey("git 的拉取不再混在 static 里记成未命中", func() {
+			convey.So(body, convey.ShouldNotContainSubstring,
+				`kind="static",result="miss",upstream="git.example.com"`)
+		})
+
+		convey.Convey("界面那张表上，本地应答算命中、穿透算未命中", func() {
+			// 分钟桶只有四种结果可落：本地应答确实是「没问上游」，
+			// 穿透确实是「问了上游」，而未命中数是由总数减出来的，
+			// 四个回源原因之和必须还等于它。
+			var bucket Bucket
+			for _, b := range rec.Drain() {
+				if b.Host == "git.example.com" {
+					bucket = b
+				}
+			}
+			convey.So(bucket.Requests, convey.ShouldEqual, 3)
+			convey.So(bucket.Hits, convey.ShouldEqual, 2)
+			misses := bucket.Requests - bucket.Hits - bucket.Denied - bucket.OriginErrors
+			convey.So(misses, convey.ShouldEqual, 1)
+			convey.So(bucket.MissFirst+bucket.MissTTL+bucket.MissEvicted+bucket.MissChanged,
+				convey.ShouldEqual, misses)
+		})
+	})
+}
+
+// TestRecorder_RejectedGitRequestsAreStillGit push 的 403 与没开协议的 404 同样是
+// git 这一类，只是结果不同——类别说的是「这是哪种请求」，不是「它成功了没有」。
+func TestRecorder_RejectedGitRequestsAreStillGit(t *testing.T) {
+	convey.Convey("被拒的 git 请求也记在 git 这一类下", t, func() {
+		reg := prometheus.NewRegistry()
+		rec := New(Options{Registerer: reg})
+		hooks := Hooks{Lookup: knownUpstreams("git.example.com")}
+
+		engine := newTestEngine(rec, hooks, &upstreamResponse{status: http.StatusForbidden})
+		get(engine, "/git.example.com/foo/bar/info/refs?service=git-receive-pack")
+
+		convey.So(scrape(reg), convey.ShouldContainSubstring,
+			`katch_requests_total{kind="git",result="denied",upstream="git.example.com"} 1`)
+	})
+}

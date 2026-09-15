@@ -70,7 +70,7 @@ func TestUpstreamRepo_Save(t *testing.T) {
 				WillReturnResult(sqlmock.NewResult(7, 1))
 			mock.ExpectCommit()
 
-			up := &upstream_entity.Upstream{Host: "docker.io", Kind: upstream_entity.KindRegistry}
+			up := &upstream_entity.Upstream{Host: "docker.io", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolRegistry}}
 			convey.So(repo.Save(ctx, up), convey.ShouldBeNil)
 			convey.So(up.ID, convey.ShouldEqual, 7)
 			convey.So(mock.ExpectationsWereMet(), convey.ShouldBeNil)

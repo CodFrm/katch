@@ -83,7 +83,7 @@ logger:
   在时间上不再单调，而面板就是按文件顺序从新到旧排的。它和 zap 自己的 `ts` 并存，是因为
   `ts` 的格式由 cago 的 encoder 决定，那不是本仓说了算的东西；
 - **`result` 与 `katch_requests_total` 的 `result` 同一套取值**：`hit` / `miss` /
-  `denied` / `origin_error`，判定也是同一处。
+  `denied` / `origin_error`，git 的拉取另有 `local` / `passthrough`，判定也是同一处。
 
 ### 最近请求读的是一张明细表
 
@@ -135,7 +135,7 @@ exporter 创建两次、双双注册进 prometheus 的默认 registry，于是 `
 
 | 指标 | 标签 | 含义 |
 | --- | --- | --- |
-| `katch_requests_total` | `upstream`、`kind`、`result` | 拉取请求数。`result` ∈ `hit` / `miss` / `denied` / `origin_error` |
+| `katch_requests_total` | `upstream`、`kind`、`result` | 拉取请求数。`kind` ∈ `registry` / `static` / `git`；`result` ∈ `hit` / `miss` / `denied` / `origin_error`，git 那一类另有 `local` / `passthrough` |
 | `katch_request_duration_seconds` | `upstream`、`kind` | 拉取耗时直方图 |
 | `katch_bytes_served_total` | `upstream`、`source` | 发给客户端的字节数，`source` ∈ `cache` / `origin` |
 | `katch_origin_backoff` | `upstream` | 上游是否处于回源退避（降级）状态 |
@@ -144,6 +144,16 @@ exporter 创建两次、双双注册进 prometheus 的默认 registry，于是 `
 判定结果：502 是回源失败、403 是规则拒绝、带 `X-Katch-Cache: HIT` 的是命中、
 其余算回源取回（包括上游自己的 404——那是上游对这个对象的判断，不是 katch 拒绝了谁）。
 好处是埋点只有一处，不必在缓存层和代理层各插一次。
+
+**git 的拉取自成一类。** `kind` 按路径形态判（`info/refs?service=…` 与
+`…/git-upload-pack`），所以被 403 掉的 push 和没开协议的 404 同样记在 `git` 下——
+类别说的是「这是哪种请求」，成没成功是 `result` 那一维的事。`result` 则读响应上的
+`X-Katch-Git`：`local` 是由本地镜像答完、一个字节都没问上游，`passthrough` 是穿透
+上游。两者的状态码一模一样，差别只在这个头上，从状态码是猜不出来的。
+
+分钟桶（界面上那份统计）只有四种结果可落，git 的两档并进去：`local` 算命中——它
+确实没碰上游；`passthrough` 落在未命中那一档，回源原因记 `first`——git 的应答从不
+进对象缓存（决策 9），另外三个原因一个都不成立，而四项之和必须仍然等于未命中数。
 
 `upstream` 标签只取**上游表里有的**主机名，其余一律折叠成 `unknown`：拉取路径是
 公开的，把请求里的主机名原样当标签，等于给任何人开了一条不需要密码的时间序列
@@ -159,6 +169,25 @@ exporter 创建两次、双双注册进 prometheus 的默认 registry，于是 `
 `katch_origin_inflight`、`katch_cache_objects`、`katch_cache_bytes`、
 `katch_cache_evictions_total`、`katch_cache_integrity_failures_total`、
 `katch_rule_decisions_total`、`katch_token_exchanges_total`。
+
+### git 的应答来源头
+
+git 的应答带 `X-Katch-Git`，取值 `passthrough`（原样穿透上游）或 `local`
+（由本地镜像应答）。它**不复用 `X-Katch-Cache`**：那个头的语义是「这个对象有没有
+回源」，而 git 的一次应答不是一个对象——协商结果因客户端而异。两个头各自只回答
+一件事，才不会有人拿着一个 `MISS` 去猜镜像状态。
+
+git 的应答同时也永远不带 `X-Katch-Cache`：它们根本不进对象缓存（决策 9），
+写进去就是把一个客户端的协商结果发给另一个客户端。
+
+这个头同时是端到端用例的判据：判据必须是客户端能观察到的东西，而不是某个内部
+标志位——`internal/proxy/extension` 那条用例就是拿一个真的 `git clone` 加这个头，
+证明第二次 clone 真的没再碰上游。
+
+它也是 `katch_requests_total` 上 git 那两档的唯一出处（常量在 `internal/metrics`
+上定义，拉取路径引用它，两边不各写一遍字符串）。`local` 之外还有两种响应不带这个头：
+push 的 403 与没开 git 协议的 404——它们根本没有「谁答的」可言，在指标上按状态码
+落成 `denied`。
 
 ### 界面上的统计不走 Prometheus
 

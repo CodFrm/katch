@@ -26,7 +26,7 @@ const (
 
 func registryUpstream(host string) *upstream_entity.Upstream {
 	return &upstream_entity.Upstream{
-		ID: 9, Host: host, Kind: upstream_entity.KindRegistry,
+		ID: 9, Host: host, Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolRegistry},
 		ImmutablePatterns: upstream_entity.PatternList{"/blobs/sha256:"},
 		MutableTTLSeconds: 600,
 	}

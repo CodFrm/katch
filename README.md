@@ -105,7 +105,7 @@ curl -X POST http://localhost:8080/api/v1/admin/upstreams \
   -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
   -d '{
         "host": "docker.io",
-        "kind": "registry",
+        "protocols": ["registry"],
         "origin": "https://registry-1.docker.io",
         "enabled": true,
         "library_completion": true,
@@ -116,7 +116,7 @@ curl -X POST http://localhost:8080/api/v1/admin/upstreams \
   -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
   -d '{
         "host": "deb.debian.org",
-        "kind": "static",
+        "protocols": ["static"],
         "origin": "https://deb.debian.org",
         "enabled": true,
         "immutable_patterns": ["/pool/"],
@@ -124,15 +124,41 @@ curl -X POST http://localhost:8080/api/v1/admin/upstreams \
       }'
 ```
 
-`kind` 只有 `registry` 和 `static` 两种，其余差异靠记录上的字段表达：
-`immutable_patterns` 声明哪些路径是内容寻址的（可长期缓存 + LRU 淘汰），
-其余路径按 `mutable_ttl_seconds` 走短 TTL。
+`protocols` 是这条上游开着的协议集合，取值为 `registry`、`static`、`git`
+的任意非空子集——一条记录可以同时开几种，比如 `github.com` 既服务 `git clone`
+也服务 release 资产下载。协议之外的差异靠记录上的字段表达：`immutable_patterns`
+声明哪些路径是内容寻址的（可长期缓存 + LRU 淘汰），其余路径按 `mutable_ttl_seconds`
+走短 TTL。
 
 拉取时响应上的 `X-Katch-Cache: HIT|MISS` 能直接看出这一次有没有回源：
 
 ```bash
 curl -sI http://localhost:8080/deb.debian.org/debian/dists/bookworm/InRelease | grep -i x-katch-cache
 ```
+
+### git clone
+
+开了 `git` 协议的上游，仓库地址照同一条规则改写：
+
+```bash
+git clone http://localhost:8080/github.com/CodFrm/katch.git
+```
+
+第一次拉取原样穿透上游，katch 同时在后台把这个仓库镜像到本地；镜像建成之后，
+之后的 clone / fetch 由本地那份应答，一个字节都不再问上游。这一次是谁答的写在
+响应头 `X-Katch-Git` 上，取值 `local` 或 `passthrough`：
+
+```bash
+curl -sI "http://localhost:8080/github.com/CodFrm/katch.git/info/refs?service=git-upload-pack" \
+  | grep -i x-katch-git
+```
+
+refs 的新鲜度按上游记录上的 `mutable_ttl_seconds` 算：TTL 内直接用本地那份，
+超了先增量同步一次再广播，同步失败就这一次穿透上游，本地镜像照旧可用。
+
+几件本地答不了的事会**自动降级为穿透**，不会失败：`--depth`（浅克隆）、
+`--filter`（部分克隆），以及体积超过单仓上限的仓库。push 一律 403——katch 是
+镜像不是代码托管。镜像占多少盘由设置里的 `git_mirror_quota_bytes` 管着。
 
 ## 管理界面
 
@@ -142,7 +168,8 @@ curl -sI http://localhost:8080/deb.debian.org/debian/dists/bookworm/InRelease | 
 | 概览 | 请求量与命中率曲线、回源原因分布、上游健康矩阵、事件流、最近请求 |
 | 上游 | 增删改、启停，改完下一个请求就生效 |
 | 缓存对象 | 搜索、清理、锁定单个对象 |
-| 设置 | 站点名片、首页是否公开、缓存配额与回收水位、回源并发/超时/重试、管理密钥轮换 |
+| git 镜像 | 已建成的仓库镜像：状态、体积、最后同步与最后访问时间，可删除单个镜像 |
+| 设置 | 站点名片、首页是否公开、缓存配额与回收水位、回源并发/超时/重试、git 镜像配额与单仓上限、管理密钥轮换 |
 
 访问规则分全局与上游内两层，同层内按**具体度**排序、首个匹配者决定结果；
 保存前可以用规则测试器验证某个具体地址会被哪条规则决定。

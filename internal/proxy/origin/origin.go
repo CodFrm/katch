@@ -28,6 +28,16 @@ type Request struct {
 	RawQuery string
 	// Header 客户端的请求头。按白名单转发，不在白名单里的一律不带走。
 	Header http.Header
+	// Body 请求体，nil 表示这次回源没有请求体（绝大多数回源都是这一类）。
+	//
+	// 它只被读一次，读完就没了：调用方因此不能拿同一个 Request 重试——重发的
+	// 那一次会给上游送一个空的请求体，而上游会拿它当一次合法的空协商来答复。
+	Body io.Reader
+	// ContentLength 请求体的长度，-1 表示未知（分块传输）。Body 为 nil 时无意义。
+	//
+	// 原样抄客户端那一侧的值：git 客户端自己会在小请求上给长度、大请求上分块，
+	// 由 katch 改写这件事没有任何好处。
+	ContentLength int64
 	// Authorization katch **自己**换来的上游凭据，空串表示匿名请求。
 	//
 	// 它和 Header 分开是刻意的：Header 是客户端那一侧的头，白名单里永远不会有
@@ -49,7 +59,9 @@ type Response struct {
 // 白名单而不是黑名单：决策 11 要求不把客户端的 Authorization 交给上游，而黑名单
 // 意味着每出现一个新的凭据头都要记得去补一条，漏一次就是一次凭据泄漏。
 // 这几个头缺了会真的坏事——没有 Range 就没有断点续传和分段拉取，没有条件请求头
-// 就每次都要整份重下，没有 Accept 时 registry 不知道该给哪个 manifest 版本。
+// 就每次都要整份重下，没有 Accept 时 registry 不知道该给哪个 manifest 版本，
+// 没有 Content-Type 上游认不出这是一个 upload-pack 请求，没有 Git-Protocol
+// 协商会退回协议 v0（决策 10）。多出来的这两项各有确定用途，白名单仍是白名单。
 var forwardedRequestHeaders = []string{
 	"Accept",
 	"Accept-Encoding",
@@ -58,6 +70,8 @@ var forwardedRequestHeaders = []string{
 	"If-None-Match",
 	"If-Modified-Since",
 	"User-Agent",
+	"Content-Type",
+	"Git-Protocol",
 }
 
 // hopByHopHeaders 只在单跳内成立的响应头，不能转给客户端。
@@ -118,9 +132,15 @@ func (c *Client) Do(ctx context.Context, req *Request) (*Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, req.Method, target, nil)
+	httpReq, err := http.NewRequestWithContext(ctx, req.Method, target, req.Body)
 	if err != nil {
 		return nil, err
+	}
+	if req.Body != nil {
+		// NewRequest 只认得几种已知类型的长度，别的一律按未知（分块）处理。
+		// 客户端给了长度就照抄回去，免得一个本来带 Content-Length 的小请求
+		// 变成分块传输——有的上游对分块的 upload-pack 请求并不友好。
+		httpReq.ContentLength = req.ContentLength
 	}
 	for _, k := range forwardedRequestHeaders {
 		if v := req.Header.Values(k); len(v) > 0 {

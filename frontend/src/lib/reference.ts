@@ -7,13 +7,22 @@
  * 「不支持」，而那正是这台镜像站最该答对的问题。
  */
 
-/** 上游的协议类别，与后端 upstream_entity.Kind 同一套取值。 */
-export type UpstreamKind = 'registry' | 'static'
+/** 上游能服务的协议，与后端 upstream_entity 的 Protocol* 常量同一套取值。 */
+export type UpstreamProtocol = 'registry' | 'static' | 'git'
+
+/**
+ * 一条引用识别成了哪种形态。
+ *
+ * 它是**这一次识别**的结论，不是上游开着的协议集合：一条上游可以同时开几种，
+ * 但一行引用只对应一条命令，要么 docker pull 要么 curl。git 不在里面——clone
+ * 的地址照抄就行，助手没有第三条命令要拼。
+ */
+export type ReferenceKind = 'registry' | 'static'
 
 /** 解析时用得上的上游字段，由公开上游列表接口提供。 */
 export interface UpstreamRef {
   host: string
-  kind: UpstreamKind
+  protocols: UpstreamProtocol[]
   libraryCompletion: boolean
 }
 
@@ -36,7 +45,7 @@ export type ParsedReference =
   | {
       status: 'ok'
       host: string
-      kind: UpstreamKind
+      kind: ReferenceKind
       /** 主机名是否在上游表里核对过。拿不到上游表时为 false。 */
       verified: boolean
       /** 识别出的完整资源引用，形如 `docker.io/library/redis:7`。 */
@@ -86,13 +95,13 @@ export function parseReference(input: string, options: ParseOptions): ParsedRefe
   if (upstreams !== null && entry === null) {
     return { status: 'unknown', host }
   }
-  if (upstreams !== null && !headIsHost && entry!.kind !== 'registry') {
-    // 裸镜像名只可能落到 registry 上：默认上游被配成静态资源时它认不出来。
+  if (upstreams !== null && !headIsHost && !entry!.protocols.includes('registry')) {
+    // 裸镜像名只可能落到 registry 上：默认上游没开 registry 时它认不出来。
     return { status: 'unknown', host }
   }
 
   const path = headIsHost ? tail : '/' + body
-  const kind = entry ? entry.kind : guessKind(scheme !== null, path)
+  const kind = resolveKind(entry, scheme !== null, path)
   const verified = entry !== null
 
   if (kind === 'registry') {
@@ -140,12 +149,31 @@ function looksLikeHost(segment: string): boolean {
 }
 
 /**
- * 拿不到上游表时只能从形态上猜类别。
+ * 这一行引用落到哪种形态上。
+ *
+ * 先按写法猜，再拿上游开着的协议去校：一条同时开了 static 与 git 的记录，
+ * 静态资源照常拼成下载命令；一条只开 registry 的记录，即使写法不像镜像引用
+ * （比如没写 tag）也只能是镜像引用。上游表拿不到时只剩猜这一条路。
+ *
+ * registry 优先于 static，与「裸镜像名只落到 registry」那一条同向：两种都开着
+ * 的记录上，猜不出来的写法按镜像引用处理。
+ */
+function resolveKind(entry: UpstreamRef | null, hadScheme: boolean, path: string): ReferenceKind {
+  const guessed = guessKind(hadScheme, path)
+  if (entry === null || entry.protocols.includes(guessed)) {
+    return guessed
+  }
+  return entry.protocols.includes('registry') ? 'registry' : 'static'
+}
+
+/**
+ * 只从写法上猜这是哪种引用。
  *
  * 只有两条依据：写了协议的是资源地址；末段带 tag 或 digest 的是镜像引用。
- * 猜错的代价是一条拉不动的命令，而不是一个假的「不支持」——所以宁可猜。
+ * 上游表拿不到时这就是全部依据，猜错的代价是一条拉不动的命令，而不是一个假的
+ * 「不支持」——所以宁可猜。
  */
-function guessKind(hadScheme: boolean, path: string): UpstreamKind {
+function guessKind(hadScheme: boolean, path: string): ReferenceKind {
   if (hadScheme) {
     return 'static'
   }

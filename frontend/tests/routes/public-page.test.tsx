@@ -11,7 +11,7 @@ const upstreams: UpstreamList = {
   list: [
     {
       host: 'docker.io',
-      kind: 'registry',
+      protocols: ['registry'],
       library_completion: true,
       hit_rate: 0.942,
       cache_bytes: 871938031616,
@@ -19,7 +19,7 @@ const upstreams: UpstreamList = {
     },
     {
       host: 'deb.debian.org',
-      kind: 'static',
+      protocols: ['static'],
       library_completion: false,
       hit_rate: 0.961,
       cache_bytes: 462754185216,

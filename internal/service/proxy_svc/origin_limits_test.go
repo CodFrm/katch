@@ -158,7 +158,7 @@ func TestFetch_QueueWaitIsBounded(t *testing.T) {
 
 		repo := setupRepo(t)
 		repo.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{
-			{ID: 1, Host: "deb.debian.org", Kind: upstream_entity.KindStatic,
+			{ID: 1, Host: "deb.debian.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
 				Origin: srv.URL, Enabled: true},
 		}, nil).AnyTimes()
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"log"
+	"os"
 	"time"
 
 	"github.com/cago-frame/cago"
@@ -28,11 +29,13 @@ import (
 	"github.com/CodFrm/katch/internal/proxy/backoff"
 	"github.com/CodFrm/katch/internal/repository/cache_repo"
 	"github.com/CodFrm/katch/internal/repository/event_repo"
+	"github.com/CodFrm/katch/internal/repository/git_repo"
 	"github.com/CodFrm/katch/internal/repository/request_log_repo"
 	"github.com/CodFrm/katch/internal/repository/rollup_repo"
 	"github.com/CodFrm/katch/internal/repository/setting_repo"
 	"github.com/CodFrm/katch/internal/repository/upstream_repo"
 	"github.com/CodFrm/katch/internal/service/cache_svc"
+	"github.com/CodFrm/katch/internal/service/git_svc"
 	"github.com/CodFrm/katch/internal/service/proxy_svc"
 	"github.com/CodFrm/katch/internal/service/request_svc"
 	"github.com/CodFrm/katch/internal/service/setting_svc"
@@ -60,6 +63,20 @@ type cacheConfig struct {
 
 // defaultCacheDir 配置里没写 cache 段时用的缓存目录。
 const defaultCacheDir = "./data/cache"
+
+// gitConfig 是 configs/config.yaml 的 git 段。
+//
+// 同样只有一个「进程起不来就没法从界面改」的东西：本地镜像的根目录。总配额、
+// 单仓上限、同步超时与并发这些跑起来之后才生效的参数一律落 setting 表。
+type gitConfig struct {
+	Dir string `yaml:"dir"`
+}
+
+// defaultGitMirrorDir 配置里没写 git 段时用的镜像目录。
+//
+// 和缓存目录并排而不是套在它下面：两者的淘汰依据不同（对象按 LRU + 摘要，
+// 镜像按最后访问时间 + 仓库粒度），混在一处会让任一侧的配额失去意义。
+const defaultGitMirrorDir = "./data/mirrors"
 
 func main() {
 	// 这里还用标准库 log：cago 的 logger 要等 component.Core() 跑完才可用，
@@ -131,6 +148,7 @@ func main() {
 			cache_repo.RegisterCacheObject(cache_repo.NewCacheObject())
 			rollup_repo.RegisterTrafficRollup(rollup_repo.NewTrafficRollup())
 			request_log_repo.RegisterRequestLog(request_log_repo.NewRequestLog())
+			git_repo.RegisterGitMirror(git_repo.NewGitMirror())
 			// 事件仓储不装配的话，退避转换、缓存回收和管理写入都记不下来——
 			// event_svc 遇到 nil 是丢掉事件并留一条日志，不会连累被观察的操作。
 			event_repo.RegisterEvent(event_repo.NewEvent())
@@ -191,6 +209,49 @@ func main() {
 			})
 			return nil
 		})).
+		// git 本地镜像：目录建不出来就保持出厂的「关着」形态，clone 照常穿透
+		// （决策 5）。必须排在仓储装配之后——镜像记录要走 git_repo。
+		Registry(cago.FuncComponent(func(ctx context.Context, cfg *configs.Config) error {
+			gitCfg := gitConfig{Dir: defaultGitMirrorDir}
+			has, err := cfg.Has(ctx, "git")
+			if err != nil {
+				return err
+			}
+			if has {
+				if err := cfg.Scan(ctx, "git", &gitCfg); err != nil {
+					return err
+				}
+			}
+			if gitCfg.Dir == "" {
+				gitCfg.Dir = defaultGitMirrorDir
+			}
+			// 启动时就把根目录建出来，而不是等第一次建镜像才发现写不了：
+			// 那时报出来的是一条淹没在拉取日志里的失败，而这里报出来的是
+			// 「这台 katch 不会建镜像」这个结论。
+			if err := os.MkdirAll(gitCfg.Dir, gitMirrorDirPerm); err != nil {
+				logger.Ctx(ctx).Error("镜像目录不可用，git 只穿透不建本地镜像",
+					zap.String("dir", gitCfg.Dir), zap.Error(err))
+				return nil
+			}
+			// 配额、单仓上限、同步超时与并发不在这里给：它们是 setting 表里的
+			// 运行时项，由镜像层每次用到时现读（决策 3/4）。
+			git_svc.Register(git_svc.New(git_svc.Options{Dir: gitCfg.Dir}))
+			gogo.Go(func() error {
+				// 定期把镜像总量按配额收一次，理由同 runCacheSweep：站长在设置页
+				// 把配额调小之后，不该要等到下一次有人拉新仓库才回到配额之下。
+				runGitMirrorSweep(ctx)
+				// ctx 结束就是进程要停了。建镜像脱离请求跑，此刻可能正有一趟
+				// clone 在往盘上写；直接退出会留下半个仓库，下次启动时那条
+				// pending 记录会让它重来一次——但等一等更省事，也更干净。
+				drainCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), mirrorDrainTimeout)
+				defer cancel()
+				if err := git_svc.Mirror().Quiesce(drainCtx); err != nil {
+					logger.Ctx(ctx).Warn("仍有后台建镜像没能在退出前收尾", zap.Error(err))
+				}
+				return nil
+			})
+			return nil
+		})).
 		// 统计：拉取路径的计数中间件 + 每分钟把进程内计数器落成分钟桶。
 		// 必须排在仓储装配之后（要写 traffic_rollup）。
 		Registry(statSvc).
@@ -222,6 +283,23 @@ func main() {
 // cache_object 只是在给库添活。
 const cacheSweepInterval = 10 * time.Minute
 
+// gitMirrorDirPerm 镜像根目录的权限，同 git_svc 里建各仓库目录时用的那个。
+const gitMirrorDirPerm = 0o750
+
+// gitSweepInterval 多久按配额收一次镜像。
+//
+// 建镜像与增量同步本身已经在每次落盘之后触发一次淘汰（决策 3/4），这里补的是
+// 「配额被调小、但没人再拉新仓库」这一种情况——不必等到下一次有人来才发现
+// 总量早就超了。
+const gitSweepInterval = 10 * time.Minute
+
+// mirrorDrainTimeout 退出时留给存量建镜像的收尾窗口。
+//
+// 比缓存那个长一些但仍然有限：一趟 clone 是分钟级的事，等它跑完等于把退出
+// 交给上游决定。等不到就记一条日志走人——那条记录还停在 pending，下次启动
+// 时的第一次拉取会重新驱动它。
+const mirrorDrainTimeout = 60 * time.Second
+
 // cacheDrainTimeout 退出时留给存量后台缓存写入的收尾窗口。
 //
 // 取一个比回源超时略长的值：正常收尾只差提交文件与写一条记录，是毫秒级的事；
@@ -240,6 +318,27 @@ func runCacheSweep(ctx context.Context) {
 			logger.Ctx(ctx).Error("清理过期缓存对象失败", zap.Error(err))
 		} else if removed > 0 {
 			logger.Ctx(ctx).Info("清理过期缓存对象", zap.Int64("removed", removed))
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// runGitMirrorSweep 跑定时的配额回收，直到 ctx 结束。
+//
+// 和 runCacheSweep 同一个形状：启动后先跑一次再进循环，进程可能已经停了几天，
+// 重启那一刻配额是否超了不该等十分钟才知道。
+func runGitMirrorSweep(ctx context.Context) {
+	ticker := time.NewTicker(gitSweepInterval)
+	defer ticker.Stop()
+	for {
+		if removed, err := git_svc.Sweep(ctx); err != nil {
+			logger.Ctx(ctx).Error("按配额回收镜像失败", zap.Error(err))
+		} else if removed > 0 {
+			logger.Ctx(ctx).Info("按配额回收镜像", zap.Int64("removed", removed))
 		}
 		select {
 		case <-ctx.Done():

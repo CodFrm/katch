@@ -76,7 +76,7 @@ func (u *upstreamSvc) PublicList(ctx context.Context, _ *api_upstream.ListReques
 		}
 		resp.List = append(resp.List, &api_upstream.Item{
 			Host:              v.Host,
-			Kind:              v.Kind,
+			Protocols:         protocols(v),
 			LibraryCompletion: v.LibraryCompletion,
 		})
 	}
@@ -132,7 +132,7 @@ func (u *upstreamSvc) write(ctx context.Context, id int64, spec *admin.UpstreamS
 		policy = upstream_entity.PolicyAllowAll
 	}
 	upstream.Host = spec.Host
-	upstream.Kind = spec.Kind
+	upstream.Protocols = upstream_entity.ProtocolSet(spec.Protocols)
 	upstream.Origin = spec.Origin
 	// 整条替换，所以 enabled 原样照抄：这里任何一处「false 就不覆盖」的写法，
 	// 都会让停用这个动作在库里什么也没发生。
@@ -180,6 +180,16 @@ func (u *upstreamSvc) Delete(ctx context.Context, req *admin.DeleteUpstreamReque
 	return &admin.DeleteUpstreamResponse{}, nil
 }
 
+// protocols 把协议集合拷成一份普通 []string，不把存储形态泄漏给调用方。
+//
+// 拷贝而不是转换：直接转换出去的切片与实体共享底层数组，调用方改一下就把
+// 那条上游的判定改了。
+func protocols(v *upstream_entity.Upstream) []string {
+	out := make([]string, 0, len(v.Protocols))
+	out = append(out, v.Protocols...)
+	return out
+}
+
 // toItem 把实体映射成对外结构。模式列表转成 []string，不把存储形态泄漏出去。
 func toItem(v *upstream_entity.Upstream) *admin.UpstreamItem {
 	patterns := make([]string, 0, len(v.ImmutablePatterns))
@@ -187,7 +197,7 @@ func toItem(v *upstream_entity.Upstream) *admin.UpstreamItem {
 	return &admin.UpstreamItem{
 		ID:                v.ID,
 		Host:              v.Host,
-		Kind:              v.Kind,
+		Protocols:         protocols(v),
 		Origin:            v.Origin,
 		Enabled:           v.Enabled,
 		ImmutablePatterns: patterns,

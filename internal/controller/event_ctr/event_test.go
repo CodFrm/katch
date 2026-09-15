@@ -363,18 +363,18 @@ func TestEventFeed_RecordsUpstreamChanges(t *testing.T) {
 		// 删除前要先把主机名取出来：删完这条记录就没了，事件里只留一个 id 的话，
 		// 界面上这条「上游已删除」永远指不出删的是哪一个。
 		upRepo.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{
-			{ID: 7, Host: "deb.debian.org", Kind: upstream_entity.KindStatic},
+			{ID: 7, Host: "deb.debian.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic}},
 		}, nil).AnyTimes()
 
 		create := &admin.SaveUpstreamRequest{
-			Host: "deb.debian.org", Kind: upstream_entity.KindStatic,
+			Host: "deb.debian.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
 			Origin: "https://deb.debian.org", Enabled: true,
 		}
 		convey.So(testMux.Do(context.Background(), create, &admin.SaveUpstreamResponse{},
 			adminHeader(adminKey)), convey.ShouldBeNil)
 
 		update := &admin.UpdateUpstreamRequest{
-			ID: 7, Host: "deb.debian.org", Kind: upstream_entity.KindStatic,
+			ID: 7, Host: "deb.debian.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
 			Origin: "https://deb.debian.org", Enabled: false,
 		}
 		convey.So(testMux.Do(context.Background(), update, &admin.UpdateUpstreamResponse{},

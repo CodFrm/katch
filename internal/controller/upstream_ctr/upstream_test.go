@@ -123,7 +123,7 @@ func TestUpstreamSaveAndList(t *testing.T) {
 		saveResp := &admin.SaveUpstreamResponse{}
 		err := testMux.Do(context.Background(), &admin.SaveUpstreamRequest{
 			Host:              "deb.debian.org",
-			Kind:              "static",
+			Protocols:         []string{upstream_entity.ProtocolStatic},
 			Origin:            "https://deb.debian.org",
 			Enabled:           true,
 			ImmutablePatterns: []string{"pool/"},
@@ -144,7 +144,7 @@ func TestUpstreamSaveAndList(t *testing.T) {
 		item := listResp.List[0]
 		convey.So(item.ID, convey.ShouldEqual, 7)
 		convey.So(item.Host, convey.ShouldEqual, "deb.debian.org")
-		convey.So(item.Kind, convey.ShouldEqual, "static")
+		convey.So(item.Protocols, convey.ShouldResemble, []string{"static"})
 		convey.So(item.Origin, convey.ShouldEqual, "https://deb.debian.org")
 		convey.So(item.Enabled, convey.ShouldBeTrue)
 		convey.So(item.ImmutablePatterns, convey.ShouldResemble, []string{"pool/"})
@@ -203,8 +203,9 @@ func TestUpstreamUpdate(t *testing.T) {
 	convey.Convey("改一条已存在的上游", t, func() {
 		convey.Convey("id 取自路径，停用原样落库", func() {
 			exist := &upstream_entity.Upstream{
-				ID: 7, Host: "deb.debian.org", Kind: "static",
-				Origin: "https://deb.debian.org", Enabled: true, Createtime: 111,
+				ID: 7, Host: "deb.debian.org",
+				Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+				Origin:    "https://deb.debian.org", Enabled: true, Createtime: 111,
 			}
 			upRepo.EXPECT().Find(gomock.Any(), int64(7)).Return(exist, nil)
 			upRepo.EXPECT().FindByHost(gomock.Any(), "deb.debian.org").Return(exist, nil)
@@ -217,8 +218,9 @@ func TestUpstreamUpdate(t *testing.T) {
 
 			resp := &admin.UpdateUpstreamResponse{}
 			convey.So(testMux.Do(context.Background(), &admin.UpdateUpstreamRequest{
-				ID: 7, Host: "deb.debian.org", Kind: "static",
-				Origin: "https://ftp.cn.debian.org", Enabled: false, MutableTTLSeconds: 60,
+				ID: 7, Host: "deb.debian.org",
+				Protocols: []string{upstream_entity.ProtocolStatic},
+				Origin:    "https://ftp.cn.debian.org", Enabled: false, MutableTTLSeconds: 60,
 			}, resp, adminHeader(adminKey)), convey.ShouldBeNil)
 			convey.So(resp.ID, convey.ShouldEqual, 7)
 			convey.So(stored.ID, convey.ShouldEqual, 7)
@@ -232,16 +234,18 @@ func TestUpstreamUpdate(t *testing.T) {
 		convey.Convey("不存在的 id 不会被悄悄新建成一条上游", func() {
 			upRepo.EXPECT().Find(gomock.Any(), int64(404)).Return(nil, nil)
 			convey.So(testMux.Do(context.Background(), &admin.UpdateUpstreamRequest{
-				ID: 404, Host: "deb.debian.org", Kind: "static",
-				Origin: "https://deb.debian.org", Enabled: true,
+				ID: 404, Host: "deb.debian.org",
+				Protocols: []string{upstream_entity.ProtocolStatic},
+				Origin:    "https://deb.debian.org", Enabled: true,
 			}, &admin.UpdateUpstreamResponse{}, adminHeader(adminKey)), convey.ShouldNotBeNil)
 		})
 
 		convey.Convey("没有密钥时 401，且一个字段都写不进去", func() {
 			// upRepo 上没有任何 EXPECT：一旦鉴权放行进 service，mock 会当场让用例失败。
 			req, err := testMux.Request(context.Background(), &admin.UpdateUpstreamRequest{
-				ID: 7, Host: "deb.debian.org", Kind: "static",
-				Origin: "https://deb.debian.org", Enabled: false,
+				ID: 7, Host: "deb.debian.org",
+				Protocols: []string{upstream_entity.ProtocolStatic},
+				Origin:    "https://deb.debian.org", Enabled: false,
 			})
 			convey.So(err, convey.ShouldBeNil)
 			w := httptest.NewRecorder()
@@ -259,7 +263,8 @@ func TestUpstreamSaveDuplicateHost(t *testing.T) {
 		upRepo.EXPECT().FindByHost(gomock.Any(), "docker.io").Return(
 			&upstream_entity.Upstream{ID: 3, Host: "docker.io"}, nil)
 		err := testMux.Do(context.Background(), &admin.SaveUpstreamRequest{
-			Host: "docker.io", Kind: "registry", Origin: "https://registry-1.docker.io",
+			Host: "docker.io", Protocols: []string{upstream_entity.ProtocolRegistry},
+			Origin: "https://registry-1.docker.io",
 		}, &admin.SaveUpstreamResponse{}, adminHeader(adminKey))
 		convey.So(err, convey.ShouldNotBeNil)
 	})
@@ -307,15 +312,21 @@ func TestPublicUpstreamList(t *testing.T) {
 		public.cache.EXPECT().SizeByUpstream(gomock.Any()).Return(map[int64]int64{7: 4096}, nil).AnyTimes()
 		upRepo.EXPECT().List(gomock.Any()).AnyTimes().Return([]*upstream_entity.Upstream{
 			{
-				ID: 7, Host: "deb.debian.org", Kind: "static", Origin: "https://deb.debian.org",
-				Enabled: true, ImmutablePatterns: upstream_entity.PatternList{"pool/"},
+				ID: 7, Host: "deb.debian.org",
+				Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+				Origin:    "https://deb.debian.org",
+				Enabled:   true, ImmutablePatterns: upstream_entity.PatternList{"pool/"},
 				MutableTTLSeconds: 300, DefaultPolicy: "deny_unless_matched", Note: "内部备注",
 			},
 			{
-				ID: 8, Host: "docker.io", Kind: "registry", Origin: "https://registry-1.docker.io",
-				Enabled: true, LibraryCompletion: true,
+				ID: 8, Host: "docker.io",
+				Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolRegistry},
+				Origin:    "https://registry-1.docker.io",
+				Enabled:   true, LibraryCompletion: true,
 			},
-			{ID: 9, Host: "paused.example.com", Kind: "static", Origin: "https://paused.example.com"},
+			{ID: 9, Host: "paused.example.com",
+				Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+				Origin:    "https://paused.example.com"},
 		}, nil)
 
 		w := httptest.NewRecorder()
@@ -332,7 +343,7 @@ func TestPublicUpstreamList(t *testing.T) {
 		convey.Convey("只列启用中的上游", func() {
 			convey.So(len(resp.Data.List), convey.ShouldEqual, 2)
 			convey.So(resp.Data.List[0]["host"], convey.ShouldEqual, "deb.debian.org")
-			convey.So(resp.Data.List[0]["kind"], convey.ShouldEqual, "static")
+			convey.So(resp.Data.List[0]["protocols"], convey.ShouldResemble, []any{"static"})
 			convey.So(resp.Data.List[1]["host"], convey.ShouldEqual, "docker.io")
 			convey.So(resp.Data.List[1]["library_completion"], convey.ShouldBeTrue)
 			convey.So(w.Body.String(), convey.ShouldNotContainSubstring, "paused.example.com")
@@ -386,7 +397,9 @@ func TestPublicUpstreamListHidden(t *testing.T) {
 			setRepo.EXPECT().Find(gomock.Any(), setting_svc.PublicHomepageSetting).Return(
 				&setting_entity.Setting{Key: setting_svc.PublicHomepageSetting, Value: "false"}, nil)
 			upRepo.EXPECT().List(gomock.Any()).AnyTimes().Return([]*upstream_entity.Upstream{
-				{ID: 7, Host: "deb.debian.org", Kind: "static", Enabled: true},
+				{ID: 7, Host: "deb.debian.org",
+					Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+					Enabled:   true},
 			}, nil)
 			public.rollup.EXPECT().SumByUpstream(gomock.Any(), gomock.Any(), gomock.Any()).
 				Return([]*rollup_entity.Totals{{UpstreamID: 7, Requests: 4, Hits: 3}}, nil).AnyTimes()

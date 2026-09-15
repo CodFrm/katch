@@ -20,8 +20,10 @@ import (
 	"github.com/cago-frame/cago/server/mux"
 	"github.com/gin-gonic/gin"
 
+	"github.com/CodFrm/katch/internal/metrics"
 	"github.com/CodFrm/katch/internal/proxy/dispatch"
 	"github.com/CodFrm/katch/internal/service/cache_svc"
+	"github.com/CodFrm/katch/internal/service/git_svc"
 	"github.com/CodFrm/katch/internal/service/proxy_svc"
 )
 
@@ -40,8 +42,40 @@ const immutableCacheControl = "public, max-age=31536000, immutable"
 // 跟着一起被永久缓存——否则滚动更新之后浏览器永远拿着旧名片，新版本再也上不去。
 const revalidateCacheControl = "no-cache"
 
-// newNoRouteHandler 构造 SPA 的 NoRoute 处理器。
-func newNoRouteHandler() (gin.HandlerFunc, error) {
+// git 的应答是谁答的：local（本地镜像）或 passthrough（穿透上游）。
+//
+// 不复用 X-Katch-Cache：那个头的语义是「这个对象有没有回源」，而 git 的一次应答
+// 不是一个对象——协商结果因客户端而异。两个头各自只回答一件事，才不会有人拿着
+// 一个 MISS 去猜镜像状态。它同时是端到端用例的判据——判据必须是客户端观察得到
+// 的东西，而不是某个内部标志位。
+//
+// 常量借 metrics 那一份：计数中间件按这个头分本地应答与穿透两档，两边各写一遍
+// 字符串，改一处就会悄悄分叉。
+const (
+	gitSourceHeader      = metrics.GitSourceHeader
+	gitSourcePassthrough = metrics.GitSourcePassthrough
+	gitSourceLocal       = metrics.GitSourceLocal
+)
+
+// gitNoCache 本地应答自己带的缓存头。
+//
+// 穿透那一侧的头是上游给的，上游的 git 服务器本来就会发这一句；本地应答没有
+// 上游可抄，得自己发：一次协商的结果因客户端而异，被中间任何一层缓存下来，
+// 就是把一个客户端的协商结果发给另一个客户端（决策 9）。
+const gitNoCache = "no-cache, max-age=0, must-revalidate"
+
+// maxGitRequestBytes 愿意为「能不能本地答」读进内存的协商请求体上限。
+//
+// 要判断一个请求答不答得了，就得先把它解开，而解开就得先读进来。超过这个大小
+// 的请求直接走穿透：一次 fetch 的 have 段再长也就几十 KB，真超了它更可能是
+// 一个想让 katch 吃内存的请求，而不是一次正经的拉取。
+const maxGitRequestBytes = 8 << 20
+
+// NewNoRouteHandler 构造生产的 NoRoute 处理器：SPA 与拉取路径共用的那一个。
+//
+// 导出是为了端到端那一侧（internal/proxy/extension）能挂上**生产的**这一个，
+// 而不是再写一份替身——替身漂了，守卫就守了个空。MountSPA 走的也是它。
+func NewNoRouteHandler() (gin.HandlerFunc, error) {
 	sub, err := fs.Sub(distFS, "dist")
 	if err != nil {
 		return nil, err
@@ -129,20 +163,41 @@ func serveUpstream(c *gin.Context, kind dispatch.Kind, host, rest string) bool {
 // 绕开——cache_svc 未命中时仍旧落到 proxy_svc.Fetch，ErrUpstreamNotAllowed
 // 依然从这里出来（判定只有一个出处）。
 func serveProxy(c *gin.Context, kind dispatch.Kind, host, rest string) {
-	// 镜像站只读。别的方法要么是写操作，要么是探测，一律不回源——转发一个
-	// 没有请求体的 POST 给上游，得到的结果没有任何意义。
-	if c.Request.Method != http.MethodGet && c.Request.Method != http.MethodHead {
+	// git 的端点寄生在 static 的路径空间里，由路径形态认出来（决策 3）。
+	// registry 有自己的路径空间，/v2/ 之下不存在 git 端点。
+	git := dispatch.GitEndpoint{}
+	if kind == dispatch.KindStatic {
+		git = dispatch.ClassifyGit(rest, c.Request.URL.RawQuery)
+	}
+	if git.IsGit() && !git.IsUploadPack() {
+		// push 一律拒绝（决策 4）：katch 是镜像不是代码托管，而且不转发客户端
+		// 凭据意味着写操作无从鉴权。403 而不是 404，且**不问上游表**：拒绝的是
+		// 这个动作，与这台主机在不在白名单里无关；按主机分别给 403 与 404，
+		// 那两个状态码的差别本身就成了一个主机名探针。响应体为空，同上。
+		c.AbortWithStatus(http.StatusForbidden)
+		return
+	}
+	if !methodAllowed(c.Request.Method, git) {
 		c.AbortWithStatus(http.StatusMethodNotAllowed)
 		return
 	}
 	ctx := c.Request.Context()
+	request := gitRequestBody(c.Request, git)
+	// 本地镜像答得了就由它答，答不了才穿透（决策 5）。判断必须在这里做完：
+	// 响应一旦开了头就没法再改主意。
+	if request.answerable && serveGitLocal(c, host, git, request.local) {
+		return
+	}
 	body, meta, err := cache_svc.Cache().Get(ctx, &proxy_svc.Target{
-		Kind:     kind,
-		Host:     host,
-		Path:     rest,
-		RawQuery: c.Request.URL.RawQuery,
-		Method:   c.Request.Method,
-		Header:   c.Request.Header,
+		Kind:          kind,
+		Host:          host,
+		Path:          rest,
+		RawQuery:      c.Request.URL.RawQuery,
+		Method:        c.Request.Method,
+		Header:        c.Request.Header,
+		Git:           git,
+		Body:          request.upstream,
+		ContentLength: request.length,
 	})
 	if err != nil {
 		if errors.Is(err, proxy_svc.ErrUpstreamNotAllowed) {
@@ -166,6 +221,11 @@ func serveProxy(c *gin.Context, kind dispatch.Kind, host, rest string) {
 			header.Add(k, v)
 		}
 	}
+	if git.IsGit() {
+		// Set 而不是 Add：上游也可能是另一台 katch，它那一份归因说的是它自己
+		// 那一跳，留着会让客户端看到两个值。
+		header.Set(gitSourceHeader, gitSourcePassthrough)
+	}
 	c.Writer.WriteHeader(meta.StatusCode)
 	// io.Copy 而不是先读进内存：一个几百 MB 的镜像层读完再发，既把首字节推迟到
 	// 整体下载完成，又让并发拉取直接把内存吃光。
@@ -173,6 +233,105 @@ func serveProxy(c *gin.Context, kind dispatch.Kind, host, rest string) {
 		// 客户端断开也会走到这里，所以是 warn 不是 error。
 		logger.Ctx(ctx).Sugar().Warnw("转发响应体中断", "host", host, "path", rest, "err", err)
 	}
+}
+
+// methodAllowed 方法闸。
+//
+// 镜像站只读：GET/HEAD 之外的方法要么是写操作，要么是探测，转发一个没有请求体的
+// POST 给上游拿到的结果没有任何意义。唯一的例外是 git 的协商端点——它的请求体
+// 就是客户端要哪些对象这件事本身，协议规定用 POST 发（决策 3）。
+//
+// 放行的判据是**路径形态**，不是「这台主机开了 git」：闸在白名单之前，按主机放行
+// 会让 405 与 404 的差别变成一个主机名探针。没开 git 的主机照样走到白名单那一步，
+// 在那里拿到和「表里没有」一模一样的空 404。
+func methodAllowed(method string, git dispatch.GitEndpoint) bool {
+	if method == http.MethodGet || method == http.MethodHead {
+		return true
+	}
+	return method == http.MethodPost && gitNegotiation(git)
+}
+
+// gitNegotiation 这次请求是不是 upload-pack 的协商——git 端点里唯一带请求体、
+// 也唯一用 POST 发的那一个。ref 广播是 GET，它没有请求体。
+func gitNegotiation(git dispatch.GitEndpoint) bool {
+	return git.IsUploadPack() && !git.Advertise
+}
+
+// gitBody 一次 git 拉取的请求体的两份形态。
+type gitBody struct {
+	// local 交给本地应答去看的那一份，ref 广播时为空——广播不看请求体。
+	local []byte
+	// answerable 这一次能不能问本地镜像。请求体大到读不进来时是假：那时
+	// 手上没有一份完整的请求可看，问了也只能得到「答不了」。
+	answerable bool
+	// upstream 穿透时转给上游的那一份，nil 表示这次请求没有请求体。
+	upstream io.Reader
+	// length 上面那一份有多长，-1 表示分块。
+	length int64
+}
+
+// gitRequestBody 把请求体读成本地应答与穿透各自要的形态。
+//
+// 只有 git 的协商请求带请求体，别的拉取一律不带——把客户端的请求体转给上游是
+// 一件要显式开的事，默认不转。
+//
+// 协商请求要读两遍（先给本地应答判断，答不了再给上游），所以它先落进内存再
+// 分发：读完了不还回去，上游收到的就是一个空请求。
+func gitRequestBody(r *http.Request, git dispatch.GitEndpoint) gitBody {
+	if !git.IsUploadPack() {
+		return gitBody{}
+	}
+	if r.Body == nil || r.Method != http.MethodPost || !gitNegotiation(git) {
+		// ref 广播：没有请求体，但照样可以由本地答。
+		return gitBody{answerable: true}
+	}
+	buffered, err := io.ReadAll(io.LimitReader(r.Body, maxGitRequestBytes+1))
+	if err != nil {
+		// 请求体读不完（客户端半路走了）。把已经拿到的那一段原样往上游送，
+		// 由上游给出它的判断——这里不替客户端编一个完整的请求出来。
+		return gitBody{upstream: bytes.NewReader(buffered), length: int64(len(buffered))}
+	}
+	if len(buffered) > maxGitRequestBytes {
+		// 太大：不留在内存里，把已读的那一段和剩下的接起来继续流给上游。
+		// ContentLength 原样抄客户端那一侧，-1 表示分块。
+		return gitBody{
+			upstream: io.MultiReader(bytes.NewReader(buffered), r.Body),
+			length:   r.ContentLength,
+		}
+	}
+	return gitBody{
+		local: buffered, answerable: true,
+		// 长度用实际读到的字节数，不用客户端声明的那个：两者不一致时，
+		// 按声明的发会让上游一直等一段永远不会来的字节。
+		upstream: bytes.NewReader(buffered), length: int64(len(buffered)),
+	}
+}
+
+// serveGitLocal 尝试由本地镜像应答，返回这次请求是否已经答完。
+//
+// 答不了不是错误：那是设计里的默认路径（决策 5）——镜像还没建成、请求带着
+// shallow 或 --filter、上游的 TTL 到了而同步没成，一律回到穿透那一条。
+func serveGitLocal(c *gin.Context, host string, git dispatch.GitEndpoint, body []byte) bool {
+	ctx := c.Request.Context()
+	answer := git_svc.LocalAnswer(ctx, &git_svc.AnswerRequest{
+		Host: host, Repo: git.Repo, Advertise: git.Advertise, Body: body,
+	})
+	if answer == nil {
+		return false
+	}
+	// 关掉它同时放掉镜像上的读占用，所以这一句不能漏。
+	defer func() { _ = answer.Body.Close() }()
+	header := c.Writer.Header()
+	header.Set("Content-Type", answer.ContentType)
+	header.Set("Cache-Control", gitNoCache)
+	header.Set(gitSourceHeader, gitSourceLocal)
+	c.Writer.WriteHeader(http.StatusOK)
+	// 边打边发：pack 是现打的，等它打完再发会把首字节推迟到整个仓库遍历完。
+	if _, err := io.Copy(c.Writer, answer.Body); err != nil {
+		// 客户端断开也会走到这里，所以是 warn 不是 error。
+		logger.Ctx(ctx).Sugar().Warnw("本地应答中断", "host", host, "repo", git.Repo, "err", err)
+	}
+	return true
 }
 
 func setCacheHeaders(c *gin.Context, path string) {
@@ -192,7 +351,7 @@ func setCacheHeaders(c *gin.Context, path string) {
 // 里加一层构造期预压缩（dist 编译期固定，压一次即可，不必为每个请求烧 CPU）。
 func MountSPA(_ context.Context, _ *configs.Config) error {
 	mux.RegisterMiddleware(func(_ *configs.Config, engine *gin.Engine) error {
-		handler, err := newNoRouteHandler()
+		handler, err := NewNoRouteHandler()
 		if err != nil {
 			return err
 		}

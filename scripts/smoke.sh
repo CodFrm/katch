@@ -28,7 +28,8 @@ trap cleanup EXIT
 # 模板取入库的 .example 而不是 configs/config.yaml——后者是开发者本地那一份，
 # 被 .gitignore 挡着，CI 的干净检出里根本不存在。
 sed "s#0.0.0.0:8080#0.0.0.0:${PORT}#; s#./data/katch.db#${workdir}/katch.db#; \
-     s#./data/cache#${workdir}/cache#; s#./runtime/logs#${workdir}/logs#g" \
+     s#./data/cache#${workdir}/cache#; s#./data/mirrors#${workdir}/mirrors#; \
+     s#./runtime/logs#${workdir}/logs#g" \
   configs/config.yaml.example > "$workdir/config.yaml"
 cp "$workdir/config.yaml" "$workdir/config.expect"
 
@@ -70,13 +71,30 @@ echo "✓ 未带密钥与密钥错误的响应完全一致"
 
 curl -s -X POST "${BASE}/api/v1/admin/upstreams" \
   -H "Authorization: Bearer ${ADMIN_KEY}" -H 'Content-Type: application/json' \
-  -d '{"host":"smoke.example.com","kind":"static","origin":"https://smoke.example.com","enabled":true}' \
+  -d '{"host":"smoke.example.com","protocols":["static"],"origin":"https://smoke.example.com","enabled":true}' \
   | grep -q '"code":0' || fail "带正确密钥创建上游失败"
 echo "✓ 带正确密钥可以创建上游"
 
 curl -s -H "Authorization: Bearer ${ADMIN_KEY}" "${BASE}/api/v1/admin/upstreams" \
   | grep -q 'smoke.example.com' || fail "刚创建的上游没能被列表读回"
 echo "✓ 创建的上游能被列表读回"
+
+# 运行时设置：git 镜像那六项要在设置表里，而且改完立刻生效——它们是「跑起来
+# 之后才生效」的参数，落库不落配置文件，改完不该要求重启进程（决策 3/4）。
+settings=$(curl -s -H "Authorization: Bearer ${ADMIN_KEY}" "${BASE}/api/v1/admin/settings")
+for key in git_mirror_quota_bytes git_repo_max_bytes git_sync_timeout_seconds \
+  git_sync_concurrency git_build_stall_seconds git_build_timeout_seconds; do
+  echo "$settings" | grep -q "\"${key}\"" || fail "运行时设置里少了 ${key}"
+done
+echo "✓ git 镜像的六项运行时设置都读得到"
+
+curl -s -X POST "${BASE}/api/v1/admin/settings" \
+  -H "Authorization: Bearer ${ADMIN_KEY}" -H 'Content-Type: application/json' \
+  -d '{"settings":{"git_repo_max_bytes":123456789}}' \
+  | grep -q '123456789' || fail "写 git_repo_max_bytes 之后没有回显新值"
+curl -s -H "Authorization: Bearer ${ADMIN_KEY}" "${BASE}/api/v1/admin/settings" \
+  | grep -q '123456789' || fail "写进去的 git_repo_max_bytes 没能立刻读回"
+echo "✓ git 单仓上限改完立刻读得到新值，进程没有重启"
 
 # 扩展点：只经管理接口加一条记录，就能拉通一个此前不存在的上游并命中缓存。
 #
@@ -90,9 +108,11 @@ FAKE_PULL="${BASE}/${FAKE_HOST}/version"
 # 进程内快照——后面那次拉取要成立，写入就必须把快照掀掉，这正是「不重启」的兑现点。
 check "/${FAKE_HOST}/version" 404 "未注册的上游拉取返回 404"
 
+# 这一条故意同时开 static 与 git：协议是集合，多开一种不该把原本那一种挤掉。
+# 下面整条「拉取 → 缓存 → 命中」走的仍然是 static 那一半。
 curl -s -X POST "${BASE}/api/v1/admin/upstreams" \
   -H "Authorization: Bearer ${ADMIN_KEY}" -H 'Content-Type: application/json' \
-  -d "{\"host\":\"${FAKE_HOST}\",\"kind\":\"static\",\"origin\":\"${BASE}/api/v1/system\",\
+  -d "{\"host\":\"${FAKE_HOST}\",\"protocols\":[\"static\",\"git\"],\"origin\":\"${BASE}/api/v1/system\",\
        \"enabled\":true,\"immutable_patterns\":[\"/version\"]}" \
   | grep -q '"code":0' || fail "经管理接口注册假上游失败"
 echo "✓ 经管理接口注册了一个此前不存在的上游"
@@ -139,6 +159,26 @@ curl -s -H "Authorization: Bearer ${ADMIN_KEY}" \
   "${BASE}/api/v1/admin/logs/requests?upstream_id=${UPSTREAM_ID}&limit=10" \
   | grep -q '"/version"' || fail "最近请求面板没有读到刚才那次拉取"
 echo "✓ 最近请求经真实库读得到刚才那次拉取"
+# git：应答来源头必须出现在真二进制的响应上。
+#
+# 这里只验得到 passthrough 那一档：本地应答要先有一份镜像，而建镜像要一台真的
+# smart HTTP git 服务器当上游，smoke 不该为它引入新依赖（同上面那条不引入
+# python 的理由）。真客户端对拉「穿透 → 建镜像 → 本地应答」由
+# internal/proxy/extension 那条端到端用例守着，它起的是真 git http-backend。
+GIT_ADVERTISE="/${FAKE_HOST}/x.git/info/refs?service=git-upload-pack"
+curl -s -D "$workdir/git.h" -o /dev/null "${BASE}${GIT_ADVERTISE}"
+grep -qi '^x-katch-git: passthrough' "$workdir/git.h" \
+  || fail "git 的 ref 广播没有带 X-Katch-Git: passthrough"
+# 两个头各自只回答一件事：git 的应答不进对象缓存，也就不该带缓存命中标记。
+if grep -qi '^x-katch-cache:' "$workdir/git.h"; then
+  fail "git 的应答带上了 X-Katch-Cache，它根本不该进对象缓存"
+fi
+echo "✓ git 的应答带着来源头 passthrough，且不带缓存命中标记"
+
+push=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  "${BASE}/${FAKE_HOST}/x.git/git-receive-pack" -d '0000')
+[ "$push" = "403" ] || fail "git push 期望 403，实际 $push"
+echo "✓ git push 一律 403：katch 是镜像不是代码托管"
 
 diff -q "$workdir/config.expect" "$workdir/config.yaml" > /dev/null \
   || fail "配置文件被进程改写了（只读配置源可能失效）"

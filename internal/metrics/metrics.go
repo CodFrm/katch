@@ -49,6 +49,26 @@ const (
 	ResultDenied Result = "denied"
 	// ResultOriginError 上游不可达或超时。
 	ResultOriginError Result = "origin_error"
+	// ResultLocal git 的这次拉取由本地镜像答完，一个字节都没问上游。
+	//
+	// 和 ResultHit 分开：命中说的是「这个对象在盘上」，而 git 的一次应答不是
+	// 一个对象——它是按这个客户端手上有什么现打出来的（可观测性一节）。
+	ResultLocal Result = "local"
+	// ResultPassthrough git 的这次拉取穿透到了上游。
+	ResultPassthrough Result = "passthrough"
+)
+
+// git 的应答上带的归因头，由拉取路径写、由这里读。
+//
+// 定义放在这里而不是拉取路径那一侧，同 MissHeader：读的人只有一个，而写的人
+// 可能有好几处，把常量放在读的人身上，两边就不会各自漂。
+const (
+	// GitSourceHeader 这次 git 应答是谁答的。
+	GitSourceHeader = "X-Katch-Git"
+	// GitSourceLocal 本地镜像答的。
+	GitSourceLocal = "local"
+	// GitSourcePassthrough 穿透上游拿到的。
+	GitSourcePassthrough = "passthrough"
 )
 
 const (
@@ -89,7 +109,7 @@ const (
 type Event struct {
 	// Upstream 上游主机名。空表示不在白名单里的主机。
 	Upstream string
-	// Kind 请求形态，registry 或 static，由 dispatch 判定。
+	// Kind 请求形态，registry、static 或 git，由 dispatch 判定。
 	Kind   string
 	Result Result
 	// MissReason 未命中的归因，Result 不是 ResultMiss 时无意义。
@@ -428,8 +448,14 @@ func (r *Recorder) addBucket(ev Event) {
 	}
 	b.Requests++
 	switch ev.Result {
-	case ResultHit:
+	case ResultHit, ResultLocal:
+		// 本地镜像答的那一次没问上游，界面上那条命中率里它就是一次命中。
 		b.Hits++
+	case ResultPassthrough:
+		// 穿透落在未命中那一档（未命中数由总数减其余三项得出）。归因记「首次」：
+		// git 的应答从不进对象缓存（决策 9），另外三个原因一个都不成立，而四项
+		// 之和必须仍然等于未命中数，否则占比条会凭空少掉一块。
+		b.MissFirst++
 	case ResultDenied:
 		b.Denied++
 	case ResultOriginError:
@@ -509,7 +535,10 @@ func (r *Recorder) Middleware(hooks Hooks) gin.HandlerFunc {
 		start := r.now()
 		c.Next()
 		ev := Event{
-			Kind:     kindLabel(kind),
+			// git 的端点寄生在 static 的路径空间里，按路径形态认（决策 3）。
+			// 类别说的是「这是哪种请求」，成没成功是结果那一维的事，所以被 403
+			// 掉的 push 和 404 掉的主机同样记在 git 这一类下。
+			Kind:     kindLabel(kind, dispatch.ClassifyGit(object, c.Request.URL.RawQuery)),
 			Duration: r.now().Sub(start),
 		}
 		if !known {
@@ -520,12 +549,15 @@ func (r *Recorder) Middleware(hooks Hooks) gin.HandlerFunc {
 		}
 		ev.Upstream = host
 		ev.Result = classify(c.Writer.Status(), c.Writer.Header().Get(cacheStatusHeader))
+		// git 的应答自己说它是谁答的，不必从状态码上猜：本地应答与穿透的状态码
+		// 一模一样，差别只在这个头上。
+		ev.Result = gitResult(c.Writer.Header().Get(GitSourceHeader), ev.Result)
 		if ev.Result == ResultMiss {
 			ev.MissReason = missReason(c.Writer.Header().Get(MissHeader))
 		}
 		if size := int64(c.Writer.Size()); size > 0 {
 			ev.BytesServed = size
-			if ev.Result == ResultMiss {
+			if ev.Result == ResultMiss || ev.Result == ResultPassthrough {
 				ev.BytesOrigin = size
 			}
 		}
@@ -572,11 +604,12 @@ func (r *Recorder) feedGate(gate Gate, host string, result Result) {
 	switch result {
 	case ResultOriginError:
 		gate.Failure(host)
-	case ResultMiss:
+	case ResultMiss, ResultPassthrough:
 		// 只有真的回源成功才算「上游还活着」。命中根本没碰上游，拿它当恢复的
-		// 证据，会让一个还在挂的上游刚出退避就被全量打回去。
+		// 证据，会让一个还在挂的上游刚出退避就被全量打回去。git 的穿透是实打实
+		// 打到了上游的那一种，和一次回源同等看待。
 		gate.Success(host)
-	case ResultHit, ResultDenied:
+	case ResultHit, ResultLocal, ResultDenied:
 		return
 	}
 	r.SetBackoff(host, gate.Degraded(host))
@@ -622,9 +655,25 @@ func missReason(value string) MissReason {
 	}
 }
 
-func kindLabel(kind dispatch.Kind) string {
-	if kind == dispatch.KindRegistry {
-		return "registry"
+// gitResult 认 git 应答上的归因头，不是 git 的应答就保持原来那个结果。
+func gitResult(source string, fallback Result) Result {
+	switch source {
+	case GitSourceLocal:
+		return ResultLocal
+	case GitSourcePassthrough:
+		return ResultPassthrough
+	default:
+		return fallback
 	}
-	return "static"
+}
+
+func kindLabel(kind dispatch.Kind, git dispatch.GitEndpoint) string {
+	switch {
+	case kind == dispatch.KindRegistry:
+		return "registry"
+	case git.IsGit():
+		return "git"
+	default:
+		return "static"
+	}
 }

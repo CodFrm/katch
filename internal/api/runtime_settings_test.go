@@ -250,7 +250,7 @@ func registerLiveUpstream(t *testing.T, engine *gin.Engine, o *liveOrigin) {
 	t.Helper()
 	w := liveAdmin(engine, http.MethodPost, "/api/v1/admin/upstreams", `{
 		"host": "`+liveUpstreamHost+`",
-		"kind": "static",
+		"protocols": ["static"],
 		"origin": "`+o.srv.URL+`",
 		"enabled": true,
 		"immutable_patterns": ["/pool/", "/hold/", "/slow/", "/flaky/"]

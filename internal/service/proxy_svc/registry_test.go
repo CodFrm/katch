@@ -80,7 +80,7 @@ func useRegistryUpstream(t *testing.T, origin string, libraryCompletion bool) {
 	t.Helper()
 	repo := mock_upstream_repo.NewMockUpstreamRepo(gomock.NewController(t))
 	repo.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{{
-		ID: 3, Host: "docker.io", Kind: upstream_entity.KindRegistry, Origin: origin,
+		ID: 3, Host: "docker.io", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolRegistry}, Origin: origin,
 		Enabled: true, DefaultPolicy: upstream_entity.PolicyAllowAll,
 		LibraryCompletion: libraryCompletion,
 	}}, nil).AnyTimes()

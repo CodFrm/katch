@@ -41,7 +41,7 @@ func TestFetch_StaticUpstreamIsPassedThrough(t *testing.T) {
 
 		repo := setupRepo(t)
 		repo.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{
-			{ID: 1, Host: "deb.debian.org", Kind: upstream_entity.KindStatic, Origin: srv.URL, Enabled: true},
+			{ID: 1, Host: "deb.debian.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic}, Origin: srv.URL, Enabled: true},
 		}, nil).AnyTimes()
 
 		body, meta, err := Proxy().Fetch(context.Background(), &Target{
@@ -73,7 +73,7 @@ func TestFetch_RegistryKeepsProtocolPrefix(t *testing.T) {
 
 		repo := setupRepo(t)
 		repo.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{
-			{ID: 1, Host: "docker.io", Kind: upstream_entity.KindRegistry, Origin: srv.URL, Enabled: true},
+			{ID: 1, Host: "docker.io", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolRegistry}, Origin: srv.URL, Enabled: true},
 		}, nil).AnyTimes()
 
 		body, _, err := Proxy().Fetch(context.Background(), &Target{
@@ -94,8 +94,8 @@ func TestFetch_RegistryKeepsProtocolPrefix(t *testing.T) {
 func TestFetch_NotWhitelisted(t *testing.T) {
 	convey.Convey("不在白名单内的请求一律同一个错误", t, func() {
 		table := []*upstream_entity.Upstream{
-			{ID: 1, Host: "disabled.example.com", Kind: upstream_entity.KindStatic, Origin: "http://127.0.0.1:1", Enabled: false},
-			{ID: 2, Host: "docker.io", Kind: upstream_entity.KindRegistry, Origin: "http://127.0.0.1:1", Enabled: true},
+			{ID: 1, Host: "disabled.example.com", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic}, Origin: "http://127.0.0.1:1", Enabled: false},
+			{ID: 2, Host: "docker.io", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolRegistry}, Origin: "http://127.0.0.1:1", Enabled: true},
 		}
 		targets := map[string]*Target{
 			"表里没有这个主机":                {Kind: dispatch.KindStatic, Host: "internal.corp.local", Path: "/x", Method: http.MethodGet},
@@ -129,7 +129,7 @@ func TestFetch_UnreachableOriginIsNotA404(t *testing.T) {
 
 		repo := setupRepo(t)
 		repo.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{
-			{ID: 1, Host: "deb.debian.org", Kind: upstream_entity.KindStatic, Origin: srv.URL, Enabled: true},
+			{ID: 1, Host: "deb.debian.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic}, Origin: srv.URL, Enabled: true},
 		}, nil).AnyTimes()
 
 		_, _, err := Proxy().Fetch(context.Background(), &Target{
@@ -164,7 +164,7 @@ func TestFetch_DropsAuthenticationChallenge(t *testing.T) {
 
 		repo := setupRepo(t)
 		repo.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{
-			{ID: 1, Host: "apt.private.test", Kind: upstream_entity.KindStatic,
+			{ID: 1, Host: "apt.private.test", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
 				Origin: srv.URL, Enabled: true},
 		}, nil).AnyTimes()
 

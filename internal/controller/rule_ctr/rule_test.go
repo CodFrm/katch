@@ -79,7 +79,7 @@ func TestRuleTester_ReportsWhichRuleDecidedAndWhy(t *testing.T) {
 	convey.Convey("规则试算报出判定、命中的规则和完整过程", t, func() {
 		upRepo.EXPECT().FindByHost(gomock.Any(), "deb.debian.org").Return(
 			&upstream_entity.Upstream{
-				ID: 7, Host: "deb.debian.org", Kind: upstream_entity.KindStatic, Enabled: true,
+				ID: 7, Host: "deb.debian.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic}, Enabled: true,
 				DefaultPolicy: upstream_entity.PolicyAllowAll,
 			}, nil).AnyTimes()
 		// AnyTimes：goconvey 每个叶子都会把外层重跑一遍，而规则在进程内有快照，

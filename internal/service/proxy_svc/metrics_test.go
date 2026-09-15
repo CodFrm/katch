@@ -51,7 +51,7 @@ func TestFetch_RecordsOriginMetrics(t *testing.T) {
 
 		repo := setupRepo(t)
 		repo.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{
-			{ID: 1, Host: "deb.debian.org", Kind: upstream_entity.KindStatic, Origin: srv.URL, Enabled: true},
+			{ID: 1, Host: "deb.debian.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic}, Origin: srv.URL, Enabled: true},
 		}, nil).AnyTimes()
 
 		reg := prometheus.NewRegistry()
@@ -93,7 +93,7 @@ func TestFetch_RecordsUnreachableOriginAsStatusZero(t *testing.T) {
 
 		repo := setupRepo(t)
 		repo.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{
-			{ID: 1, Host: "deb.debian.org", Kind: upstream_entity.KindStatic, Origin: origin, Enabled: true},
+			{ID: 1, Host: "deb.debian.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic}, Origin: origin, Enabled: true},
 		}, nil).AnyTimes()
 
 		reg := prometheus.NewRegistry()

@@ -8,6 +8,7 @@ import { useAdminUpstreamData } from '@/hooks/use-admin-data'
 import { useAdminSession } from '@/hooks/use-admin-session'
 import type { StatRange } from '@/lib/api'
 import { CacheScreen } from '@/routes/admin/cache-screen'
+import { GitMirrorsScreen } from '@/routes/admin/git-mirrors-screen'
 import { OverviewScreen } from '@/routes/admin/overview-screen'
 import { RulesScreen } from '@/routes/admin/rules-screen'
 import { SettingsScreen } from '@/routes/admin/settings-screen'
@@ -130,6 +131,10 @@ function AdminWorkspace({
               onUnauthorized={onUnauthorized}
             />
           }
+        />
+        <Route
+          path="git"
+          element={<GitMirrorsScreen adminKey={adminKey} onUnauthorized={onUnauthorized} />}
         />
         {/* 全局规则没有自己的上游，从设置页进来：它先于每个上游自己的规则求值。 */}
         <Route

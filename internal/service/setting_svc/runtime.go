@@ -42,6 +42,28 @@ const (
 	//
 	// 它是这份历史占用磁盘的唯一闸门：保留期越长，库越大，占用与流量线性相关。
 	RecentRequestRetentionSecondsSetting = "recent_request_retention_seconds"
+	// GitMirrorQuotaBytesSetting git 本地镜像的总容量上限（字节）。
+	//
+	// 和缓存配额分开的两个键，因为它们量的是两处盘：对象缓存按内容摘要存、
+	// 按 LRU 淘汰，镜像按仓库整个存、整个删。合成一个数，任一侧的上限都失去意义。
+	GitMirrorQuotaBytesSetting = "git_mirror_quota_bytes"
+	// GitRepoMaxBytesSetting 单个仓库的体积上限（字节），超过它的仓库登记为
+	// rejected、此后永久穿透（能力边界一节）。
+	GitRepoMaxBytesSetting = "git_repo_max_bytes"
+	// GitSyncTimeoutSecondsSetting 一次增量同步最多跑多久（秒）。
+	//
+	// 只管增量同步，不再管初次建镜像：建镜像归 git_build_timeout_seconds
+	// （决策 3）。两者量的是不同的事——同步是一次小增量，建镜像是把一个仓库
+	// 整个拉下来，合用一个值会逼站长为了容纳一个大仓库把同步也一起放宽。
+	GitSyncTimeoutSecondsSetting = "git_sync_timeout_seconds"
+	// GitSyncConcurrencySetting 同时在跑的建镜像/同步任务上限。
+	GitSyncConcurrencySetting = "git_sync_concurrency"
+	// GitBuildStallSecondsSetting 建镜像的停滞时限（秒）：fetch 阶段内，距上一次
+	// 从上游收到字节超过这么久就中止（决策 2）。
+	GitBuildStallSecondsSetting = "git_build_stall_seconds"
+	// GitBuildTimeoutSecondsSetting 建镜像的总时限（秒）：从开始建镜像到镜像
+	// 可用为止的整段墙钟（决策 3）。
+	GitBuildTimeoutSecondsSetting = "git_build_timeout_seconds"
 )
 
 // 出厂默认值，全仓只此一份：缓存层与拉取路径都经 Runtime 读这里，谁也不再自带
@@ -55,6 +77,17 @@ const (
 	defaultOriginRetries        = 2
 	// 一天是「刚刚发生了什么」够用、磁盘又吃得消的那个数。
 	defaultRecentRequestRetentionSeconds = 86400
+	// 镜像的出厂值比缓存那一组保守得多：go-git 每次本地应答都要全量遍历对象图
+	// 并从零重打包（能力边界一节），一个几 GB 的仓库镜像下来也答不动。
+	defaultGitMirrorQuotaBytes   = int64(10) << 30
+	defaultGitRepoMaxBytes       = int64(1) << 30
+	defaultGitSyncTimeoutSeconds = 600
+	defaultGitSyncConcurrency    = 2
+	// 停滞时限比总时限小一个量级：它管的是「上游不说话了」，两分钟一个字节
+	// 都没有，再等下去也等不来。总时限则要容得下一次正常的大仓库建镜像，
+	// 超标的那些由单仓上限去拦，不该由时间去拦（决策 3）。
+	defaultGitBuildStallSeconds   = 120
+	defaultGitBuildTimeoutSeconds = 1800
 )
 
 // settingDef 一项运行时设置的定义：类型、默认值和取值范围。
@@ -110,6 +143,27 @@ var settingDefs = []*settingDef{
 		// 一份诊断用的历史。下限一小时：比这更短的窗口在界面上看不出任何
 		// 东西；上限七天：再长就不再是「最近」，只是把盘占着。
 		Default: jsonInt(defaultRecentRequestRetentionSeconds), Min: 3600, Max: 604800},
+	{Key: GitMirrorQuotaBytesSetting, Type: admin.SettingTypeInt,
+		// 同 cache_quota_bytes：0 不是「不限」，是「什么都别镜像」，
+		// 那该是一个开关而不是一个容量。
+		Default: jsonInt(defaultGitMirrorQuotaBytes), Min: 1, Max: int64(1) << 50},
+	{Key: GitRepoMaxBytesSetting, Type: admin.SettingTypeInt,
+		Default: jsonInt(defaultGitRepoMaxBytes), Min: 1, Max: int64(1) << 50},
+	{Key: GitSyncTimeoutSecondsSetting, Type: admin.SettingTypeInt,
+		// 上限一天：一次增量同步是秒级的事，比这更长说明上游那一侧出了问题，
+		// 而不该让一趟同步挂在那里。
+		Default: jsonInt(defaultGitSyncTimeoutSeconds), Min: 1, Max: 86400},
+	{Key: GitSyncConcurrencySetting, Type: admin.SettingTypeInt,
+		// 0 并发会让后台建镜像永远排不上队，那不是「关掉镜像」该有的表达方式。
+		Default: jsonInt(defaultGitSyncConcurrency), Min: 1, Max: 64},
+	{Key: GitBuildStallSecondsSetting, Type: admin.SettingTypeInt,
+		// 0 秒的停滞容忍度会让每一次建镜像在第一个字节到达之前就被判死。
+		// 上限一小时：一条一小时不吐字节的连接，等的已经不是数据了。
+		Default: jsonInt(defaultGitBuildStallSeconds), Min: 1, Max: 3600},
+	{Key: GitBuildTimeoutSecondsSetting, Type: admin.SettingTypeInt,
+		// 上限一天，同 git_sync_timeout_seconds：比这更长的建镜像不该由时间
+		// 去拦，那是单仓上限的活。
+		Default: jsonInt(defaultGitBuildTimeoutSeconds), Min: 1, Max: 86400},
 }
 
 var settingDefIndex = func() map[string]*settingDef {
@@ -297,6 +351,19 @@ type RuntimeSettings struct {
 	OriginRetries int
 	// RecentRequestRetentionSeconds「最近请求」历史保留多久（秒）。
 	RecentRequestRetentionSeconds int64
+	// GitMirrorQuotaBytes git 本地镜像总共可以占多少字节。
+	GitMirrorQuotaBytes int64
+	// GitRepoMaxBytes 单个仓库镜像的体积上限，超过它的仓库不镜像。
+	GitRepoMaxBytes int64
+	// GitSyncTimeoutSeconds 一次增量同步最多跑多久。初次建镜像不看它，
+	// 那一段归 GitBuildTimeoutSeconds（决策 3）。
+	GitSyncTimeoutSeconds int
+	// GitSyncConcurrency 同时在跑的建镜像/同步任务上限。
+	GitSyncConcurrency int
+	// GitBuildStallSeconds 建镜像时上游多久不送字节算停滞。
+	GitBuildStallSeconds int
+	// GitBuildTimeoutSeconds 一次建镜像整段墙钟的上限。
+	GitBuildTimeoutSeconds int
 }
 
 // RuntimeSource 运行时设置的来源。
@@ -349,7 +416,7 @@ func (s *settingSvc) Runtime(ctx context.Context) (*RuntimeSettings, error) {
 
 // assign 把一项归一化之后的值填进快照。
 //
-// 用一个 switch 而不是反射打 tag：这张表一共八项，switch 漏掉一项时
+// 用一个 switch 而不是反射打 tag：这张表就这么长，switch 漏掉一项时
 // TestRuntime_ReadsEverySettingDef 会当场报出来。
 func (r *RuntimeSettings) assign(key string, value json.RawMessage) error {
 	switch key {
@@ -371,6 +438,18 @@ func (r *RuntimeSettings) assign(key string, value json.RawMessage) error {
 		return json.Unmarshal(value, &r.OriginRetries)
 	case RecentRequestRetentionSecondsSetting:
 		return json.Unmarshal(value, &r.RecentRequestRetentionSeconds)
+	case GitMirrorQuotaBytesSetting:
+		return json.Unmarshal(value, &r.GitMirrorQuotaBytes)
+	case GitRepoMaxBytesSetting:
+		return json.Unmarshal(value, &r.GitRepoMaxBytes)
+	case GitSyncTimeoutSecondsSetting:
+		return json.Unmarshal(value, &r.GitSyncTimeoutSeconds)
+	case GitSyncConcurrencySetting:
+		return json.Unmarshal(value, &r.GitSyncConcurrency)
+	case GitBuildStallSecondsSetting:
+		return json.Unmarshal(value, &r.GitBuildStallSeconds)
+	case GitBuildTimeoutSecondsSetting:
+		return json.Unmarshal(value, &r.GitBuildTimeoutSeconds)
 	case PublicHomepageSetting:
 		// 首页是否公开有自己的读法（PublicHomepage），不进这份快照：拉取路径
 		// 用不上它，而接口层要的是那条「读不出来就收口」的语义。

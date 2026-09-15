@@ -103,6 +103,11 @@ export function SettingsScreen({
   const ttl = readIntSetting(list, 'mutable_ttl_seconds')
   const retention = readIntSetting(list, 'recent_request_retention_seconds')
   const timeout = readIntSetting(list, 'origin_timeout_seconds')
+  const gitQuota = readIntSetting(list, 'git_mirror_quota_bytes')
+  const gitRepoLimit = readIntSetting(list, 'git_repo_max_bytes')
+  const gitSyncTimeout = readIntSetting(list, 'git_sync_timeout_seconds')
+  const gitBuildStall = readIntSetting(list, 'git_build_stall_seconds')
+  const gitBuildTimeout = readIntSetting(list, 'git_build_timeout_seconds')
 
   return (
     <>
@@ -290,6 +295,98 @@ export function SettingsScreen({
           />
         </Row>
 
+        <Group label={t('admin.settings.groups.git')} />
+        <Row
+          label={t('admin.settings.fields.gitQuota')}
+          htmlFor="setting-git-quota"
+          hint={t('admin.settings.hints.gitQuota')}
+        >
+          <Input
+            id="setting-git-quota"
+            value={textValue(
+              'git_mirror_quota_bytes',
+              `${formatBytes(gitQuota).value} ${formatBytes(gitQuota).unit}`
+            )}
+            onChange={(event) =>
+              editParsed('git_mirror_quota_bytes', event.target.value, parseBytes)
+            }
+            className="w-[120px] rounded-none font-mono text-[13px] md:text-[13px]"
+          />
+        </Row>
+        <Row
+          label={t('admin.settings.fields.gitRepoLimit')}
+          htmlFor="setting-git-repo-limit"
+          hint={t('admin.settings.hints.gitRepoLimit')}
+        >
+          <Input
+            id="setting-git-repo-limit"
+            value={textValue(
+              'git_repo_max_bytes',
+              `${formatBytes(gitRepoLimit).value} ${formatBytes(gitRepoLimit).unit}`
+            )}
+            onChange={(event) => editParsed('git_repo_max_bytes', event.target.value, parseBytes)}
+            className="w-[120px] rounded-none font-mono text-[13px] md:text-[13px]"
+          />
+        </Row>
+        <Row
+          label={t('admin.settings.fields.gitSyncTimeout')}
+          htmlFor="setting-git-sync-timeout"
+          hint={t('admin.settings.hints.gitSyncTimeout')}
+        >
+          <div className="flex items-center gap-3">
+            <Input
+              id="setting-git-sync-timeout"
+              value={textValue('git_sync_timeout_seconds', formatDuration(gitSyncTimeout))}
+              onChange={(event) =>
+                editParsed('git_sync_timeout_seconds', event.target.value, parseDuration)
+              }
+              className="w-[120px] rounded-none font-mono text-[13px] md:text-[13px]"
+            />
+            <span className="text-muted-foreground text-[13px]">
+              {t('admin.settings.fields.gitSyncConcurrencyShort')}
+            </span>
+            <Input
+              aria-label={t('admin.settings.fields.gitSyncConcurrency')}
+              inputMode="numeric"
+              value={textValue(
+                'git_sync_concurrency',
+                String(readIntSetting(list, 'git_sync_concurrency'))
+              )}
+              onChange={(event) => edit('git_sync_concurrency', Number(event.target.value))}
+              className="w-[90px] rounded-none font-mono text-[13px] md:text-[13px]"
+            />
+          </div>
+        </Row>
+
+        <Row
+          label={t('admin.settings.fields.gitBuildStall')}
+          htmlFor="setting-git-build-stall"
+          hint={t('admin.settings.hints.gitBuildStall')}
+        >
+          <Input
+            id="setting-git-build-stall"
+            value={textValue('git_build_stall_seconds', formatDuration(gitBuildStall))}
+            onChange={(event) =>
+              editParsed('git_build_stall_seconds', event.target.value, parseDuration)
+            }
+            className="w-[120px] rounded-none font-mono text-[13px] md:text-[13px]"
+          />
+        </Row>
+        <Row
+          label={t('admin.settings.fields.gitBuildTimeout')}
+          htmlFor="setting-git-build-timeout"
+          hint={t('admin.settings.hints.gitBuildTimeout')}
+        >
+          <Input
+            id="setting-git-build-timeout"
+            value={textValue('git_build_timeout_seconds', formatDuration(gitBuildTimeout))}
+            onChange={(event) =>
+              editParsed('git_build_timeout_seconds', event.target.value, parseDuration)
+            }
+            className="w-[120px] rounded-none font-mono text-[13px] md:text-[13px]"
+          />
+        </Row>
+
         <Group label={t('admin.settings.groups.access')} />
         <Row label={t('admin.settings.fields.adminKey')}>
           <RotateKey adminKey={adminKey} onUnauthorized={onUnauthorized} onRotated={onKeyRotated} />
@@ -320,6 +417,12 @@ const NUMERIC_KEYS = new Set([
   'origin_concurrency',
   'origin_timeout_seconds',
   'origin_retries',
+  'git_mirror_quota_bytes',
+  'git_repo_max_bytes',
+  'git_sync_timeout_seconds',
+  'git_sync_concurrency',
+  'git_build_stall_seconds',
+  'git_build_timeout_seconds',
   'recent_request_retention_seconds',
 ])
 

@@ -22,9 +22,10 @@
     "persistentHide": "收起 ↑",
     "persistentLabel": "上游前缀"
   },
-  "kind": {
+  "protocol": {
     "registry": "容器镜像",
-    "static": "静态资源"
+    "static": "静态资源",
+    "git": "Git 仓库"
   },
   "status": {
     "normal": "正常",
@@ -41,7 +42,7 @@
     "title": "支持的上游",
     "count": "全部 {{count}} 个",
     "host": "上游",
-    "kind": "类型",
+    "protocols": "协议",
     "hitRate": "命中率",
     "cached": "已缓存",
     "status": "状态"
@@ -52,6 +53,7 @@
       "overview": "概览",
       "upstreams": "上游",
       "cache": "缓存对象",
+      "git": "Git 镜像",
       "settings": "设置",
       "addUpstream": "添加上游"
     },
@@ -120,6 +122,16 @@
         "setting_changed_unknown": "修改了运行时设置",
         "admin_key_rotated": "轮换了管理密钥",
         "cache_reclaimed": "淘汰 {{removed}} 个冷对象，腾出 {{size}}",
+        "git_mirror_pending": "{{host}}{{repo}} 开始建本地镜像",
+        "git_mirror_pending_unknown": "有个仓库开始建本地镜像",
+        "git_mirror_ready": "{{host}}{{repo}} 镜像建成，占用 {{size}}",
+        "git_mirror_ready_unknown": "有个仓库的本地镜像建成了",
+        "git_mirror_failed": "{{host}}{{repo}} 建镜像失败：{{error}}",
+        "git_mirror_failed_unknown": "有个仓库建镜像失败了",
+        "git_mirror_rejected": "{{host}}{{repo}} 体积超过单仓上限，此后持续穿透",
+        "git_mirror_rejected_unknown": "有个仓库体积超过单仓上限，此后持续穿透",
+        "git_mirror_evicted": "镜像超配额，回收 {{host}}{{repo}}，腾出 {{size}}",
+        "git_mirror_evicted_unknown": "镜像超配额，回收了一个仓库",
         "unknown": "一条没见过的事件"
       }
     },
@@ -178,7 +190,7 @@
       "form": {
         "host": "上游主机名",
         "origin": "回源地址",
-        "kind": "上游类别",
+        "protocols": "上游协议",
         "defaultPolicy": "默认策略",
         "note": "备注",
         "save": "保存上游",
@@ -283,6 +295,27 @@
         "operations": "操作"
       }
     },
+    "git": {
+      "title": "Git 镜像",
+      "count": "共 {{count}} 个",
+      "empty": "还没有镜像。",
+      "delete": "删除",
+      "neverSynced": "从未同步",
+      "columns": {
+        "repo": "仓库",
+        "state": "状态",
+        "size": "体积",
+        "lastSync": "最后同步",
+        "lastAccess": "最后访问",
+        "operations": "操作"
+      },
+      "state": {
+        "pending": "建镜像中",
+        "ready": "已就绪",
+        "failed": "失败",
+        "rejected": "超限穿透"
+      }
+    },
     "settings": {
       "title": "设置",
       "subtitle": "这里只有运行时配置，改完立刻生效，不需要重启",
@@ -302,6 +335,7 @@
         "cache": "缓存",
         "origin": "拉取",
         "history": "历史",
+        "git": "git 镜像",
         "access": "访问"
       },
       "fields": {
@@ -318,6 +352,13 @@
         "timeout": "上游超时",
         "retries": "重试次数",
         "retriesShort": "重试",
+        "gitQuota": "镜像总配额",
+        "gitRepoLimit": "单仓体积上限",
+        "gitSyncTimeout": "同步超时",
+        "gitSyncConcurrency": "同步并发上限",
+        "gitBuildStall": "建镜像停滞时限",
+        "gitBuildTimeout": "建镜像总时限",
+        "gitSyncConcurrencyShort": "并发",
         "adminKey": "管理员密钥",
         "globalRules": "全局访问规则"
       },
@@ -329,7 +370,12 @@
         "recentRequestRetention": "这份历史占用磁盘的唯一闸门：保留期越长，库越大，占用与流量线性相关",
         "immutable": "内容寻址，永不过期，只按 LRU 淘汰",
         "concurrency": "同一上游同时回源的请求数",
-        "globalRules": "先于每个上游自己的规则求值"
+        "globalRules": "先于每个上游自己的规则求值",
+        "gitQuota": "本地 git 镜像最多占用多少磁盘",
+        "gitRepoLimit": "超过它的仓库一直走穿透，不建本地镜像",
+        "gitSyncTimeout": "一次增量同步最多跑多久，建镜像另有自己的时限",
+        "gitBuildStall": "建镜像时上游多久不送数据就中止这一次",
+        "gitBuildTimeout": "一次建镜像从排队到建成最多跑多久，超过就中止"
       },
       "states": {
         "publicOn": "上游列表与命中率对所有人可见",

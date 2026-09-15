@@ -11,9 +11,10 @@ import "github.com/cago-frame/cago/server/mux"
 // ImmutablePatterns 在这里是 []string 而不是实体上的 PatternList：API 结构体是
 // 对外契约，不该把「库里存成 JSON 文本」这个存储细节泄漏给调用方。
 type UpstreamItem struct {
-	ID                int64    `json:"id"`
-	Host              string   `json:"host"`
-	Kind              string   `json:"kind"`
+	ID   int64  `json:"id"`
+	Host string `json:"host"`
+	// Protocols 这条上游开着的协议，取值见 upstream_entity 的 Protocol* 常量。
+	Protocols         []string `json:"protocols"`
 	Origin            string   `json:"origin"`
 	Enabled           bool     `json:"enabled"`
 	ImmutablePatterns []string `json:"immutable_patterns"`
@@ -46,7 +47,8 @@ type ListUpstreamsResponse struct {
 // 在序列化请求时会被整个跳过，那会让所有 Go 侧调用方发出空请求体。
 type UpstreamSpec struct {
 	Host string
-	Kind string
+	// Protocols 这条上游开着的协议，非空。一条记录可以同时开多个。
+	Protocols []string
 	// Origin 回源地址。
 	Origin string
 	// Enabled 为 false 等同于不在白名单里：既不回源，也不在拉取路径上回显，
@@ -67,9 +69,12 @@ type UpstreamSpec struct {
 type SaveUpstreamRequest struct {
 	mux.Meta `path:"/admin/upstreams" method:"POST"`
 	Host     string `json:"host" binding:"required" label:"上游主机名"`
-	// Kind 只有两种。其余差异靠本记录上的字段表达，而不是给每类上游写一个适配器。
-	Kind   string `json:"kind" binding:"required,oneof=registry static" label:"上游类别"`
-	Origin string `json:"origin" binding:"required,url" label:"回源地址"`
+	// Protocols 这条上游开着的协议，至少一个。协议之外的差异靠本记录上的字段
+	// 表达，而不是给每类上游写一个适配器。
+	//
+	// 空集合被 required 挡住而不是当成「什么都开」：判定的默认值必须是拒绝。
+	Protocols []string `json:"protocols" binding:"required,min=1,dive,oneof=registry static git" label:"上游协议"`
+	Origin    string   `json:"origin" binding:"required,url" label:"回源地址"`
 	// Enabled 见 UpstreamSpec.Enabled。
 	Enabled           bool     `json:"enabled"`
 	ImmutablePatterns []string `json:"immutable_patterns"`
@@ -83,7 +88,7 @@ type SaveUpstreamRequest struct {
 // Spec 这次请求要落的字段。
 func (r *SaveUpstreamRequest) Spec() *UpstreamSpec {
 	return &UpstreamSpec{
-		Host: r.Host, Kind: r.Kind, Origin: r.Origin, Enabled: r.Enabled,
+		Host: r.Host, Protocols: r.Protocols, Origin: r.Origin, Enabled: r.Enabled,
 		ImmutablePatterns: r.ImmutablePatterns, MutableTTLSeconds: r.MutableTTLSeconds,
 		DefaultPolicy: r.DefaultPolicy, LibraryCompletion: r.LibraryCompletion, Note: r.Note,
 	}
@@ -103,11 +108,11 @@ type SaveUpstreamResponse struct {
 //
 // 字段与 SaveUpstreamRequest 逐字相同，理由见 UpstreamSpec。
 type UpdateUpstreamRequest struct {
-	mux.Meta `path:"/admin/upstreams/:id" method:"PUT"`
-	ID       int64  `uri:"id"`
-	Host     string `json:"host" binding:"required" label:"上游主机名"`
-	Kind     string `json:"kind" binding:"required,oneof=registry static" label:"上游类别"`
-	Origin   string `json:"origin" binding:"required,url" label:"回源地址"`
+	mux.Meta  `path:"/admin/upstreams/:id" method:"PUT"`
+	ID        int64    `uri:"id"`
+	Host      string   `json:"host" binding:"required" label:"上游主机名"`
+	Protocols []string `json:"protocols" binding:"required,min=1,dive,oneof=registry static git" label:"上游协议"`
+	Origin    string   `json:"origin" binding:"required,url" label:"回源地址"`
 	// Enabled 见 UpstreamSpec.Enabled。
 	Enabled           bool     `json:"enabled"`
 	ImmutablePatterns []string `json:"immutable_patterns"`
@@ -120,7 +125,7 @@ type UpdateUpstreamRequest struct {
 // Spec 这次请求要落的字段。
 func (r *UpdateUpstreamRequest) Spec() *UpstreamSpec {
 	return &UpstreamSpec{
-		Host: r.Host, Kind: r.Kind, Origin: r.Origin, Enabled: r.Enabled,
+		Host: r.Host, Protocols: r.Protocols, Origin: r.Origin, Enabled: r.Enabled,
 		ImmutablePatterns: r.ImmutablePatterns, MutableTTLSeconds: r.MutableTTLSeconds,
 		DefaultPolicy: r.DefaultPolicy, LibraryCompletion: r.LibraryCompletion, Note: r.Note,
 	}

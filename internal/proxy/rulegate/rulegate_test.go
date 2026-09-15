@@ -100,7 +100,7 @@ func setupPullPath(t *testing.T, rules []*rule_entity.AccessRule, origin string)
 
 	upRepo := mock_upstream_repo.NewMockUpstreamRepo(ctrl)
 	upRepo.EXPECT().FindByHost(gomock.Any(), "deb.debian.org").Return(&upstream_entity.Upstream{
-		ID: 7, Host: "deb.debian.org", Kind: upstream_entity.KindStatic, Origin: origin,
+		ID: 7, Host: "deb.debian.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic}, Origin: origin,
 		Enabled: true, DefaultPolicy: upstream_entity.PolicyAllowAll,
 		ImmutablePatterns: upstream_entity.PatternList{"/pool/"},
 	}, nil).AnyTimes()

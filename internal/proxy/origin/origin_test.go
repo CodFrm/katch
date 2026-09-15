@@ -162,3 +162,71 @@ func TestDo_UnreachableOriginIsError(t *testing.T) {
 		convey.So(err, convey.ShouldNotBeNil)
 	})
 }
+
+// TestDo_ForwardsRequestBodyAndGitHeaders
+//
+// 决策 10：穿透 git 的协商请求要把请求体原样送到上游，而 Content-Type 与
+// Git-Protocol 必须跟着走——前者是 upload-pack 请求的载体，缺了后者协议会退回
+// v0。白名单仍然是白名单：这里只多了这两项，客户端的 Authorization 照旧不外传。
+func TestDo_ForwardsRequestBodyAndGitHeaders(t *testing.T) {
+	convey.Convey("请求体与 git 的两个头原样送达上游", t, func() {
+		payload := "0032want d9a1b0c2c3d4e5f60718293a4b5c6d7e8f901234\n0000"
+		var (
+			gotBody   string
+			gotHeader http.Header
+			gotMethod string
+		)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, _ := io.ReadAll(r.Body)
+			gotBody = string(b)
+			gotHeader = r.Header.Clone()
+			gotMethod = r.Method
+			w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
+			_, _ = io.WriteString(w, "0008NAK\n")
+		}))
+		defer srv.Close()
+
+		clientHeader := http.Header{}
+		clientHeader.Set("Content-Type", "application/x-git-upload-pack-request")
+		clientHeader.Set("Git-Protocol", "version=2")
+		clientHeader.Set("Authorization", "Basic c2VjcmV0")
+
+		resp, err := New().Do(context.Background(), &Request{
+			Method: http.MethodPost, Origin: srv.URL,
+			Path: "/CodFrm/katch/git-upload-pack", Header: clientHeader,
+			Body: strings.NewReader(payload), ContentLength: int64(len(payload)),
+		})
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(gotMethod, convey.ShouldEqual, http.MethodPost)
+		convey.So(gotBody, convey.ShouldEqual, payload)
+		convey.So(gotHeader.Get("Content-Type"), convey.ShouldEqual, "application/x-git-upload-pack-request")
+		convey.So(gotHeader.Get("Git-Protocol"), convey.ShouldEqual, "version=2")
+		// 白名单里多两项不等于把凭据也放进来了。
+		convey.So(gotHeader.Get("Authorization"), convey.ShouldBeEmpty)
+		convey.So(resp.Header.Get("Content-Type"), convey.ShouldEqual, "application/x-git-upload-pack-result")
+		convey.So(body(t, resp), convey.ShouldEqual, "0008NAK\n")
+	})
+}
+
+// TestDo_NilBodyStaysBodyless 没有请求体的回源仍然不带请求体。
+//
+// 一个带着 Transfer-Encoding: chunked 却没有内容的 GET 会被一部分上游直接拒掉，
+// 而 katch 绝大多数回源都是这一类。
+func TestDo_NilBodyStaysBodyless(t *testing.T) {
+	convey.Convey("没有请求体时不给上游造一个出来", t, func() {
+		gotLength := int64(-1)
+		gotEncoding := ""
+		srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			gotLength = r.ContentLength
+			gotEncoding = strings.Join(r.TransferEncoding, ",")
+		}))
+		defer srv.Close()
+
+		_, err := New().Do(context.Background(), &Request{
+			Method: http.MethodGet, Origin: srv.URL, Path: "/dists/stable/InRelease",
+		})
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(gotLength, convey.ShouldEqual, 0)
+		convey.So(gotEncoding, convey.ShouldBeEmpty)
+	})
+}

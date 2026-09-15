@@ -16,6 +16,7 @@ import {
   type AdminUpstreamItem,
   type StatRange,
   type UpstreamStatItem,
+  type UpstreamProtocol,
 } from '@/lib/api'
 import { formatBytes, formatCount, formatPercent } from '@/lib/format'
 import { hitRate, originRequests, savedBytes } from '@/lib/stats'
@@ -28,9 +29,19 @@ type Tab = 'overview' | 'rules'
 const TABS: Tab[] = ['overview', 'rules']
 
 /**
+ * 协议集合在界面上是一行标签，用间隔点连起来。
+ *
+ * 写在组件外面而不是 JSX 里：那个间隔点是排版符号不是文案，留在 JSX 里会被
+ * i18next/no-literal-string 当成漏翻的界面文字拦下来（该规则只看 JSX）。
+ */
+function protocolLabels(protocols: UpstreamProtocol[], t: (key: string) => string): string {
+  return protocols.map((protocol) => t(`protocol.${protocol}`)).join(' · ')
+}
+
+/**
  * 上游详情：这个上游的指标条与逐小时的命中/回源图，加上它自己的访问规则。
  *
- * 主机名用等宽、回源地址用等宽，类型和状态用无衬线——机器产出或消费的一律等宽。
+ * 主机名用等宽、回源地址用等宽，协议和状态用无衬线——机器产出或消费的一律等宽。
  */
 export function UpstreamScreen({
   adminKey,
@@ -111,7 +122,7 @@ export function UpstreamScreen({
         subtitle={
           upstream && (
             <>
-              <span className="text-muted-foreground">{t(`kind.${upstream.kind}`)}</span>
+              <span className="text-muted-foreground">{protocolLabels(upstream.protocols, t)}</span>
               <span className="text-ink-3">·</span>
               <span className="text-muted-foreground font-mono">{upstream.origin}</span>
             </>

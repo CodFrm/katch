@@ -30,7 +30,7 @@ func useGoProxyUpstream(t *testing.T, origin string) {
 	t.Helper()
 	repo := mock_upstream_repo.NewMockUpstreamRepo(gomock.NewController(t))
 	repo.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{{
-		ID: 4, Host: "proxy.golang.org", Kind: upstream_entity.KindStatic, Origin: origin,
+		ID: 4, Host: "proxy.golang.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic}, Origin: origin,
 		Enabled: true, DefaultPolicy: upstream_entity.PolicyAllowAll,
 	}}, nil).AnyTimes()
 	upstream_repo.RegisterUpstream(proxy_svc.NewCachedUpstreamRepo(repo))

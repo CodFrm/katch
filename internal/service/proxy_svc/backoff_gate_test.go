@@ -65,7 +65,7 @@ func registerUpstream(t *testing.T, host string, originURL string) {
 	t.Helper()
 	repo := mock_upstream_repo.NewMockUpstreamRepo(gomock.NewController(t))
 	repo.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{{
-		ID: 7, Host: host, Kind: upstream_entity.KindStatic, Origin: originURL, Enabled: true,
+		ID: 7, Host: host, Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic}, Origin: originURL, Enabled: true,
 		ImmutablePatterns: upstream_entity.PatternList{"/pool/"}, MutableTTLSeconds: 60,
 	}}, nil).AnyTimes()
 	upstream_repo.RegisterUpstream(proxy_svc.NewCachedUpstreamRepo(repo))

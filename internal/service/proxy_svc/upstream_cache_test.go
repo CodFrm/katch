@@ -14,9 +14,9 @@ import (
 
 func table() []*upstream_entity.Upstream {
 	return []*upstream_entity.Upstream{
-		{ID: 1, Host: "deb.debian.org", Kind: upstream_entity.KindStatic, Enabled: true,
+		{ID: 1, Host: "deb.debian.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic}, Enabled: true,
 			ImmutablePatterns: upstream_entity.PatternList{"pool/"}},
-		{ID: 2, Host: "docker.io", Kind: upstream_entity.KindRegistry, Enabled: true},
+		{ID: 2, Host: "docker.io", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolRegistry}, Enabled: true},
 	}
 }
 
@@ -200,7 +200,7 @@ func TestCachedUpstreamRepo_WriteDuringColdLoadIsNotLost(t *testing.T) {
 				}
 				// 写入之后库里那条已经停用了。
 				return []*upstream_entity.Upstream{
-					{ID: 2, Host: "docker.io", Kind: upstream_entity.KindRegistry, Enabled: true},
+					{ID: 2, Host: "docker.io", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolRegistry}, Enabled: true},
 				}, nil
 			})
 		inner.EXPECT().Save(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()

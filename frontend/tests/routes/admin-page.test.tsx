@@ -16,7 +16,7 @@ const upstreams = {
     {
       id: 1,
       host: 'docker.io',
-      kind: 'registry',
+      protocols: ['registry'],
       origin: 'https://registry-1.docker.io',
       enabled: true,
       immutable_patterns: ['@sha256:'],
@@ -30,7 +30,7 @@ const upstreams = {
     {
       id: 2,
       host: 'pypi.org',
-      kind: 'static',
+      protocols: ['static'],
       origin: 'https://pypi.org',
       enabled: true,
       immutable_patterns: [],
@@ -171,7 +171,12 @@ const events = {
       kind: 'upstream_created',
       actor: 'admin',
       upstream_id: 2,
-      detail: { host: 'pypi.org', kind: 'static', origin: 'https://pypi.org', enabled: true },
+      detail: {
+        host: 'pypi.org',
+        protocols: ['static'],
+        origin: 'https://pypi.org',
+        enabled: true,
+      },
       createtime: TO - 90000,
     },
   ],

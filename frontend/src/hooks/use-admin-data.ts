@@ -4,6 +4,7 @@ import {
   fetchAdminEvents,
   fetchAdminOverview,
   fetchAdminUpstreams,
+  fetchGitMirrors,
   fetchRecentRequests,
   fetchRules,
   fetchSettings,
@@ -16,6 +17,7 @@ import {
   type AdminUpstreamItem,
   type CacheSearchResult,
   type EventItem,
+  type GitMirrorItem,
   type RecentRequestItem,
   type SettingItem,
   type StatRange,
@@ -374,4 +376,26 @@ export function useAdminSettings(
   }, [key, token, reject])
 
   return { data: settings, reload }
+}
+
+/** 全部 git 本地镜像。规模有配额顶着，后端不分页（同 useAdminRules）。 */
+export function useGitMirrors(
+  key: string,
+  onUnauthorized: () => void
+): Reloadable<GitMirrorItem[]> {
+  const reject = useRejectOnUnauthorized(onUnauthorized)
+  const [mirrors, setMirrors] = useState<GitMirrorItem[]>([])
+  const [token, reload] = useReloadToken()
+
+  useEffect(() => {
+    const controller = new AbortController()
+    void fetchGitMirrors(key, controller.signal).then((result) => {
+      if (!controller.signal.aborted) {
+        setMirrors(unwrap(result, () => reject.current())?.list ?? [])
+      }
+    })
+    return () => controller.abort()
+  }, [key, token, reject])
+
+  return { data: mirrors, reload }
 }

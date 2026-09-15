@@ -32,7 +32,7 @@ export function PullAssistant({
     () =>
       upstreams?.map((u) => ({
         host: u.host,
-        kind: u.kind,
+        protocols: u.protocols,
         libraryCompletion: u.library_completion,
       })) ?? null,
     [upstreams]
@@ -93,7 +93,7 @@ export function PullAssistant({
             {parsed.verified && (
               <span className="text-ink-3">
                 {[
-                  t(`kind.${parsed.kind}`),
+                  t(`protocol.${parsed.kind}`),
                   cached ? t('assistant.cached', { size: `${cached.value} ${cached.unit}` }) : null,
                 ]
                   .filter(Boolean)

@@ -429,8 +429,8 @@ func TestStat_FlushRefreshesCacheGauges(t *testing.T) {
 		deps.cache.EXPECT().CountByUpstream(gomock.Any()).
 			Return(map[int64]int64{7: 3}, nil)
 		deps.upstream.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{
-			{ID: 7, Host: "deb.debian.org", Kind: upstream_entity.KindStatic, Enabled: true},
-			{ID: 8, Host: "quiet.example.com", Kind: upstream_entity.KindStatic, Enabled: true},
+			{ID: 7, Host: "deb.debian.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic}, Enabled: true},
+			{ID: 8, Host: "quiet.example.com", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic}, Enabled: true},
 		}, nil)
 
 		convey.So(deps.svc.Flush(context.Background()), convey.ShouldBeNil)

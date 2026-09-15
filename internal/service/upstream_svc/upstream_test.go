@@ -76,7 +76,7 @@ func TestUpdate(t *testing.T) {
 				})
 
 			resp, err := Upstream().Update(ctx, &admin.UpdateUpstreamRequest{
-				ID: 7, Host: "docker.io", Kind: upstream_entity.KindRegistry,
+				ID: 7, Host: "docker.io", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolRegistry},
 				Origin: "https://registry-1.docker.io", Enabled: false,
 			})
 			convey.So(err, convey.ShouldBeNil)
@@ -95,7 +95,7 @@ func TestUpdate(t *testing.T) {
 				&upstream_entity.Upstream{ID: 9, Host: "deb.debian.org"}, nil)
 
 			_, err := Upstream().Update(ctx, &admin.UpdateUpstreamRequest{
-				ID: 7, Host: "deb.debian.org", Kind: upstream_entity.KindStatic,
+				ID: 7, Host: "deb.debian.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
 				Origin: "https://deb.debian.org",
 			})
 			convey.So(err, convey.ShouldNotBeNil)
@@ -104,7 +104,7 @@ func TestUpdate(t *testing.T) {
 		convey.Convey("id 不存在时报错，而不是悄悄新建一条", func() {
 			repo.EXPECT().Find(gomock.Any(), int64(404)).Return(nil, nil)
 			_, err := Upstream().Update(ctx, &admin.UpdateUpstreamRequest{
-				ID: 404, Host: "docker.io", Kind: upstream_entity.KindRegistry,
+				ID: 404, Host: "docker.io", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolRegistry},
 				Origin: "https://registry-1.docker.io",
 			})
 			convey.So(err, convey.ShouldNotBeNil)
@@ -126,7 +126,7 @@ func TestSaveDefaultPolicy(t *testing.T) {
 			})
 
 		_, err := Upstream().Save(context.Background(), &admin.SaveUpstreamRequest{
-			Host: "docker.io", Kind: upstream_entity.KindRegistry,
+			Host: "docker.io", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolRegistry},
 			Origin: "https://registry-1.docker.io",
 		})
 		convey.So(err, convey.ShouldBeNil)

@@ -363,7 +363,7 @@ const quiesceTimeout = 30 * time.Second
 
 func staticUpstream(host string) *upstream_entity.Upstream {
 	return &upstream_entity.Upstream{
-		ID: 7, Host: host, Kind: upstream_entity.KindStatic,
+		ID: 7, Host: host, Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
 		ImmutablePatterns: upstream_entity.PatternList{"/pool/"},
 		MutableTTLSeconds: 60,
 	}

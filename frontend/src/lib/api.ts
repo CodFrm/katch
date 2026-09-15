@@ -5,8 +5,8 @@
  * 字段都在 `data` 里，所以这里剥掉那一层再交给界面，免得每个组件都记着它。
  */
 
-/** 上游的协议类别，取值与后端 upstream_entity.Kind 一致。 */
-export type UpstreamKind = 'registry' | 'static'
+/** 上游能服务的协议，取值与后端 upstream_entity 的 Protocol* 常量一致。 */
+export type UpstreamProtocol = 'registry' | 'static' | 'git'
 
 /** 上游此刻的可服务状态，只有这两种，取值与后端 api/upstream 的常量一致。 */
 export type UpstreamStatus = 'normal' | 'degraded'
@@ -14,7 +14,8 @@ export type UpstreamStatus = 'normal' | 'degraded'
 /** 公开上游列表里的一条。回源地址、默认策略这些运营字段不在公开接口里。 */
 export interface UpstreamItem {
   host: string
-  kind: UpstreamKind
+  /** 这条上游开着的协议，非空。一条记录可以同时开多个。 */
+  protocols: UpstreamProtocol[]
   library_completion: boolean
   hit_rate: number
   cache_bytes: number
@@ -151,7 +152,7 @@ async function adminGet<T>(
 export interface AdminUpstreamItem {
   id: number
   host: string
-  kind: UpstreamKind
+  protocols: UpstreamProtocol[]
   origin: string
   enabled: boolean
   immutable_patterns: string[]
@@ -405,6 +406,24 @@ export interface PurgeResult {
   skipped: number
 }
 
+/**
+ * 一份本地 git 镜像，取值与后端 api/admin.GitMirrorItem 一致。
+ *
+ * state 取值见后端 git_entity 的 Mirror* 常量：pending / ready / failed / rejected。
+ */
+export interface GitMirrorItem {
+  id: number
+  host: string
+  repo: string
+  state: 'pending' | 'ready' | 'failed' | 'rejected'
+  size_bytes: number
+  last_sync_at: number
+  last_access_at: number
+  last_error: string
+  createtime: number
+  updatetime: number
+}
+
 /** 一项运行时设置的值类型，界面按它选控件。 */
 export type SettingValueType = 'bool' | 'int' | 'string'
 
@@ -419,7 +438,7 @@ export interface SettingItem {
 export interface UpstreamDraft {
   id: number
   host: string
-  kind: UpstreamKind
+  protocols: UpstreamProtocol[]
   origin: string
   enabled: boolean
   immutable_patterns: string[]
@@ -497,6 +516,16 @@ export function pinCacheObject(key: string, id: number, pinned: boolean) {
   })
 }
 
+/** 全部 git 本地镜像，不分页——同上游列表，规模有配额顶着。 */
+export function fetchGitMirrors(key: string, signal?: AbortSignal) {
+  return adminGet<{ list: GitMirrorItem[] }>('/api/v1/admin/git/mirrors', key, signal)
+}
+
+/** 删除一条镜像：盘上的目录与库记录都会被清掉，下一次拉取重新走穿透。 */
+export function deleteGitMirror(key: string, id: number) {
+  return adminSend<Record<string, never>>(`/api/v1/admin/git/mirrors/${id}`, key, 'DELETE')
+}
+
 export function fetchSettings(key: string, signal?: AbortSignal) {
   return adminGet<{ list: SettingItem[] }>('/api/v1/admin/settings', key, signal)
 }
@@ -533,7 +562,7 @@ export function toUpstreamDraft(upstream: AdminUpstreamItem): UpstreamDraft {
   return {
     id: upstream.id,
     host: upstream.host,
-    kind: upstream.kind,
+    protocols: upstream.protocols,
     origin: upstream.origin,
     enabled: upstream.enabled,
     immutable_patterns: upstream.immutable_patterns,

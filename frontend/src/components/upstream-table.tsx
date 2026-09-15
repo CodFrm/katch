@@ -8,9 +8,19 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import type { UpstreamItem } from '@/lib/api'
+import type { UpstreamItem, UpstreamProtocol } from '@/lib/api'
 import { formatBytes, formatPercent } from '@/lib/format'
 import { cn } from '@/lib/utils'
+
+/**
+ * 协议集合在界面上是一行标签，用间隔点连起来。
+ *
+ * 放在组件外面而不是写在 JSX 里：那个分隔符是排版符号而不是文案，写在 JSX 里
+ * 会被 i18next/no-literal-string 当成漏翻的界面文字拦下来。
+ */
+function protocolLabels(protocols: UpstreamProtocol[], t: (key: string) => string): string {
+  return protocols.map((protocol) => t(`protocol.${protocol}`)).join(' · ')
+}
 
 /** 表格里值和单位挨在一起，不像侧栏那样分开排。 */
 function formatSize(bytes: number): string {
@@ -29,7 +39,7 @@ export function UpstreamTable({ upstreams }: { upstreams: UpstreamItem[] }) {
   const { t } = useTranslation()
   const columns = [
     { key: 'host', width: 'w-[280px]' },
-    { key: 'kind', width: 'w-[150px]' },
+    { key: 'protocols', width: 'w-[150px]' },
     { key: 'hitRate', width: 'w-[110px]' },
     { key: 'cached', width: 'w-[110px]' },
     { key: 'status', width: '' },
@@ -66,7 +76,7 @@ export function UpstreamTable({ upstreams }: { upstreams: UpstreamItem[] }) {
                 {upstream.host}
               </TableCell>
               <TableCell className="text-muted-foreground px-0 py-2.5">
-                {t(`kind.${upstream.kind}`)}
+                {protocolLabels(upstream.protocols, t)}
               </TableCell>
               <TableCell className="text-foreground px-0 py-2.5 font-mono">
                 {`${formatPercent(upstream.hit_rate)}%`}

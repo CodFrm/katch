@@ -4,10 +4,12 @@ import { parseReference, type UpstreamRef } from '@/lib/reference'
 
 // 上游表来自公开接口，不是客户端里写死的表——这里模拟接口给出的那一份。
 const upstreams: UpstreamRef[] = [
-  { host: 'docker.io', kind: 'registry', libraryCompletion: true },
-  { host: 'ghcr.io', kind: 'registry', libraryCompletion: false },
-  { host: 'deb.debian.org', kind: 'static', libraryCompletion: false },
-  { host: 'proxy.golang.org', kind: 'static', libraryCompletion: false },
+  { host: 'docker.io', protocols: ['registry'], libraryCompletion: true },
+  { host: 'ghcr.io', protocols: ['registry'], libraryCompletion: false },
+  { host: 'deb.debian.org', protocols: ['static'], libraryCompletion: false },
+  { host: 'proxy.golang.org', protocols: ['static'], libraryCompletion: false },
+  // 一条同时开了两种协议的记录：多开一种不该把原本那一种挤掉。
+  { host: 'github.com', protocols: ['static', 'git'], libraryCompletion: false },
 ]
 
 const origin = 'https://katch.dev'
@@ -94,6 +96,14 @@ describe('parseReference 识别', () => {
       command: 'curl -fL https://katch.dev/deb.debian.org/',
     },
     {
+      name: '同时开了 static 与 git 的上游，静态资源照常识别成下载命令',
+      input: 'https://github.com/foo/bar/releases/download/v1/x.tgz',
+      host: 'github.com',
+      kind: 'static',
+      target: 'github.com/foo/bar/releases/download/v1/x.tgz',
+      command: 'curl -fLO https://katch.dev/github.com/foo/bar/releases/download/v1/x.tgz',
+    },
+    {
       name: '两侧空白与多余斜杠不影响识别',
       input: '  https://deb.debian.org//debian/x  ',
       host: 'deb.debian.org',
@@ -132,6 +142,17 @@ describe('parseReference 认不出来的输入', () => {
     expect(parseReference('quay.io/prometheus/busybox:latest', { upstreams, origin })).toEqual({
       status: 'unknown',
       host: 'quay.io',
+    })
+  })
+
+  it('默认 registry 那条记录没开 registry 协议时，裸镜像名认不出来', () => {
+    // 裸镜像名只可能落到 registry 上：默认上游只开静态资源时它认不出来。
+    const staticDockerIo: UpstreamRef[] = upstreams.map((u) =>
+      u.host === 'docker.io' ? { ...u, protocols: ['static'] } : u
+    )
+    expect(parseReference('redis:7', { upstreams: staticDockerIo, origin })).toEqual({
+      status: 'unknown',
+      host: 'docker.io',
     })
   })
 

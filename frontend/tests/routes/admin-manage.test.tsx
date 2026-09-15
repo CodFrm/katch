@@ -30,7 +30,7 @@ function upstreamRows() {
     {
       id: 1,
       host: 'docker.io',
-      kind: 'registry',
+      protocols: ['registry'],
       origin: 'https://registry-1.docker.io',
       enabled: true,
       immutable_patterns: ['@sha256:'],
@@ -44,7 +44,7 @@ function upstreamRows() {
     {
       id: 2,
       host: 'deb.debian.org',
-      kind: 'static',
+      protocols: ['static'],
       origin: 'https://deb.debian.org',
       enabled: true,
       immutable_patterns: [],
@@ -135,6 +135,12 @@ function settingRows() {
     { key: 'origin_concurrency', value: 64, type: 'int' },
     { key: 'origin_timeout_seconds', value: 30, type: 'int' },
     { key: 'origin_retries', value: 2, type: 'int' },
+    { key: 'git_mirror_quota_bytes', value: 10 * GB, type: 'int' },
+    { key: 'git_repo_max_bytes', value: GB, type: 'int' },
+    { key: 'git_sync_timeout_seconds', value: 600, type: 'int' },
+    { key: 'git_sync_concurrency', value: 2, type: 'int' },
+    { key: 'git_build_stall_seconds', value: 120, type: 'int' },
+    { key: 'git_build_timeout_seconds', value: 1800, type: 'int' },
   ]
 }
 
@@ -174,7 +180,7 @@ const publicUpstreams = {
   list: [
     {
       host: 'docker.io',
-      kind: 'registry',
+      protocols: ['registry'],
       library_completion: true,
       hit_rate: 0.942,
       cache_bytes: 812 * GB,
@@ -182,7 +188,7 @@ const publicUpstreams = {
     },
     {
       host: 'deb.debian.org',
-      kind: 'static',
+      protocols: ['static'],
       library_completion: false,
       hit_rate: 0.961,
       cache_bytes: 431 * GB,
@@ -648,6 +654,58 @@ describe('后台 · 设置', () => {
     expect(await screen.findByRole('status')).toHaveTextContent('已保存')
   })
 
+  it('git 镜像那六项读得出来，改一项存得回去', async () => {
+    // 设置页不按后端的 settingDefs 自动渲染，每一项都是手写的一行：少写一行，
+    // 那一项就是「存得下但界面上根本改不到」。
+    renderAdmin('/admin/settings')
+
+    expect(await screen.findByLabelText('镜像总配额')).toHaveValue('10 GB')
+    expect(screen.getByLabelText('同步超时')).toHaveValue('10m')
+    expect(screen.getByLabelText('同步并发上限')).toHaveValue('2')
+    expect(screen.getByLabelText('建镜像停滞时限')).toHaveValue('2m')
+    expect(screen.getByLabelText('建镜像总时限')).toHaveValue('30m')
+
+    const limit = await screen.findByLabelText('单仓体积上限')
+    expect(limit).toHaveValue('1.00 GB')
+    await userEvent.clear(limit)
+    await userEvent.type(limit, '512 MB')
+    await userEvent.click(screen.getByRole('button', { name: '保存更改' }))
+
+    const call = await vi.waitFor(() => {
+      const found = calls.find(
+        (item) => item.url === '/api/v1/admin/settings' && item.method === 'POST'
+      )
+      expect(found).toBeDefined()
+      return found!
+    })
+    expect(call.body).toEqual({ settings: { git_repo_max_bytes: 512 * 1024 * 1024 } })
+    expect(await screen.findByRole('status')).toHaveTextContent('已保存')
+  })
+
+  it('两道时间闸改完按数送回后端，不是把 `5m` 原样送过去', async () => {
+    renderAdmin('/admin/settings')
+
+    const stall = await screen.findByLabelText('建镜像停滞时限')
+    await userEvent.clear(stall)
+    await userEvent.type(stall, '30s')
+    const total = screen.getByLabelText('建镜像总时限')
+    await userEvent.clear(total)
+    await userEvent.type(total, '1h')
+    await userEvent.click(screen.getByRole('button', { name: '保存更改' }))
+
+    const call = await vi.waitFor(() => {
+      const found = calls.find(
+        (item) => item.url === '/api/v1/admin/settings' && item.method === 'POST'
+      )
+      expect(found).toBeDefined()
+      return found!
+    })
+    expect(call.body).toEqual({
+      settings: { git_build_stall_seconds: 30, git_build_timeout_seconds: 3600 },
+    })
+    expect(await screen.findByRole('status')).toHaveTextContent('已保存')
+  })
+
   it('最近请求保留时长默认一天，写成 1h 就按秒保存', async () => {
     renderAdmin('/admin/settings')
 
@@ -775,9 +833,47 @@ describe('后台 · 上游的增改与启停', () => {
     expect(call.body).toMatchObject({
       host: 'ghcr.io',
       origin: 'https://ghcr.io',
-      kind: 'registry',
+      protocols: ['registry'],
       enabled: true,
     })
+  })
+
+  it('协议是多选：勾上 git 不会把原本的静态资源挤掉', async () => {
+    renderAdmin('/admin')
+
+    await userEvent.click(await screen.findByRole('link', { name: '添加上游' }))
+    await userEvent.type(screen.getByLabelText('上游主机名'), 'github.com')
+    await userEvent.type(screen.getByLabelText('回源地址'), 'https://github.com')
+    // 出厂勾的是容器镜像，这一条上游要的是静态资源加 git。
+    await userEvent.click(screen.getByRole('checkbox', { name: '容器镜像' }))
+    // 故意倒着勾：写回去的顺序是固定的那一份，不随点击先后变——否则同一条上游
+    // 会有两份说法相同、字节不同的请求体。
+    await userEvent.click(screen.getByRole('checkbox', { name: 'Git 仓库' }))
+    await userEvent.click(screen.getByRole('checkbox', { name: '静态资源' }))
+    await userEvent.click(screen.getByRole('button', { name: '保存上游' }))
+
+    const call = await vi.waitFor(() => {
+      const found = calls.find(
+        (item) => item.url === '/api/v1/admin/upstreams' && item.method === 'POST'
+      )
+      expect(found).toBeDefined()
+      return found!
+    })
+    expect(call.body.protocols).toEqual(['static', 'git'])
+  })
+
+  it('一个协议都不勾时不发请求：那条记录什么都服务不了', async () => {
+    renderAdmin('/admin')
+
+    await userEvent.click(await screen.findByRole('link', { name: '添加上游' }))
+    await userEvent.type(screen.getByLabelText('上游主机名'), 'ghcr.io')
+    await userEvent.type(screen.getByLabelText('回源地址'), 'https://ghcr.io')
+    await userEvent.click(screen.getByRole('checkbox', { name: '容器镜像' }))
+    await userEvent.click(screen.getByRole('button', { name: '保存上游' }))
+
+    expect(
+      calls.some((item) => item.url === '/api/v1/admin/upstreams' && item.method === 'POST')
+    ).toBe(false)
   })
 
   it('暂停一个上游写的是 enabled=false，其余登记字段原样带回去', async () => {

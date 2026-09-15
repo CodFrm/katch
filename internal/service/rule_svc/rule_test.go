@@ -34,7 +34,7 @@ func setupRuleTest(t *testing.T) (*mock_rule_repo.MockAccessRuleRepo, *mock_upst
 
 func debian() *upstream_entity.Upstream {
 	return &upstream_entity.Upstream{
-		ID: 7, Host: "deb.debian.org", Kind: upstream_entity.KindStatic,
+		ID: 7, Host: "deb.debian.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
 		Enabled: true, DefaultPolicy: upstream_entity.PolicyAllowAll,
 	}
 }

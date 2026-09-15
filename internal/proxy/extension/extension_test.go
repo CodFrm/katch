@@ -239,10 +239,10 @@ func TestNewUpstream_RegisteredThroughAdminAPIOnly(t *testing.T) {
 		convey.So(origin.hits.Load(), convey.ShouldEqual, 0)
 
 		// ② 只经管理接口注册。没有 SQL、没有配置文件、没有任何装配函数，
-		// 整条记录就是 spec 说的那四样：主机名、协议类别、回源地址、不可变模式。
+		// 整条记录就是 spec 说的那四样：主机名、协议集合、回源地址、不可变模式。
 		saved := call(engine, http.MethodPost, "/api/v1/admin/upstreams", `{
 			"host": "`+fakeUpstreamHost+`",
-			"kind": "static",
+			"protocols": ["static"],
 			"origin": "`+origin.srv.URL+`",
 			"enabled": true,
 			"immutable_patterns": ["/pool/"]
@@ -299,6 +299,88 @@ func TestNewUpstream_StaysUnknownWithoutRegistration(t *testing.T) {
 	})
 }
 
+// TestUpstreamProtocolSet_DecidesWhatItServes 协议集合说了算，任务目标 (a) 与 (b)。
+//
+// 开了两种协议的记录不因为多开了一种就丢掉原本那一种：一条 protocols
+// 为 [static, git] 的上游，static 路径照常拉得通。反过来，只开 registry 的记录
+// 在 static 路径上仍然什么都不是——回填上来的 docker.io 正是这个形态，它多出来的
+// 那条 static 路径必须还是 404，而且 404 里不带主机名：不存在、没开这个协议、
+// 被停用三种理由折叠成同一个空回应，否则这台站点就成了一台主机名探测器。
+func TestUpstreamProtocolSet_DecidesWhatItServes(t *testing.T) {
+	convey.Convey("同时开 static 与 git 的上游，static 路径照常命中", t, func() {
+		engine, origin := startKatch(t)
+		saved := call(engine, http.MethodPost, "/api/v1/admin/upstreams", `{
+			"host": "`+fakeUpstreamHost+`",
+			"protocols": ["static", "git"],
+			"origin": "`+origin.srv.URL+`",
+			"enabled": true,
+			"immutable_patterns": ["/pool/"]
+		}`, adminJSON())
+		convey.So(saved.Code, convey.ShouldEqual, http.StatusOK)
+		convey.So(saved.Body.String(), convey.ShouldContainSubstring, `"code":0`)
+
+		w := call(engine, http.MethodGet, "/"+fakeUpstreamHost+fakeUpstreamPath, "", nil)
+		convey.So(w.Code, convey.ShouldEqual, http.StatusOK)
+		convey.So(w.Body.String(), convey.ShouldEqual, fakeUpstreamBody)
+		convey.So(origin.hits.Load(), convey.ShouldEqual, 1)
+	})
+
+	convey.Convey("只开 registry 的上游，它名下的 static 路径是不带主机名的空 404", t, func() {
+		engine, origin := startKatch(t)
+		// 这正是旧库回填上来的那个形态：kind='registry' → protocols=["registry"]。
+		saved := call(engine, http.MethodPost, "/api/v1/admin/upstreams", `{
+			"host": "`+fakeUpstreamHost+`",
+			"protocols": ["registry"],
+			"origin": "`+origin.srv.URL+`",
+			"enabled": true
+		}`, adminJSON())
+		convey.So(saved.Code, convey.ShouldEqual, http.StatusOK)
+
+		w := call(engine, http.MethodGet, "/"+fakeUpstreamHost+fakeUpstreamPath, "", nil)
+		convey.So(w.Code, convey.ShouldEqual, http.StatusNotFound)
+		convey.So(w.Body.String(), convey.ShouldBeEmpty)
+		convey.So(w.Body.String(), convey.ShouldNotContainSubstring, fakeUpstreamHost)
+		// 回源一次都不该发生：没开这个协议的主机连回源的资格都没有。
+		convey.So(origin.hits.Load(), convey.ShouldEqual, 0)
+	})
+
+	convey.Convey("协议集合本身是有闸的", t, func() {
+		engine, _ := startKatch(t)
+		reject := func(protocols string) {
+			w := call(engine, http.MethodPost, "/api/v1/admin/upstreams", `{
+				"host": "`+fakeUpstreamHost+`",
+				"protocols": `+protocols+`,
+				"origin": "http://127.0.0.1:1",
+				"enabled": true
+			}`, adminJSON())
+			convey.So(w.Body.String(), convey.ShouldNotContainSubstring, `"code":0`)
+		}
+
+		convey.Convey("一个协议都不开的记录建不出来：判定的默认值是拒绝", func() {
+			reject(`[]`)
+		})
+		convey.Convey("字段整个缺席也建不出来", func() {
+			reject(`null`)
+		})
+		convey.Convey("认不出的取值建不出来：库里只该有已知协议", func() {
+			// 这一条和迁移那边「遇到未知 kind 就停下」是同一件事的两头：
+			// 写入侧不放进来，升级侧不猜出去。
+			reject(`["ftp"]`)
+		})
+		convey.Convey("已知协议里混一个认不出的，整条都不收", func() {
+			reject(`["static", "ftp"]`)
+		})
+	})
+}
+
+// adminJSON 带管理密钥的 JSON 请求头。
+func adminJSON() http.Header {
+	return http.Header{
+		"Authorization": []string{"Bearer " + adminKey},
+		"Content-Type":  []string{"application/json"},
+	}
+}
+
 // TestFakeUpstreamIsNotAFixture 守卫的守卫。
 //
 // 上面那条用例只有在「生产代码根本不认识这个主机名」时才证明得了扩展点：一旦
@@ -306,6 +388,8 @@ func TestNewUpstream_StaysUnknownWithoutRegistration(t *testing.T) {
 // 内置上游，不是扩展点。所以这里直接去仓库里核实一遍，不靠约定。
 func TestFakeUpstreamIsNotAFixture(t *testing.T) {
 	convey.Convey("假上游的主机名不出现在任何生产 Go 代码里", t, func() {
+		// git 那台假上游受同一条约束：它也只该经管理接口被认识。
+		hosts := []string{fakeUpstreamHost, fakeGitHost}
 		_, thisFile, _, ok := runtime.Caller(0)
 		convey.So(ok, convey.ShouldBeTrue)
 		root := filepath.Clean(filepath.Join(filepath.Dir(thisFile), "..", "..", ".."))
@@ -330,8 +414,10 @@ func TestFakeUpstreamIsNotAFixture(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			if strings.Contains(string(content), fakeUpstreamHost) {
-				mentions = append(mentions, path)
+			for _, host := range hosts {
+				if strings.Contains(string(content), host) {
+					mentions = append(mentions, path+"："+host)
+				}
 			}
 			return nil
 		})

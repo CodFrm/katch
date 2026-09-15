@@ -120,7 +120,7 @@ func TestProxy_SecondPullIsServedFromDisk(t *testing.T) {
 			_, _ = io.WriteString(w, payload)
 		})
 		upstreamTable(t, &upstream_entity.Upstream{
-			ID: 1, Host: "deb.debian.org", Kind: upstream_entity.KindStatic,
+			ID: 1, Host: "deb.debian.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
 			Origin: srv.URL, Enabled: true,
 			ImmutablePatterns: upstream_entity.PatternList{"/pool/"},
 			MutableTTLSeconds: 60,

@@ -19,6 +19,7 @@ import (
 	"github.com/CodFrm/katch/internal/proxy/dispatch"
 	"github.com/CodFrm/katch/internal/proxy/origin"
 	"github.com/CodFrm/katch/internal/proxy/registry"
+	"github.com/CodFrm/katch/internal/service/git_svc"
 	"github.com/CodFrm/katch/internal/service/setting_svc"
 	"github.com/CodFrm/katch/internal/service/upstream_svc"
 )
@@ -48,6 +49,15 @@ type Target struct {
 	Method   string
 	// Header 客户端请求头，由回源侧按白名单过滤后转发。
 	Header http.Header
+	// Git git 端点的识别结果，由 dispatch.ClassifyGit 给出。零值表示这不是
+	// git 请求，一切照旧——判定在拉取路径那一层做完，这里只按结果分流。
+	Git dispatch.GitEndpoint
+	// Body 请求体，nil 表示没有。目前只有 git 的协商请求带它。
+	//
+	// 它只能被读一次，所以带请求体的回源不重试，见 fetchWithRetry。
+	Body io.Reader
+	// ContentLength 请求体长度，-1 表示未知（分块传输）。Body 为 nil 时无意义。
+	ContentLength int64
 }
 
 // Meta 回源响应的元信息。响应体单独返回，便于流式转发。
@@ -149,7 +159,7 @@ func (p *proxySvc) Fetch(ctx context.Context, target *Target) (io.ReadCloser, *M
 	if upstream == nil {
 		return nil, nil, ErrUpstreamNotAllowed
 	}
-	if !kindMatches(target, upstream) {
+	if !protocolMatches(target, upstream) {
 		return nil, nil, ErrUpstreamNotAllowed
 	}
 	// 闸问在这里，而不是在白名单判定之前：表里没有的主机名必须先拿到那一个
@@ -208,6 +218,9 @@ func (p *proxySvc) Fetch(ctx context.Context, target *Target) (io.ReadCloser, *M
 	// 口径，摘掉的只是「向谁鉴权」这句话。
 	resp.Header.Del("WWW-Authenticate")
 	stripUpstreamAccountHeaders(resp.Header)
+	// 穿透成功之后才让后台去建镜像（决策 5）：走到这里才同时知道「这是一个
+	// git 仓库的只读请求」「这台上游开着 git」「上游确实认这个仓库」三件事。
+	p.mirror(ctx, target, resp.StatusCode)
 	return body, &Meta{
 		StatusCode:    resp.StatusCode,
 		Header:        resp.Header,
@@ -247,6 +260,19 @@ func stripUpstreamAccountHeaders(header http.Header) {
 	}
 }
 
+// mirror 一次成功的 git 穿透之后，让镜像层把这个仓库建起来（决策 7：谁被拉过
+// 就镜像谁）。它不阻塞这次拉取——登记之外的活都在镜像层的后台协程上。
+//
+// 只认 upload-pack：push 在拉取路径那一层就被 403 掉了，真走到这里也不该因为
+// 一次写操作去建镜像。只认 200：上游的 404 说的是「这里没有这个仓库」，照着它
+// 建镜像只是在一次次白打上游；401/403 同理，katch 不带凭据，建也建不下来。
+func (p *proxySvc) mirror(ctx context.Context, target *Target, status int) {
+	if !target.Git.IsUploadPack() || status != http.StatusOK {
+		return
+	}
+	git_svc.Mirror().Ensure(ctx, target.Host, target.Git.Repo)
+}
+
 // settings 读一次运行时设置。
 //
 // 读不出来不让拉取停摆：返回的快照在出错时是出厂值（失败与降级一节——库不可用时
@@ -275,6 +301,12 @@ func (p *proxySvc) fetchWithRetry(ctx context.Context, target *Target,
 	// 重试次数是个非负数（写入时校验挡着），真读到一个负数也要至少回源一次：
 	// 一次都不试就返回，交出去的会是一个既没响应也没错误的结果，调用方当场崩。
 	attempts := max(rt.OriginRetries+1, 1)
+	if target.Body != nil {
+		// 请求体是一次性的 io.Reader，第一次尝试就把它读空了。再试一次送上去
+		// 的是一个空请求体，而上游会拿它当一次合法的空协商正常答复——客户端
+		// 于是收到一份和它要的东西无关的 200，比一次干脆的失败难查得多。
+		attempts = 1
+	}
 	var lastErr error
 	for range attempts {
 		attemptCtx, cancel := context.WithCancel(ctx)
@@ -328,24 +360,35 @@ func (p *proxySvc) fetchUpstream(
 		})
 	}
 	return p.origin.Do(ctx, &origin.Request{
-		Method:   target.Method,
-		Origin:   upstream.Origin,
-		Path:     target.Path,
-		RawQuery: target.RawQuery,
-		Header:   target.Header,
+		Method:        target.Method,
+		Origin:        upstream.Origin,
+		Path:          target.Path,
+		RawQuery:      target.RawQuery,
+		Header:        target.Header,
+		Body:          target.Body,
+		ContentLength: target.ContentLength,
 	})
 }
 
-// kindMatches 校验请求形态与上游类别是否相符。
+// protocolMatches 校验请求形态所需的协议，这条上游开没开。
 //
-// 类别对不上就当作没有这个上游：registry 客户端固定走 /v2 前缀，一个 static 上游
+// 没开就当作没有这个上游：registry 客户端固定走 /v2 前缀，一个只开 static 的上游
 // 出现在 /v2/ 之下（或反过来）只可能是拼错或在试探，按白名单之外处理最省事。
-func kindMatches(target *Target, upstream *upstream_entity.Upstream) bool {
+//
+// 查集合而不是比单值，于是一条同时开了 static 与 git 的记录照常服务 static 路径，
+// 而回填成 [registry] 的 docker.io 在 static 路径上仍然什么都不是。空集合对任何
+// 形态都答 false，见 ProtocolSet.Has。
+func protocolMatches(target *Target, upstream *upstream_entity.Upstream) bool {
 	switch target.Kind {
 	case dispatch.KindRegistry:
-		return upstream.Kind == upstream_entity.KindRegistry
+		return upstream.Protocols.Has(upstream_entity.ProtocolRegistry)
 	case dispatch.KindStatic:
-		return upstream.Kind == upstream_entity.KindStatic
+		// git 的端点寄生在 static 的路径空间里，但要的是 git 那一种协议：
+		// 一条只开了 static 的 github.com 服务 release 资产，不服务 clone。
+		if target.Git.IsGit() {
+			return upstream.Protocols.Has(upstream_entity.ProtocolGit)
+		}
+		return upstream.Protocols.Has(upstream_entity.ProtocolStatic)
 	default:
 		// 其余归属根本不该走到回源，走到了就是调用方漏判了一种分支。
 		return false

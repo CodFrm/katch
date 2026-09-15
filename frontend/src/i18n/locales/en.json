@@ -22,9 +22,10 @@
     "persistentHide": "Hide ↑",
     "persistentLabel": "Upstream prefix"
   },
-  "kind": {
+  "protocol": {
     "registry": "Container image",
-    "static": "Static files"
+    "static": "Static files",
+    "git": "Git repository"
   },
   "status": {
     "normal": "Normal",
@@ -41,7 +42,7 @@
     "title": "Supported upstreams",
     "count": "{{count}} in total",
     "host": "Upstream",
-    "kind": "Kind",
+    "protocols": "Protocols",
     "hitRate": "Hit rate",
     "cached": "Cached",
     "status": "Status"
@@ -52,6 +53,7 @@
       "overview": "Overview",
       "upstreams": "Upstreams",
       "cache": "Cache objects",
+      "git": "Git mirrors",
       "settings": "Settings",
       "addUpstream": "Add upstream"
     },
@@ -120,6 +122,16 @@
         "setting_changed_unknown": "Changed runtime settings",
         "admin_key_rotated": "Rotated the admin key",
         "cache_reclaimed": "Evicted {{removed}} cold objects, freeing {{size}}",
+        "git_mirror_pending": "{{host}}{{repo}} started building a local mirror",
+        "git_mirror_pending_unknown": "A repository started building a local mirror",
+        "git_mirror_ready": "{{host}}{{repo}} mirror built, using {{size}}",
+        "git_mirror_ready_unknown": "A repository's local mirror finished building",
+        "git_mirror_failed": "{{host}}{{repo}} failed to mirror: {{error}}",
+        "git_mirror_failed_unknown": "A repository failed to mirror",
+        "git_mirror_rejected": "{{host}}{{repo}} exceeds the per-repo size limit, staying passthrough",
+        "git_mirror_rejected_unknown": "A repository exceeds the per-repo size limit, staying passthrough",
+        "git_mirror_evicted": "Mirror quota exceeded, reclaimed {{host}}{{repo}}, freeing {{size}}",
+        "git_mirror_evicted_unknown": "Mirror quota exceeded, reclaimed a repository",
         "unknown": "An event this build does not know yet"
       }
     },
@@ -178,7 +190,7 @@
       "form": {
         "host": "Upstream host",
         "origin": "Origin address",
-        "kind": "Upstream kind",
+        "protocols": "Upstream protocols",
         "defaultPolicy": "Default policy",
         "note": "Note",
         "save": "Save upstream",
@@ -283,6 +295,27 @@
         "operations": "Actions"
       }
     },
+    "git": {
+      "title": "Git mirrors",
+      "count": "{{count}} total",
+      "empty": "No mirrors yet.",
+      "delete": "Delete",
+      "neverSynced": "Never synced",
+      "columns": {
+        "repo": "Repository",
+        "state": "State",
+        "size": "Size",
+        "lastSync": "Last sync",
+        "lastAccess": "Last access",
+        "operations": "Actions"
+      },
+      "state": {
+        "pending": "Building",
+        "ready": "Ready",
+        "failed": "Failed",
+        "rejected": "Passthrough (over limit)"
+      }
+    },
     "settings": {
       "title": "Settings",
       "subtitle": "Runtime settings only — every change takes effect right away, no restart",
@@ -302,6 +335,7 @@
         "cache": "Cache",
         "origin": "Origin",
         "history": "History",
+        "git": "Git mirrors",
         "access": "Access"
       },
       "fields": {
@@ -318,6 +352,13 @@
         "timeout": "Origin timeout",
         "retries": "Retries",
         "retriesShort": "retries",
+        "gitQuota": "Mirror quota",
+        "gitRepoLimit": "Single repo limit",
+        "gitSyncTimeout": "Sync timeout",
+        "gitSyncConcurrency": "Sync concurrency",
+        "gitBuildStall": "Build stall timeout",
+        "gitBuildTimeout": "Build time limit",
+        "gitSyncConcurrencyShort": "concurrency",
         "adminKey": "Admin key",
         "globalRules": "Global access rules"
       },
@@ -329,7 +370,12 @@
         "recentRequestRetention": "The only gate on how much disk this history takes: the longer the retention, the bigger the database, growing linearly with traffic",
         "immutable": "Content addressed, never expires, evicted by LRU only",
         "concurrency": "Requests hitting one upstream at the same time",
-        "globalRules": "Evaluated before every upstream's own rules"
+        "globalRules": "Evaluated before every upstream's own rules",
+        "gitQuota": "Total disk the local git mirrors may take",
+        "gitRepoLimit": "Repositories over this stay on passthrough and are never mirrored",
+        "gitSyncTimeout": "How long one incremental sync may run; builds have their own limit",
+        "gitBuildStall": "Abort a build once the upstream has sent nothing for this long",
+        "gitBuildTimeout": "How long one mirror build may take, queueing included"
       },
       "states": {
         "publicOn": "Upstreams and hit rate are visible to everyone",

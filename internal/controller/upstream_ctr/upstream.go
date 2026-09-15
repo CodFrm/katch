@@ -89,10 +89,10 @@ func (u *Upstream) record(ctx context.Context, kind string, id int64, spec *admi
 	event_svc.Event().Record(ctx, &event_svc.RecordInput{
 		Kind: kind, Actor: event_entity.ActorAdmin, UpstreamID: id,
 		Detail: map[string]any{
-			"host":    spec.Host,
-			"kind":    spec.Kind,
-			"origin":  spec.Origin,
-			"enabled": spec.Enabled,
+			"host":      spec.Host,
+			"protocols": spec.Protocols,
+			"origin":    spec.Origin,
+			"enabled":   spec.Enabled,
 		},
 	})
 }

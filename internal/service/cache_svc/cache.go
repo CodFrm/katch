@@ -253,6 +253,12 @@ func (c *cacheSvc) usable() bool {
 // HEAD 没有响应体；带 Range 或条件头的请求拿到的是半截或 304，把它们写进缓存
 // 就是把半截当整份。这类请求直接透传给上游，由上游自己回答。
 func cacheableRequest(target *proxy_svc.Target) bool {
+	if target.Git.IsGit() {
+		// git 的任何应答都不进对象缓存（决策 9）：协商结果因客户端而异，不是
+		// 一个内容寻址的对象，存下来就是把一个客户端的协商结果发给另一个客户端。
+		// ref 广播是一个不带 Range 的普通 GET，不在这里挡住就会被当成对象存下。
+		return false
+	}
 	if target.Method != http.MethodGet {
 		return false
 	}
@@ -374,7 +380,7 @@ func (c *cacheSvc) serveFromDisk(ctx context.Context, upstream *upstream_entity.
 	// 只给 registry 补。static 那一侧的 Etag 在未命中时是**上游那一串**，命中时换成
 	// katch 自己的摘要，同一份内容就有了两个互不相认的强校验符——客户端拿着后者去做
 	// 条件请求，只会换回一次整份重传。那一侧要一致得把上游的头存下来，是另一条路。
-	if upstream.Kind == upstream_entity.KindRegistry && object.Digest != "" {
+	if upstream.Protocols.Has(upstream_entity.ProtocolRegistry) && object.Digest != "" {
 		header.Set("Docker-Content-Digest", object.Digest)
 		header.Set("Etag", `"`+object.Digest+`"`)
 	}

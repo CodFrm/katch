@@ -13,6 +13,7 @@ import (
 
 	"github.com/CodFrm/katch/internal/model/entity/cache_entity"
 	"github.com/CodFrm/katch/internal/model/entity/event_entity"
+	"github.com/CodFrm/katch/internal/model/entity/git_entity"
 	"github.com/CodFrm/katch/internal/model/entity/request_log_entity"
 	"github.com/CodFrm/katch/internal/model/entity/rollup_entity"
 	"github.com/CodFrm/katch/internal/model/entity/rule_entity"
@@ -30,6 +31,8 @@ func migrationList() []*gormigrate.Migration {
 		event(),
 		trafficRollupMissReasons(),
 		recentRequest(),
+		upstreamProtocols(),
+		gitMirror(),
 	}
 }
 
@@ -451,6 +454,137 @@ func recentRequest() *gormigrate.Migration {
 			if err != nil {
 				return err
 			}
+			return tx.Exec(fmt.Sprintf("DROP TABLE IF EXISTS `%s`", table)).Error
+		},
+	}
+}
+
+// upstreamProtocols 把上游的单值 kind 换成协议集合 protocols。
+//
+// 建列、回填、删列三步在同一条迁移里走完，不留 kind：留一个没人读的旧真相，
+// 迟早有人照着它写判断，两份真相就此分叉（spec 决策 2）。
+//
+// 顺序是先核对、后动结构：gormigrate 的默认选项不开事务，一条中途失败的迁移
+// 会把半截 DDL 留在库里。先把全部 kind 取值点一遍，遇到第三种取值就在什么都
+// 还没改的时候停下——库被手改过时猜一个默认值，只会让一条 registry 上游在升级
+// 之后静默地服务不了任何东西。
+//
+// 逐条 ALTER 而不是一条多子句的：MySQL 认后者，sqlite 不认（同 trafficRollupMissReasons）。
+// DROP COLUMN 在 sqlite 上要 3.35+，modernc.org/sqlite 满足；kind 上没有索引，
+// 否则 sqlite 会直接拒绝删列。
+func upstreamProtocols() *gormigrate.Migration {
+	// backfill 旧的 kind 取值到新的协议集合。集合里就它一个：升级之前的记录
+	// 只可能服务一种协议，多开哪一种是升级之后由人决定的事。
+	backfill := map[string]string{
+		upstream_entity.ProtocolRegistry: `["` + upstream_entity.ProtocolRegistry + `"]`,
+		upstream_entity.ProtocolStatic:   `["` + upstream_entity.ProtocolStatic + `"]`,
+	}
+	return &gormigrate.Migration{
+		ID: "20260914000001_upstream_protocols",
+		Migrate: func(tx *gorm.DB) error {
+			table, err := tableName(tx, &upstream_entity.Upstream{})
+			if err != nil {
+				return err
+			}
+			var kinds []string
+			if err := tx.Table(table).Distinct().Pluck("kind", &kinds).Error; err != nil {
+				return err
+			}
+			for _, kind := range kinds {
+				if _, ok := backfill[kind]; !ok {
+					return fmt.Errorf("migrations: upstream.kind 出现未知取值 %q，"+
+						"无法回填 protocols；请先修正这一行再升级", kind)
+				}
+			}
+			// 可空的 TEXT，与同表的 immutable_patterns 一致：MySQL 8.0.13 之前
+			// 不允许 TEXT 列带 DEFAULT，带了这条迁移在老 MySQL 上直接报错。
+			if err := tx.Exec(fmt.Sprintf(
+				"ALTER TABLE `%s` ADD COLUMN `protocols` TEXT", table)).Error; err != nil {
+				return err
+			}
+			for kind, protocols := range backfill {
+				if err := tx.Exec(fmt.Sprintf(
+					"UPDATE `%s` SET `protocols` = ? WHERE `kind` = ?", table),
+					protocols, kind).Error; err != nil {
+					return err
+				}
+			}
+			return tx.Exec(fmt.Sprintf("ALTER TABLE `%s` DROP COLUMN `kind`", table)).Error
+		},
+		Rollback: func(tx *gorm.DB) error {
+			table, err := tableName(tx, &upstream_entity.Upstream{})
+			if err != nil {
+				return err
+			}
+			if err := tx.Exec(fmt.Sprintf(
+				"ALTER TABLE `%s` ADD COLUMN `kind` VARCHAR(32) NOT NULL DEFAULT ''",
+				table)).Error; err != nil {
+				return err
+			}
+			// 回滚回单值只能挑一个：registry 优先，因为它是路径形态上唯一不可
+			// 替代的那一种，剩下的（含只开 git 的）都落到 static。这是有损的，
+			// 也正是「换回去」这个动作本身的代价。
+			if err := tx.Exec(fmt.Sprintf("UPDATE `%s` SET `kind` = ?", table),
+				upstream_entity.ProtocolStatic).Error; err != nil {
+				return err
+			}
+			if err := tx.Exec(fmt.Sprintf(
+				"UPDATE `%s` SET `kind` = ? WHERE `protocols` LIKE ?", table),
+				upstream_entity.ProtocolRegistry,
+				`%"`+upstream_entity.ProtocolRegistry+`"%`).Error; err != nil {
+				return err
+			}
+			return tx.Exec(fmt.Sprintf("ALTER TABLE `%s` DROP COLUMN `protocols`", table)).Error
+		},
+	}
+}
+
+// gitMirror 建 git 本地镜像表。
+//
+// host+repo 上一条唯一索引：并发的两次穿透会同时想登记同一个仓库，没有它，
+// 盘上一份镜像会对应库里两条真相，而「这个仓库现在什么状态」就此有了两个答案。
+//
+// 建表语句手写而不是 AutoMigrate：同 event 那条，AutoMigrate 的产物随 gorm 版本
+// 漂移，而迁移要的是一份此刻写死、将来也不会变的表结构。
+func gitMirror() *gormigrate.Migration {
+	return &gormigrate.Migration{
+		ID: "20260914000002_git_mirror",
+		Migrate: func(tx *gorm.DB) error {
+			table, err := tableName(tx, &git_entity.GitMirror{})
+			if err != nil {
+				return err
+			}
+			autoPK := "BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY"
+			if tx.Name() == "sqlite" {
+				autoPK = "INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT"
+			}
+			// host 与 repo 都给足长度：仓库路径可以很长，而截断会让两个不同的
+			// 仓库在唯一索引上撞成同一行。
+			stmt := fmt.Sprintf("CREATE TABLE `%s` ("+
+				"`id` %s,"+
+				"`host` VARCHAR(255) NOT NULL,"+
+				"`repo` VARCHAR(512) NOT NULL,"+
+				"`state` VARCHAR(32) NOT NULL,"+
+				"`last_sync_at` BIGINT NOT NULL DEFAULT 0,"+
+				"`last_access_at` BIGINT NOT NULL DEFAULT 0,"+
+				"`size_bytes` BIGINT NOT NULL DEFAULT 0,"+
+				"`last_error` TEXT,"+
+				"`createtime` BIGINT NOT NULL DEFAULT 0,"+
+				"`updatetime` BIGINT NOT NULL DEFAULT 0)", table, autoPK)
+			if err := tx.Exec(stmt).Error; err != nil {
+				return err
+			}
+			return tx.Exec(fmt.Sprintf(
+				"CREATE UNIQUE INDEX `uk_%s_host_repo` ON `%s` (`host`,`repo`)",
+				table, table)).Error
+		},
+		Rollback: func(tx *gorm.DB) error {
+			table, err := tableName(tx, &git_entity.GitMirror{})
+			if err != nil {
+				return err
+			}
+			// 索引跟着表一起走：DROP TABLE 会带走它，单独再删一次在 MySQL 上
+			// 是一条错误而不是幂等操作。
 			return tx.Exec(fmt.Sprintf("DROP TABLE IF EXISTS `%s`", table)).Error
 		},
 	}

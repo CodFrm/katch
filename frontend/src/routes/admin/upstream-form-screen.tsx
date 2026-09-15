@@ -11,18 +11,18 @@ import {
   type AdminUpstreamItem,
   type DefaultPolicy,
   type UpstreamDraft,
-  type UpstreamKind,
+  type UpstreamProtocol,
 } from '@/lib/api'
 import { cn } from '@/lib/utils'
 
-const KINDS: UpstreamKind[] = ['registry', 'static']
+const PROTOCOLS: UpstreamProtocol[] = ['registry', 'static', 'git']
 const POLICIES: DefaultPolicy[] = ['allow_all', 'deny_unless_matched']
 
 /** 新登记一条上游时的出厂值，和后端 SaveUpstreamRequest 的默认行为对齐。 */
 const BLANK: UpstreamDraft = {
   id: 0,
   host: '',
-  kind: 'registry',
+  protocols: ['registry'],
   origin: '',
   enabled: true,
   immutable_patterns: [],
@@ -72,9 +72,25 @@ export function UpstreamFormScreen({
     setDraft({ ...current, ...patch })
   }
 
+  // 勾选顺序不进请求体：协议集合按 PROTOCOLS 的固定顺序写回去，否则同一条上游
+  // 会因为点击先后产生两份不同的 JSON，而它们说的是同一件事。
+  function toggleProtocol(protocol: UpstreamProtocol) {
+    const next = current.protocols.includes(protocol)
+      ? current.protocols.filter((item) => item !== protocol)
+      : PROTOCOLS.filter((item) => item === protocol || current.protocols.includes(item))
+    change({ protocols: next })
+  }
+
   function submit(event: FormEvent) {
     event.preventDefault()
-    if (current.host.trim() === '' || current.origin.trim() === '' || action.pending) {
+    // 一个协议都不勾等于这条记录什么都不服务，后端也会拒绝——在这里就拦住，
+    // 免得使用者拿到一条只说「上游协议为必填字段」的报错。
+    if (
+      current.host.trim() === '' ||
+      current.origin.trim() === '' ||
+      current.protocols.length === 0 ||
+      action.pending
+    ) {
       return
     }
     void action.run(
@@ -115,12 +131,15 @@ export function UpstreamFormScreen({
             className="w-[360px] rounded-none font-mono text-[13px] md:text-[13px]"
           />
         </Field>
-        <Field label={t('admin.upstream.form.kind')}>
-          <Segmented
-            label={t('admin.upstream.form.kind')}
-            options={KINDS.map((kind) => ({ value: kind, label: t(`kind.${kind}`) }))}
-            value={current.kind}
-            onChange={(value) => change({ kind: value as UpstreamKind })}
+        <Field label={t('admin.upstream.form.protocols')}>
+          <Checks
+            label={t('admin.upstream.form.protocols')}
+            options={PROTOCOLS.map((protocol) => ({
+              value: protocol,
+              label: t(`protocol.${protocol}`),
+            }))}
+            values={current.protocols}
+            onToggle={(value) => toggleProtocol(value as UpstreamProtocol)}
           />
         </Field>
         <Field label={t('admin.upstream.form.defaultPolicy')}>
@@ -190,6 +209,46 @@ function Field({
         )}
       </div>
       {children}
+    </div>
+  )
+}
+
+/**
+ * 多选的那一组开关：协议是集合，一条上游可以同时开几种。
+ *
+ * 它和 Segmented 长得一样但语义不同——用 checkbox 而不是 radio，读屏软件才不会
+ * 把「可以多选」说成「三选一」。
+ */
+function Checks({
+  label,
+  options,
+  values,
+  onToggle,
+}: {
+  label: string
+  options: { value: string; label: string }[]
+  values: string[]
+  onToggle: (value: string) => void
+}) {
+  return (
+    <div role="group" aria-label={label} className="border-line-strong flex border">
+      {options.map((option) => (
+        <button
+          key={option.value}
+          type="button"
+          role="checkbox"
+          aria-checked={values.includes(option.value)}
+          onClick={() => onToggle(option.value)}
+          className={cn(
+            'px-3.5 py-[7px] text-xs',
+            values.includes(option.value)
+              ? 'bg-foreground text-background'
+              : 'text-muted-foreground hover:text-foreground'
+          )}
+        >
+          {option.label}
+        </button>
+      ))}
     </div>
   )
 }

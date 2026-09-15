@@ -132,7 +132,7 @@ func TestProxy_StaticUpstreamIsStreamedThrough(t *testing.T) {
 			_, _ = io.WriteString(w, payload)
 		})
 		upstreamTable(t, &upstream_entity.Upstream{
-			ID: 1, Host: "deb.debian.org", Kind: upstream_entity.KindStatic,
+			ID: 1, Host: "deb.debian.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
 			Origin: origin, Enabled: true,
 		})
 
@@ -154,7 +154,7 @@ func TestProxy_UpstreamStatusIsPassedThrough(t *testing.T) {
 			_, _ = io.WriteString(w, "404 Not Found: pool/x.deb")
 		})
 		upstreamTable(t, &upstream_entity.Upstream{
-			ID: 1, Host: "deb.debian.org", Kind: upstream_entity.KindStatic,
+			ID: 1, Host: "deb.debian.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
 			Origin: origin, Enabled: true,
 		})
 
@@ -173,7 +173,7 @@ func TestProxy_UnreachableUpstreamIs502(t *testing.T) {
 		dead := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
 		dead.Close()
 		upstreamTable(t, &upstream_entity.Upstream{
-			ID: 1, Host: "deb.debian.org", Kind: upstream_entity.KindStatic,
+			ID: 1, Host: "deb.debian.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
 			Origin: dead.URL, Enabled: true,
 		})
 
@@ -200,7 +200,7 @@ func TestProxy_UnknownUpstreamIs404WithoutEchoingHost(t *testing.T) {
 		for name, path := range cases {
 			convey.Convey(name+"："+path, func() {
 				upstreamTable(t, &upstream_entity.Upstream{
-					ID: 1, Host: "deb.debian.org", Kind: upstream_entity.KindStatic,
+					ID: 1, Host: "deb.debian.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
 					Origin: "http://127.0.0.1:1", Enabled: false,
 				})
 
@@ -246,7 +246,7 @@ func TestProxy_RegistryHostSitsAfterV2(t *testing.T) {
 			_, _ = io.WriteString(w, `{"schemaVersion":2}`)
 		})
 		upstreamTable(t, &upstream_entity.Upstream{
-			ID: 1, Host: "docker.io", Kind: upstream_entity.KindRegistry,
+			ID: 1, Host: "docker.io", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolRegistry},
 			Origin: origin, Enabled: true,
 		})
 
@@ -266,7 +266,7 @@ func TestProxy_ClientCredentialsAreNotForwarded(t *testing.T) {
 			got = r.Header.Clone()
 		})
 		upstreamTable(t, &upstream_entity.Upstream{
-			ID: 1, Host: "deb.debian.org", Kind: upstream_entity.KindStatic,
+			ID: 1, Host: "deb.debian.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
 			Origin: origin, Enabled: true,
 		})
 
@@ -285,7 +285,7 @@ func TestProxy_ClientCredentialsAreNotForwarded(t *testing.T) {
 func TestProxy_WriteMethodsAreRejected(t *testing.T) {
 	convey.Convey("非 GET/HEAD 不回源", t, func() {
 		upstreamTable(t, &upstream_entity.Upstream{
-			ID: 1, Host: "deb.debian.org", Kind: upstream_entity.KindStatic,
+			ID: 1, Host: "deb.debian.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
 			Origin: "http://127.0.0.1:1", Enabled: true,
 		})
 

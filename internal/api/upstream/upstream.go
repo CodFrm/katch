@@ -19,15 +19,16 @@ const (
 
 // Item 公开列表里的一条上游。
 //
-// 前三个字段是使用者自己拼拉取地址时用得上的：主机名是路径第一段，类别决定用
-// docker 还是 curl，library_completion 决定 docker.io 上的官方镜像能不能省掉
-// library/ 前缀。后面两个回答的是「这个上游现在好不好用」——首页页脚那张表
+// 前三个字段是使用者自己拼拉取地址时用得上的：主机名是路径第一段，协议集合决定
+// 用 docker 还是 curl 还是 git clone，library_completion 决定 docker.io 上的官方
+// 镜像能不能省掉 library/ 前缀。后面两个回答的是「这个上游现在好不好用」——首页页脚那张表
 // 要答的正是「支不支持我要的东西」（spec 前台一节）。回源地址、默认策略、
 // 不可变模式、备注都是运营数据，留在管理接口那一侧。
 type Item struct {
-	Host              string `json:"host"`
-	Kind              string `json:"kind"`
-	LibraryCompletion bool   `json:"library_completion"`
+	Host string `json:"host"`
+	// Protocols 这条上游开着的协议，取值见 upstream_entity 的 Protocol* 常量。
+	Protocols         []string `json:"protocols"`
+	LibraryCompletion bool     `json:"library_completion"`
 	// HitRate 近 24 小时的命中率，取值 0~1。
 	//
 	// 由计数推导而不是存一个比值（可观测性一节），口径与后台那张健康矩阵同一套。

@@ -63,6 +63,94 @@ describe('describeEvent', () => {
     ).toEqual({ removed: '1,420', size: '142 GB' })
   })
 
+  // 四种 git 镜像事件（任务 3 已经在记，这里补上界面这一侧的标签）：新登记、
+  // 建成、失败、超限拒绝。都要带上仓库，不能只说「某个仓库」。
+  it('git 镜像事件带仓库信息，建成的那条还带体积', () => {
+    expect(
+      describeEvent(
+        event({ kind: 'git_mirror_pending', detail: { host: 'github.com', repo: '/foo/bar.git' } })
+      )
+    ).toEqual({
+      tone: 'change',
+      key: 'admin.events.kind.git_mirror_pending',
+      values: { host: 'github.com', repo: '/foo/bar.git' },
+      enums: {},
+    })
+
+    expect(
+      describeEvent(
+        event({
+          kind: 'git_mirror_ready',
+          detail: { host: 'github.com', repo: '/foo/bar.git', size_bytes: 152520359936 },
+        })
+      )
+    ).toEqual({
+      tone: 'change',
+      key: 'admin.events.kind.git_mirror_ready',
+      values: { host: 'github.com', repo: '/foo/bar.git', size: '142 GB' },
+      enums: {},
+    })
+
+    expect(eventTone('git_mirror_failed')).toBe('degraded')
+    expect(
+      describeEvent(
+        event({
+          kind: 'git_mirror_failed',
+          detail: { host: 'github.com', repo: '/foo/bar.git', error: '上游拨不通' },
+        })
+      ).values
+    ).toEqual({ host: 'github.com', repo: '/foo/bar.git', error: '上游拨不通' })
+
+    expect(eventTone('git_mirror_rejected')).toBe('degraded')
+    expect(
+      describeEvent(
+        event({ kind: 'git_mirror_rejected', detail: { host: 'github.com', repo: '/foo/bar.git' } })
+      ).values
+    ).toEqual({ host: 'github.com', repo: '/foo/bar.git' })
+  })
+
+  // 缺了仓库信息时退到不带字段的文案，理由同其余 kind。
+  it('git 镜像事件缺字段时退到不带字段的那条文案', () => {
+    expect(describeEvent(event({ kind: 'git_mirror_pending', detail: {} })).key).toBe(
+      'admin.events.kind.git_mirror_pending_unknown'
+    )
+    expect(describeEvent(event({ kind: 'git_mirror_ready', detail: {} })).key).toBe(
+      'admin.events.kind.git_mirror_ready_unknown'
+    )
+    expect(describeEvent(event({ kind: 'git_mirror_failed', detail: {} })).key).toBe(
+      'admin.events.kind.git_mirror_failed_unknown'
+    )
+    expect(describeEvent(event({ kind: 'git_mirror_rejected', detail: {} })).key).toBe(
+      'admin.events.kind.git_mirror_rejected_unknown'
+    )
+  })
+
+  // 被淘汰和建成、失败、超限拒绝一样是一次镜像状态变化，时间线上要说得出
+  // 消失的是哪个仓库、腾出多少盘——「回收了 1 个镜像」答不了「我的 clone
+  // 为什么又开始穿透了」。
+  it('镜像被配额淘汰时说得出是哪个仓库、腾出多少', () => {
+    expect(
+      describeEvent(
+        event({
+          kind: 'git_mirror_evicted',
+          actor: 'system',
+          detail: { host: 'github.com', repo: '/foo/bar.git', size_bytes: 1073741824 },
+        })
+      )
+    ).toEqual({
+      tone: 'reclaim',
+      key: 'admin.events.kind.git_mirror_evicted',
+      values: { host: 'github.com', repo: '/foo/bar.git', size: '1.00 GB' },
+      enums: {},
+    })
+  })
+
+  it('淘汰事件缺仓库字段时退到不带字段的那条文案', () => {
+    expect(describeEvent(event({ kind: 'git_mirror_evicted', detail: {} })).key).toBe(
+      'admin.events.kind.git_mirror_evicted_unknown'
+    )
+  })
+
   // 后端将来加了新的 kind，界面宁可说「一条没见过的事件」，也不能把枚举贴出去。
   it('认不出来的 kind 走兜底文案，不回显枚举本身', () => {
     const view = describeEvent(event({ kind: 'meteor_strike' }))

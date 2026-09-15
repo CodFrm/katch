@@ -29,6 +29,10 @@ const TONES: Record<string, EventTone> = {
   upstream_degraded: 'degraded',
   upstream_recovered: 'recovered',
   cache_reclaimed: 'reclaim',
+  git_mirror_failed: 'degraded',
+  git_mirror_rejected: 'degraded',
+  // 淘汰和缓存回收同一种语气：都是「盘满了，收走了一些」，不是出了故障。
+  git_mirror_evicted: 'reclaim',
 }
 
 /** 后端 event_entity 里的全部 kind。不在这张表里的一律走 unknown。 */
@@ -44,6 +48,11 @@ const KNOWN_KINDS = new Set([
   'upstream_degraded',
   'upstream_recovered',
   'cache_reclaimed',
+  'git_mirror_pending',
+  'git_mirror_ready',
+  'git_mirror_failed',
+  'git_mirror_rejected',
+  'git_mirror_evicted',
 ])
 
 /** 后端 event_entity 的 actor 只有这两个取值，别的一律当未知。 */
@@ -121,6 +130,39 @@ export function describeEvent(event: EventItem): EventView {
     }
     case 'admin_key_rotated':
       return view(event.kind)
+    case 'git_mirror_pending':
+    case 'git_mirror_rejected': {
+      const host = str(detail, 'host')
+      const repo = str(detail, 'repo')
+      return host && repo ? view(event.kind, { host, repo }) : view(`${event.kind}_unknown`)
+    }
+    case 'git_mirror_ready': {
+      const host = str(detail, 'host')
+      const repo = str(detail, 'repo')
+      if (!host || !repo) {
+        return view(`${event.kind}_unknown`)
+      }
+      const size = formatBytes(num(detail, 'size_bytes'))
+      return view(event.kind, { host, repo, size: `${size.value} ${size.unit}` })
+    }
+    case 'git_mirror_failed': {
+      const host = str(detail, 'host')
+      const repo = str(detail, 'repo')
+      const error = str(detail, 'error')
+      if (!host || !repo || !error) {
+        return view(`${event.kind}_unknown`)
+      }
+      return view(event.kind, { host, repo, error })
+    }
+    case 'git_mirror_evicted': {
+      const host = str(detail, 'host')
+      const repo = str(detail, 'repo')
+      if (!host || !repo) {
+        return view(`${event.kind}_unknown`)
+      }
+      const size = formatBytes(num(detail, 'size_bytes'))
+      return view(event.kind, { host, repo, size: `${size.value} ${size.unit}` })
+    }
     case 'cache_reclaimed': {
       const freed = formatBytes(num(detail, 'freed_bytes'))
       return view(event.kind, {

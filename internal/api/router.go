@@ -13,6 +13,7 @@ import (
 
 	"github.com/CodFrm/katch/internal/controller/cache_ctr"
 	"github.com/CodFrm/katch/internal/controller/event_ctr"
+	"github.com/CodFrm/katch/internal/controller/git_ctr"
 	"github.com/CodFrm/katch/internal/controller/request_ctr"
 	"github.com/CodFrm/katch/internal/controller/rule_ctr"
 	"github.com/CodFrm/katch/internal/controller/setting_ctr"
@@ -73,6 +74,9 @@ func Router(_ context.Context, root *mux.Router) error {
 	cacheCtr := cache_ctr.NewCache()
 	adminGroup.Bind(storageAware(cacheCtr.Search), storageAware(cacheCtr.Purge),
 		storageAware(cacheCtr.Pin))
+	// git 本地镜像同一道闸：删镜像和清缓存一样是破坏性操作。
+	gitCtr := git_ctr.NewGit()
+	adminGroup.Bind(storageAware(gitCtr.List), storageAware(gitCtr.Delete))
 	// 设置读写与密钥轮换和其余管理接口同一道闸：轮换尤其不能另开一套入口，
 	// 一个不要当前密钥就能换密钥的端点等于把后台直接送出去。
 	settingCtr := setting_ctr.NewSetting()

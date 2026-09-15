@@ -73,13 +73,28 @@ func TestRecentRequestMigration(t *testing.T) {
 
 // TestRecentRequestMigrationAppendedAtEnd 新迁移只追加不修改。
 //
-// 已经跑过的迁移改了不会重跑，只会让新旧环境的表结构悄悄分叉；这条用例把「新的
-// 那一条在末尾」钉死，避免它被插到中间去。
+// 已经跑过的迁移改了不会重跑，只会让新旧环境的表结构悄悄分叉；这条用例钉的是
+// 「它排在写它那一刻已有的全部迁移之后」，也就是没有被插到中间去。
+//
+// 原先钉的是「它在末尾」。git 上游那一轮之后又追加了两条迁移，末尾不再是它——
+// 「在末尾」本就只在一条迁移是最后加的那一段时间里成立，换成「在前驱之后」才是
+// 只追加这条规则本身。
 func TestRecentRequestMigrationAppendedAtEnd(t *testing.T) {
-	convey.Convey("recent_request 迁移追加在 migrationList 末尾", t, func() {
+	convey.Convey("recent_request 迁移排在它之前的全部迁移之后", t, func() {
 		list := migrationList()
 		convey.So(len(list), convey.ShouldBeGreaterThan, 0)
-		convey.So(list[len(list)-1].ID, convey.ShouldEqual, recentRequest().ID)
+		index := func(id string) int {
+			for i, m := range list {
+				if m.ID == id {
+					return i
+				}
+			}
+			return -1
+		}
+		at := index(recentRequest().ID)
+		convey.So(at, convey.ShouldBeGreaterThanOrEqualTo, 0)
+		// trafficRollupMissReasons 是写这条迁移时的末尾。
+		convey.So(at, convey.ShouldBeGreaterThan, index(trafficRollupMissReasons().ID))
 	})
 }
 
