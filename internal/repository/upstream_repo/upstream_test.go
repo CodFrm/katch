@@ -97,10 +97,53 @@ func TestUpstreamRepo_Save(t *testing.T) {
 	})
 }
 
+func TestRegisterUpstreamInstallsIsolatedRewriteConfig(t *testing.T) {
+	convey.Convey("legacy 上游注入使用隔离的事务与 generation", t, func() {
+		beforeUpstream := defaultUpstream
+		beforeRewriteConfig := defaultRewriteConfig
+		t.Cleanup(func() {
+			defaultUpstream = beforeUpstream
+			defaultRewriteConfig = beforeRewriteConfig
+		})
+
+		RegisterRewriteConfig(NewRewriteConfig(nil))
+		RegisterUpstream(NewUpstream())
+		repo := RewriteConfig()
+		ctx := context.Background()
+
+		convey.So(repo.Transaction(ctx, func(txCtx context.Context) error {
+			return repo.AdvanceGeneration(txCtx)
+		}), convey.ShouldBeNil)
+		got, err := repo.Snapshot(ctx)
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(got.Generation, convey.ShouldEqual, 1)
+
+		convey.So(repo.Transaction(ctx, func(txCtx context.Context) error {
+			if err := repo.AdvanceGeneration(txCtx); err != nil {
+				return err
+			}
+			return errors.New("rollback")
+		}), convey.ShouldNotBeNil)
+		got, err = repo.Snapshot(ctx)
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(got.Generation, convey.ShouldEqual, 1)
+	})
+}
+
+func TestRewriteConfigWithoutDatabase(t *testing.T) {
+	convey.Convey("未配置数据库的生产 rewrite 仓储明确报错", t, func() {
+		repo := NewRewriteConfig(nil)
+		convey.So(repo.AdvanceGeneration(context.Background()), convey.ShouldNotBeNil)
+		got, err := repo.Snapshot(context.Background())
+		convey.So(err, convey.ShouldNotBeNil)
+		convey.So(got, convey.ShouldBeNil)
+	})
+}
+
 func TestRewriteConfigTransaction(t *testing.T) {
 	convey.Convey("配置写入与 generation 递增共用事务", t, func() {
-		ctx, _, mock := testutils.Database(t)
-		repo := NewRewriteConfig()
+		ctx, database, mock := testutils.Database(t)
+		repo := NewRewriteConfig(database)
 		mock.ExpectBegin()
 		mock.ExpectExec("UPDATE `rewrite_states` SET `generation`=generation WHERE id=\\?").
 			WithArgs(int64(1)).WillReturnResult(sqlmock.NewResult(0, 1))
@@ -116,8 +159,8 @@ func TestRewriteConfigTransaction(t *testing.T) {
 	})
 
 	convey.Convey("配置写入失败时 generation 一起回滚", t, func() {
-		ctx, _, mock := testutils.Database(t)
-		repo := NewRewriteConfig()
+		ctx, database, mock := testutils.Database(t)
+		repo := NewRewriteConfig(database)
 		mock.ExpectBegin()
 		mock.ExpectExec("UPDATE `rewrite_states` SET `generation`=generation WHERE id=\\?").
 			WithArgs(int64(1)).WillReturnResult(sqlmock.NewResult(0, 1))
@@ -131,7 +174,7 @@ func TestRewriteConfigTransaction(t *testing.T) {
 
 func TestRewriteConfigSnapshot(t *testing.T) {
 	convey.Convey("generation、site_domain 与启用上游来自同一个事务快照", t, func() {
-		ctx, _, mock := testutils.Database(t)
+		ctx, database, mock := testutils.Database(t)
 		mock.ExpectBegin()
 		mock.ExpectQuery("SELECT \\* FROM `rewrite_states` WHERE id=\\?").
 			WithArgs(int64(1), 1).
@@ -146,7 +189,7 @@ func TestRewriteConfigSnapshot(t *testing.T) {
 				AddRow(7, "pypi.org", `["static"]`, "pypi", true))
 		mock.ExpectCommit()
 
-		got, err := NewRewriteConfig().Snapshot(ctx)
+		got, err := NewRewriteConfig(database).Snapshot(ctx)
 		convey.So(err, convey.ShouldBeNil)
 		convey.So(got.Generation, convey.ShouldEqual, 12)
 		convey.So(got.SiteDomain, convey.ShouldEqual, "mirror.example.com")

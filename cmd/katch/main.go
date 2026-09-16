@@ -140,6 +140,9 @@ func main() {
 			// 个请求），每个请求查一次库等于把镜像站的吞吐绑在 sqlite 上。缓存在
 			// 管理接口写入上游时自动失效，所以界面上改完不必重启。
 			upstream_repo.RegisterUpstream(proxy_svc.NewCachedUpstreamRepo(upstream_repo.NewUpstream()))
+			// rewrite 快照与 generation 必须落在同一个真实数据库事务里；
+			// RegisterUpstream 的隔离实现只用于兼容旧测试注入。
+			upstream_repo.RegisterRewriteConfig(upstream_repo.NewRewriteConfig(db.Default()))
 			// 设置表同样包一层进程内缓存，理由和上游表一样：每次回源都要读一遍
 			// 超时/并发/重试，每次写缓存都要读一遍配额，逐个请求查库等于把吞吐
 			// 绑在 sqlite 上。缓存在管理接口写设置时自动失效，所以界面上改完

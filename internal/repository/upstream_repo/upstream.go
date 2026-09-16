@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 
 	"github.com/cago-frame/cago/database/db"
 	"gorm.io/gorm"
@@ -35,8 +36,12 @@ func Upstream() UpstreamRepo {
 }
 
 // RegisterUpstream 注册实现，由 main 装配、由测试注入 mock。
+//
+// 旧测试只注入上游仓储；给它们一份独立的 rewrite 状态，避免意外访问生产数据库。
+// 生产启动必须随后显式调用 RegisterRewriteConfig 装配持久化实现。
 func RegisterUpstream(i UpstreamRepo) {
 	defaultUpstream = i
+	defaultRewriteConfig = newIsolatedRewriteConfig()
 }
 
 type upstreamRepo struct{}
@@ -108,7 +113,7 @@ type RewriteConfigRepo interface {
 	Snapshot(ctx context.Context) (*RewriteConfigSnapshot, error)
 }
 
-var defaultRewriteConfig RewriteConfigRepo = NewRewriteConfig()
+var defaultRewriteConfig RewriteConfigRepo = NewRewriteConfig(nil)
 
 // RewriteConfig 返回 rewrite 配置仓储。
 func RewriteConfig() RewriteConfigRepo {
@@ -120,28 +125,95 @@ func RegisterRewriteConfig(repo RewriteConfigRepo) {
 	defaultRewriteConfig = repo
 }
 
-type rewriteConfigRepo struct{}
+type isolatedRewriteConfigRepo struct {
+	mu         sync.Mutex
+	generation int64
+}
 
-// NewRewriteConfig 构造数据库实现。
-func NewRewriteConfig() RewriteConfigRepo {
-	return &rewriteConfigRepo{}
+type isolatedRewriteTransactionKey struct{}
+
+func newIsolatedRewriteConfig() RewriteConfigRepo {
+	return &isolatedRewriteConfigRepo{}
+}
+
+func (r *isolatedRewriteConfigRepo) Transaction(ctx context.Context, fn func(context.Context) error) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	before := r.generation
+	err := fn(context.WithValue(ctx, isolatedRewriteTransactionKey{}, r))
+	if err != nil {
+		r.generation = before
+	}
+	return err
+}
+
+func (r *isolatedRewriteConfigRepo) AdvanceGeneration(ctx context.Context) error {
+	if transaction, ok := ctx.Value(isolatedRewriteTransactionKey{}).(*isolatedRewriteConfigRepo); ok && transaction == r {
+		r.generation++
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.generation++
+	return nil
+}
+
+func (r *isolatedRewriteConfigRepo) Snapshot(context.Context) (*RewriteConfigSnapshot, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return &RewriteConfigSnapshot{
+		Generation: r.generation,
+		Upstreams:  make([]*upstream_entity.Upstream, 0),
+	}, nil
+}
+
+type rewriteConfigTransactionKey struct{}
+
+type rewriteConfigRepo struct {
+	database *gorm.DB
+}
+
+// NewRewriteConfig 构造数据库实现。database 必须由生产启动路径显式传入。
+func NewRewriteConfig(database *gorm.DB) RewriteConfigRepo {
+	return &rewriteConfigRepo{database: database}
+}
+
+func (r *rewriteConfigRepo) db(ctx context.Context) (*gorm.DB, error) {
+	if transaction, ok := ctx.Value(rewriteConfigTransactionKey{}).(*gorm.DB); ok {
+		return transaction.WithContext(ctx), nil
+	}
+	if r.database == nil {
+		return nil, fmt.Errorf("upstream: rewrite config database is not registered")
+	}
+	return r.database.WithContext(ctx), nil
 }
 
 // Transaction 在固定状态行上先取得写锁，使并发配置写按提交顺序比较与递增。
 func (r *rewriteConfigRepo) Transaction(ctx context.Context, fn func(context.Context) error) error {
-	return db.Ctx(ctx).Transaction(func(tx *gorm.DB) error {
+	database, err := r.db(ctx)
+	if err != nil {
+		return err
+	}
+	return database.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(&upstream_entity.RewriteState{}).
 			Where("id=?", rewriteStateID).
 			UpdateColumn("generation", gorm.Expr("generation")).Error; err != nil {
 			return err
 		}
-		return fn(db.WithContextDB(ctx, tx))
+		txCtx := db.WithContextDB(ctx, tx)
+		txCtx = context.WithValue(txCtx, rewriteConfigTransactionKey{}, tx)
+		return fn(txCtx)
 	})
 }
 
 // AdvanceGeneration 在当前配置事务里原子递增持久化代数。
 func (r *rewriteConfigRepo) AdvanceGeneration(ctx context.Context) error {
-	result := db.Ctx(ctx).Model(&upstream_entity.RewriteState{}).
+	database, err := r.db(ctx)
+	if err != nil {
+		return err
+	}
+	result := database.Model(&upstream_entity.RewriteState{}).
 		Where("id=?", rewriteStateID).
 		UpdateColumn("generation", gorm.Expr("generation + 1"))
 	if result.Error != nil {
@@ -155,8 +227,12 @@ func (r *rewriteConfigRepo) AdvanceGeneration(ctx context.Context) error {
 
 // Snapshot 在一个读事务里装载 generation、站点域名与全部启用上游。
 func (r *rewriteConfigRepo) Snapshot(ctx context.Context) (*RewriteConfigSnapshot, error) {
+	database, err := r.db(ctx)
+	if err != nil {
+		return nil, err
+	}
 	out := &RewriteConfigSnapshot{Upstreams: make([]*upstream_entity.Upstream, 0)}
-	err := db.Ctx(ctx).Transaction(func(tx *gorm.DB) error {
+	err = database.Transaction(func(tx *gorm.DB) error {
 		state := &upstream_entity.RewriteState{}
 		if err := tx.Where("id=?", rewriteStateID).First(state).Error; err != nil {
 			return err

@@ -77,8 +77,19 @@ func TestCacheValidatorMigration(t *testing.T) {
 		convey.So(got.LastModified, convey.ShouldBeEmpty)
 	})
 
-	convey.Convey("新迁移只追加在列表末尾", t, func() {
+	convey.Convey("历史 cache validator 迁移排在新 package profile 迁移之前", t, func() {
 		list := migrationList()
-		convey.So(list[len(list)-1].ID, convey.ShouldEqual, cacheValidator().ID)
+		cacheValidatorIndex := -1
+		packageProfileIndex := -1
+		for i, migration := range list {
+			switch migration.ID {
+			case cacheValidator().ID:
+				cacheValidatorIndex = i
+			case packageProfile().ID:
+				packageProfileIndex = i
+			}
+		}
+		convey.So(cacheValidatorIndex, convey.ShouldBeGreaterThanOrEqualTo, 0)
+		convey.So(packageProfileIndex, convey.ShouldBeGreaterThan, cacheValidatorIndex)
 	})
 }
