@@ -122,8 +122,9 @@ type Upstream struct {
 	Origin    string      `gorm:"column:origin" json:"origin"`
 	// Enabled 为 false 时等同于不存在：既不回源，也不在拉取路径上回显。
 	Enabled bool `gorm:"column:enabled" json:"enabled"`
-	// ImmutablePatterns 命中即视为内容寻址、可长期缓存的路径模式
-	// （APT 是 pool/，Go proxy 是 @v/，raw 是 40 位 commit SHA）。
+	// ImmutablePatterns 命中即视为内容寻址、可长期缓存的补充路径模式。
+	// registry 的 blob 与 digest manifest 由协议语义自动识别；这里主要表达 APT 的
+	// pool/、Go proxy 的 @v/ 与 raw 的 40 位 commit SHA 等 static 路径。
 	ImmutablePatterns PatternList `gorm:"column:immutable_patterns;type:text" json:"immutable_patterns"`
 	// MutableTTLSeconds 可变对象的缓存时长，0 表示用全局默认值。
 	MutableTTLSeconds int    `gorm:"column:mutable_ttl_seconds" json:"mutable_ttl_seconds"`

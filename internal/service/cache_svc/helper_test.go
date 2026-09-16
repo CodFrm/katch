@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -27,6 +28,8 @@ import (
 	"github.com/CodFrm/katch/internal/service/proxy_svc"
 	"github.com/CodFrm/katch/internal/service/setting_svc"
 )
+
+var errPromote = errors.New("promote failed")
 
 // fakeRuntime 用例侧的运行时设置。
 //
@@ -70,7 +73,10 @@ type fakeRepo struct {
 	nextID int64
 	rows   map[int64]*cache_entity.CacheObject
 	// stampAccess 为真时由内存表接管 last_access_at，见上。
-	stampAccess bool
+	stampAccess   bool
+	promoteErr    error
+	deleteStarted chan struct{}
+	deleteGate    chan struct{}
 	// totalSizeGate 非 nil 时，TotalSize 会先等它。
 	//
 	// TotalSize 只有 enforceQuota 一个调用方，而 enforceQuota 只跑在 pump 那个
@@ -116,10 +122,23 @@ func newFakeRepo(t *testing.T, stampAccess bool) *fakeRepo {
 		})
 	m.EXPECT().Delete(gomock.Any(), gomock.Any()).AnyTimes().
 		DoAndReturn(func(_ any, id int64) error {
+			f.waitDelete()
 			f.mu.Lock()
 			defer f.mu.Unlock()
 			delete(f.rows, id)
 			return nil
+		})
+	m.EXPECT().DeleteExpired(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().
+		DoAndReturn(func(_ any, id, before int64) (bool, error) {
+			f.waitDelete()
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			row, ok := f.rows[id]
+			if !ok || row.Immutable || row.ExpiresAt <= 0 || row.ExpiresAt > before || row.Pinned {
+				return false, nil
+			}
+			delete(f.rows, id)
+			return true, nil
 		})
 	m.EXPECT().Touch(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().
 		DoAndReturn(func(_ any, id int64, at int64) error {
@@ -134,6 +153,19 @@ func newFakeRepo(t *testing.T, stampAccess bool) *fakeRepo {
 			if f.stampAccess {
 				f.seq++
 				row.LastAccessAt = f.seq
+			}
+			return nil
+		})
+	m.EXPECT().PromoteImmutable(gomock.Any(), gomock.Any()).AnyTimes().
+		DoAndReturn(func(_ any, id int64) error {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if f.promoteErr != nil {
+				return f.promoteErr
+			}
+			if row, ok := f.rows[id]; ok {
+				row.Immutable = true
+				row.ExpiresAt = 0
 			}
 			return nil
 		})
@@ -183,8 +215,8 @@ func newFakeRepo(t *testing.T, stampAccess bool) *fakeRepo {
 			defer f.mu.Unlock()
 			list := make([]*cache_entity.CacheObject, 0, limit)
 			for _, row := range f.rows {
-				// 和 SQL 一样：expires_at=0 是「不过期」，pin 的留下。
-				if row.ExpiresAt > 0 && row.ExpiresAt <= before && !row.Pinned {
+				// 和 SQL 一样：只收已过期、可变且未 pin 的记录。
+				if row.ExpiresAt > 0 && row.ExpiresAt <= before && !row.Immutable && !row.Pinned {
 					list = append(list, clone(row))
 				}
 			}
@@ -279,6 +311,27 @@ func (f *fakeRepo) all() []*cache_entity.CacheObject {
 }
 
 // expire 把一条可变记录的过期时刻拨到过去，免得用例真的去睡一个 TTL。
+func (f *fakeRepo) waitDelete() {
+	f.mu.Lock()
+	started, gate := f.deleteStarted, f.deleteGate
+	f.mu.Unlock()
+	if started != nil {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+	}
+	if gate != nil {
+		<-gate
+	}
+}
+
+func (f *fakeRepo) setPromoteError(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.promoteErr = err
+}
+
 func (f *fakeRepo) expire(key string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

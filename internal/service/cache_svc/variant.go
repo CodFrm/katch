@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -70,6 +71,86 @@ func isManifestRequest(path string) bool {
 		return false
 	}
 	return strings.HasSuffix(path[:ref], "/manifests")
+}
+
+// registryRequestImmutability 判断 registry 标准端点的保留语义。
+// 第二个返回值表示协议是否定义了这个端点：已定义的结果优先于补充路径模式；
+// 未定义的非标准端点才继续交给 immutable_patterns。
+func registryRequestImmutability(target *proxy_svc.Target) (immutable, defined bool) {
+	if target.Kind != dispatch.KindRegistry {
+		return false, false
+	}
+	refAt := strings.LastIndex(target.Path, "/")
+	if refAt <= 0 || refAt == len(target.Path)-1 {
+		return false, false
+	}
+	action := target.Path[:refAt]
+	ref, ok := registryReference(target.Path[refAt+1:])
+	if !ok {
+		return false, false
+	}
+	switch {
+	case strings.HasSuffix(action, "/blobs"):
+		if registryDigestReference(ref) {
+			return true, true
+		}
+	case strings.HasSuffix(action, "/manifests"):
+		if registryDigestReference(ref) {
+			return true, true
+		}
+		if registryTag(ref) {
+			return false, true
+		}
+	case strings.HasSuffix(action, "/referrers"):
+		if registryDigestReference(ref) {
+			return false, true
+		}
+	case strings.HasSuffix(action, "/tags"):
+		if ref == "list" {
+			return false, true
+		}
+	}
+	return false, false
+}
+
+func registryReference(raw string) (string, bool) {
+	decoded, err := url.PathUnescape(raw)
+	return decoded, err == nil && !strings.Contains(decoded, "/")
+}
+
+func registryDigestReference(ref string) bool {
+	algorithm, encoded, ok := strings.Cut(ref, ":")
+	if !ok || algorithm == "" || encoded == "" || !asciiLetter(rune(algorithm[0])) {
+		return false
+	}
+	for _, ch := range algorithm[1:] {
+		if !asciiLetter(ch) && (ch < '0' || ch > '9') && !strings.ContainsRune("+._-", ch) {
+			return false
+		}
+	}
+	for _, ch := range encoded {
+		if !asciiLetter(ch) && (ch < '0' || ch > '9') && !strings.ContainsRune("=_-", ch) {
+			return false
+		}
+	}
+	return true
+}
+
+func registryTag(ref string) bool {
+	if len(ref) == 0 || len(ref) > 128 ||
+		(!asciiLetter(rune(ref[0])) && (ref[0] < '0' || ref[0] > '9') && ref[0] != '_') {
+		return false
+	}
+	for _, ch := range ref[1:] {
+		if !asciiLetter(ch) && (ch < '0' || ch > '9') && !strings.ContainsRune("_.-", ch) {
+			return false
+		}
+	}
+	return true
+}
+
+func asciiLetter(ch rune) bool {
+	return ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z'
 }
 
 // normalizeAccept 把一次请求的 Accept 归一成可比较的形态，同一个意思归一成同一个串。

@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/smartystreets/goconvey/convey"
 
@@ -54,6 +55,157 @@ func manifestOrigin(t *testing.T) *originStub {
 		}
 		w.Header().Set("Content-Type", mediaType)
 		_, _ = io.WriteString(w, body)
+	})
+}
+
+// TestGet_RegistryDigestObjectsAreImmutableWithoutPatterns 回归线上集群的真实配置：
+// registry 上游没有填 immutable_patterns 时，blob 与按 digest 请求的 manifest
+// 仍是协议定义的内容寻址对象，不能被当成普通可变路径在 5 分钟后清掉。
+func TestGet_RegistryDigestObjectsAreImmutableWithoutPatterns(t *testing.T) {
+	convey.Convey("registry 自带的内容寻址语义不依赖上游模式", t, func() {
+		o := manifestOrigin(t)
+		up := registryUpstream("registry.test")
+		up.ImmutablePatterns = nil
+		up.MutableTTLSeconds = 300
+		svc, repo, _ := setupSvc(t, o, up, Options{})
+
+		cases := []struct {
+			name      string
+			path      string
+			immutable bool
+		}{
+			{"blob 按 digest 寻址", "/library/redis/blobs/sha256:2e752c", true},
+			{"转义分隔符的 blob 仍按 digest 寻址", "/library/redis/blobs/sha256%3A2e752c", true},
+			{"manifest 按 digest 寻址", "/library/redis/manifests/sha256:e2debf", true},
+			{"manifest 按 tag 寻址", "/library/redis/manifests/7", false},
+			{"referrers 索引会随仓库内容变化", "/library/redis/referrers/sha256:e2debf", false},
+		}
+		for _, c := range cases {
+			convey.Convey(c.name, func() {
+				_, _ = pullWith(t, svc, registryTarget("registry.test", c.path))
+				row := repo.byKey(c.path)
+				convey.So(row, convey.ShouldNotBeNil)
+				convey.So(row.Immutable, convey.ShouldEqual, c.immutable)
+				if c.immutable {
+					convey.So(row.ExpiresAt, convey.ShouldEqual, int64(0))
+				} else {
+					convey.So(row.ExpiresAt, convey.ShouldBeGreaterThan, time.Now().Unix())
+				}
+			})
+		}
+	})
+}
+
+// TestGet_RegistryProtocolRetentionOverridesPatterns 标准 registry 端点的可变性由协议定义。
+// 配置里的补充模式不能把 tag manifest 或 referrers 索引变成永久快照。
+func TestGet_RegistryProtocolRetentionOverridesPatterns(t *testing.T) {
+	convey.Convey("registry 标准可变端点不被补充模式覆盖", t, func() {
+		o := manifestOrigin(t)
+		up := registryUpstream("registry.test")
+		up.ImmutablePatterns = upstream_entity.PatternList{
+			"/manifests/", "/referrers/", "/blobs/latest",
+		}
+		svc, repo, _ := setupSvc(t, o, up, Options{})
+
+		for _, path := range []string{
+			"/library/redis/manifests/7",
+			"/library/redis/referrers/sha256:e2debf",
+		} {
+			_, _ = pullWith(t, svc, registryTarget("registry.test", path))
+			row := repo.byKey(path)
+			convey.So(row, convey.ShouldNotBeNil)
+			convey.So(row.Immutable, convey.ShouldBeFalse)
+			convey.So(row.ExpiresAt, convey.ShouldBeGreaterThan, time.Now().Unix())
+		}
+
+		_, _ = pullWith(t, svc, registryTarget("registry.test", "/library/redis/blobs/latest"))
+		nonstandard := repo.byKey("/library/redis/blobs/latest")
+		convey.So(nonstandard.Immutable, convey.ShouldBeTrue)
+		convey.So(nonstandard.ExpiresAt, convey.ShouldEqual, int64(0))
+	})
+}
+
+// TestGet_RegistryLegacyImmutableTagIsRefetched 把标准可变端点写成永久对象的旧记录不能继续命中。
+func TestGet_RegistryLegacyImmutableTagIsRefetched(t *testing.T) {
+	convey.Convey("旧版本永久缓存的 tag manifest 会回源并改回 TTL", t, func() {
+		o := manifestOrigin(t)
+		up := registryUpstream("registry.test")
+		up.ImmutablePatterns = upstream_entity.PatternList{"/manifests/"}
+		svc, repo, _ := setupSvc(t, o, up, Options{})
+		const path = "/library/redis/manifests/7"
+
+		convey.So(svc.Put(context.Background(), &PutRequest{
+			UpstreamID: 9, Key: path, Content: strings.NewReader("stale tag"),
+			ContentType: "application/json", Immutable: true,
+		}), convey.ShouldBeNil)
+		got, meta := pullWith(t, svc, registryTarget("registry.test", path))
+		convey.So(got, convey.ShouldEqual, `{"schemaVersion":2,"flavour":"docker"}`)
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusMiss)
+		convey.So(o.hits.Load(), convey.ShouldEqual, int64(1))
+		row := repo.byKey(path)
+		convey.So(row.Immutable, convey.ShouldBeFalse)
+		convey.So(row.ExpiresAt, convey.ShouldBeGreaterThan, time.Now().Unix())
+	})
+}
+
+// TestGet_RegistryLegacyMutableDigestIsPromoted 升级前已经写下的错误记录也要自愈。
+// 命中时若只发出字节、不修正元数据，后台 Sweep 仍会在旧 TTL 到点后删掉它。
+func TestGet_RegistryLegacyMutableDigestIsPromoted(t *testing.T) {
+	convey.Convey("旧版本写成可变的 registry digest 在命中时提升为永久对象", t, func() {
+		o := manifestOrigin(t)
+		up := registryUpstream("registry.test")
+		up.ImmutablePatterns = nil
+		svc, repo, _ := setupSvc(t, o, up, Options{})
+		const path = "/library/redis/blobs/sha256:2e752c"
+		const content = "legacy layer"
+
+		convey.So(svc.Put(context.Background(), &PutRequest{
+			UpstreamID: 9, Key: path, Content: strings.NewReader(content),
+			ContentType: "application/octet-stream", Immutable: false, TTLSeconds: 300,
+		}), convey.ShouldBeNil)
+		legacy := repo.byKey(path)
+		convey.So(legacy.Immutable, convey.ShouldBeFalse)
+		convey.So(legacy.ExpiresAt, convey.ShouldBeGreaterThan, int64(0))
+		repo.expire(path)
+
+		got, meta := pullWith(t, svc, registryTarget("registry.test", path))
+		convey.So(got, convey.ShouldEqual, content)
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
+		convey.So(o.hits.Load(), convey.ShouldEqual, int64(0))
+		promoted := repo.byKey(path)
+		convey.So(promoted.Immutable, convey.ShouldBeTrue)
+		convey.So(promoted.ExpiresAt, convey.ShouldEqual, int64(0))
+	})
+}
+
+// TestGet_RegistryPromotionFailureStillServesHit 元数据修正失败只影响自愈，不影响读。
+func TestGet_RegistryPromotionFailureStillServesHit(t *testing.T) {
+	convey.Convey("提升旧 digest 记录失败时继续命中并在下次重试", t, func() {
+		o := manifestOrigin(t)
+		up := registryUpstream("registry.test")
+		up.ImmutablePatterns = nil
+		svc, repo, _ := setupSvc(t, o, up, Options{})
+		const path = "/library/redis/blobs/sha256:2e752c"
+		const content = "legacy layer"
+
+		convey.So(svc.Put(context.Background(), &PutRequest{
+			UpstreamID: 9, Key: path, Content: strings.NewReader(content),
+			ContentType: "application/octet-stream", Immutable: false, TTLSeconds: 300,
+		}), convey.ShouldBeNil)
+		repo.expire(path)
+		repo.setPromoteError(errPromote)
+
+		got, meta := pullWith(t, svc, registryTarget("registry.test", path))
+		convey.So(got, convey.ShouldEqual, content)
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
+		convey.So(o.hits.Load(), convey.ShouldEqual, int64(0))
+		convey.So(repo.byKey(path).Immutable, convey.ShouldBeFalse)
+
+		repo.setPromoteError(nil)
+		_, meta = pullWith(t, svc, registryTarget("registry.test", path))
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
+		convey.So(repo.byKey(path).Immutable, convey.ShouldBeTrue)
+		convey.So(repo.byKey(path).ExpiresAt, convey.ShouldEqual, int64(0))
 	})
 }
 

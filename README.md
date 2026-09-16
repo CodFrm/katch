@@ -126,9 +126,10 @@ curl -X POST http://localhost:8080/api/v1/admin/upstreams \
 
 `protocols` 是这条上游开着的协议集合，取值为 `registry`、`static`、`git`
 的任意非空子集——一条记录可以同时开几种，比如 `github.com` 既服务 `git clone`
-也服务 release 资产下载。协议之外的差异靠记录上的字段表达：`immutable_patterns`
-声明哪些路径是内容寻址的（可长期缓存 + LRU 淘汰），其余路径按 `mutable_ttl_seconds`
-走短 TTL。
+也服务 release 资产下载。registry 的 blob 与按 digest 请求的 manifest 会按协议语义
+自动长期缓存，tag manifest 走 `mutable_ttl_seconds`；`immutable_patterns` 用来声明
+static 或非标准路径中哪些对象是内容寻址的（可长期缓存 + LRU 淘汰），其余路径按
+`mutable_ttl_seconds` 走短 TTL。
 
 拉取时响应上的 `X-Katch-Cache: HIT|MISS` 能直接看出这一次有没有回源：
 

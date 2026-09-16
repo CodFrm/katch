@@ -85,6 +85,21 @@ func (mr *MockCacheObjectRepoMockRecorder) Delete(ctx, id any) *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Delete", reflect.TypeOf((*MockCacheObjectRepo)(nil).Delete), ctx, id)
 }
 
+// DeleteExpired mocks base method.
+func (m *MockCacheObjectRepo) DeleteExpired(ctx context.Context, id, before int64) (bool, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "DeleteExpired", ctx, id, before)
+	ret0, _ := ret[0].(bool)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// DeleteExpired indicates an expected call of DeleteExpired.
+func (mr *MockCacheObjectRepoMockRecorder) DeleteExpired(ctx, id, before any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeleteExpired", reflect.TypeOf((*MockCacheObjectRepo)(nil).DeleteExpired), ctx, id, before)
+}
+
 // EvictCandidates mocks base method.
 func (m *MockCacheObjectRepo) EvictCandidates(ctx context.Context, limit int) ([]*cache_entity.CacheObject, error) {
 	m.ctrl.T.Helper()
@@ -158,6 +173,20 @@ func (m *MockCacheObjectRepo) ListByUpstream(ctx context.Context, upstreamID int
 func (mr *MockCacheObjectRepoMockRecorder) ListByUpstream(ctx, upstreamID any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListByUpstream", reflect.TypeOf((*MockCacheObjectRepo)(nil).ListByUpstream), ctx, upstreamID)
+}
+
+// PromoteImmutable mocks base method.
+func (m *MockCacheObjectRepo) PromoteImmutable(ctx context.Context, id int64) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "PromoteImmutable", ctx, id)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// PromoteImmutable indicates an expected call of PromoteImmutable.
+func (mr *MockCacheObjectRepoMockRecorder) PromoteImmutable(ctx, id any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PromoteImmutable", reflect.TypeOf((*MockCacheObjectRepo)(nil).PromoteImmutable), ctx, id)
 }
 
 // Save mocks base method.

@@ -22,10 +22,14 @@ type CacheObjectRepo interface {
 	FindByKey(ctx context.Context, upstreamID int64, key string) (*cache_entity.CacheObject, error)
 	Save(ctx context.Context, object *cache_entity.CacheObject) error
 	Delete(ctx context.Context, id int64) error
+	// DeleteExpired 只在记录仍满足过期清理条件时删除，避免删掉并发提升的旧记录。
+	DeleteExpired(ctx context.Context, id, before int64) (bool, error)
 	// Touch 命中时只更新访问时间与命中数，不整行写回。
 	Touch(ctx context.Context, id int64, at int64) error
 	// SetPinned 只改 pinned 一列，理由同 Touch。
 	SetPinned(ctx context.Context, id int64, pinned bool) error
+	// PromoteImmutable 修正旧版本把 registry digest 对象写成可变记录的元数据。
+	PromoteImmutable(ctx context.Context, id int64) error
 	// TotalSize 缓存占用的总字节数，配额判定用。
 	TotalSize(ctx context.Context) (int64, error)
 	// SizeByUpstream 按上游分组的缓存占用，键是 upstream_id。
@@ -103,6 +107,14 @@ func (c *cacheObjectRepo) Delete(ctx context.Context, id int64) error {
 	return db.Ctx(ctx).Where("id=?", id).Delete(&cache_entity.CacheObject{}).Error
 }
 
+func (c *cacheObjectRepo) DeleteExpired(ctx context.Context, id, before int64) (bool, error) {
+	result := db.Ctx(ctx).
+		Where("id=? AND immutable=? AND expires_at>0 AND expires_at<=? AND pinned=?",
+			id, false, before, false).
+		Delete(&cache_entity.CacheObject{})
+	return result.RowsAffected > 0, result.Error
+}
+
 func (c *cacheObjectRepo) Touch(ctx context.Context, id int64, at int64) error {
 	// hit_count 用表达式自增而不是读出来加一写回去：命中是并发最高的写，
 	// 读改写会把同时发生的另一次命中直接吞掉。
@@ -116,6 +128,15 @@ func (c *cacheObjectRepo) Touch(ctx context.Context, id int64, at int64) error {
 func (c *cacheObjectRepo) SetPinned(ctx context.Context, id int64, pinned bool) error {
 	return db.Ctx(ctx).Model(&cache_entity.CacheObject{}).Where("id=?", id).
 		Updates(map[string]any{"pinned": pinned, "updatetime": time.Now().Unix()}).Error
+}
+
+func (c *cacheObjectRepo) PromoteImmutable(ctx context.Context, id int64) error {
+	return db.Ctx(ctx).Model(&cache_entity.CacheObject{}).Where("id=?", id).
+		Updates(map[string]any{
+			"expires_at": int64(0),
+			"immutable":  true,
+			"updatetime": time.Now().Unix(),
+		}).Error
 }
 
 func (c *cacheObjectRepo) TotalSize(ctx context.Context) (int64, error) {
@@ -168,11 +189,11 @@ func (c *cacheObjectRepo) CountByUpstream(ctx context.Context) (map[int64]int64,
 
 func (c *cacheObjectRepo) ExpiredBefore(ctx context.Context, before int64, limit int) ([]*cache_entity.CacheObject, error) {
 	list := make([]*cache_entity.CacheObject, 0, limit)
-	// expires_at=0 是「不过期」而不是「1970 年就过期了」：不可变对象存的就是 0，
-	// 漏掉这个条件会把整个缓存当成过期的一次清空。
+	// expires_at=0 是「不过期」而不是「1970 年就过期了」；同时显式限定可变对象，
+	// 避免升级遗留或人工修复留下 immutable=true + 旧 expires_at 的不一致行反复入选。
 	// pin 的对象留下：人明确要求常驻的东西不该被一次例行清理带走。
 	if err := db.Ctx(ctx).
-		Where("expires_at>0 AND expires_at<=? AND pinned=?", before, false).
+		Where("expires_at>0 AND expires_at<=? AND immutable=? AND pinned=?", before, false, false).
 		Order("expires_at asc").Limit(limit).Find(&list).Error; err != nil {
 		return nil, err
 	}

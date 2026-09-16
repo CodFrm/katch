@@ -11,8 +11,8 @@
 //     的官方镜像还要把 redis 补成 library/redis，这一步由上游记录上的
 //     LibraryCompletion 决定，适配器不认识任何具体主机名。
 //
-// 「哪些路径不可变」不在这里：manifest 按 digest 不可变、按 tag 短 TTL、blob 长期
-// 缓存，全都是路径模式，是上游记录上的数据（决策 13），由缓存层按模式判定。
+// 「哪些路径不可变」由缓存层统一判定：registry 协议定义的 blob 与 digest manifest
+// 自动长期缓存；记录上的 immutable_patterns 用来补充 static 或非标准内容寻址路径。
 package registry
 
 import (

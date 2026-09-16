@@ -4,7 +4,9 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/smartystreets/goconvey/convey"
 
@@ -68,5 +70,52 @@ func TestSweep_RemovesExpiredMutableObjects(t *testing.T) {
 			convey.So(removed, convey.ShouldEqual, 0)
 			convey.So(repo.byKey("/dists/stable/InRelease"), convey.ShouldNotBeNil)
 		})
+	})
+}
+
+// TestSweep_DoesNotDeleteLegacyDigestPromotedAfterListing 覆盖清理与升级自愈的竞态：
+// Sweep 拿到旧快照后，命中路径可能已经把同一行提升成不可变对象，删除时必须复核。
+func TestSweep_DoesNotDeleteLegacyDigestPromotedAfterListing(t *testing.T) {
+	convey.Convey("已被列为过期候选的 registry digest 提升后不再删除", t, func() {
+		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, "origin")
+		})
+		up := registryUpstream("registry.test")
+		up.ImmutablePatterns = nil
+		svc, repo, _ := setupSvc(t, o, up, Options{})
+		const path = "/library/redis/blobs/sha256:2e752c"
+		const content = "legacy layer"
+		convey.So(svc.Put(context.Background(), &PutRequest{
+			UpstreamID: 9, Key: path, Content: strings.NewReader(content),
+			ContentType: "application/octet-stream", Immutable: false, TTLSeconds: 300,
+		}), convey.ShouldBeNil)
+		repo.expire(path)
+		repo.deleteStarted = make(chan struct{}, 1)
+		repo.deleteGate = make(chan struct{})
+
+		type sweepResult struct {
+			removed int64
+			err     error
+		}
+		done := make(chan sweepResult, 1)
+		go func() {
+			removed, err := svc.Sweep(context.Background())
+			done <- sweepResult{removed: removed, err: err}
+		}()
+		select {
+		case <-repo.deleteStarted:
+		case <-time.After(3 * time.Second):
+			t.Fatal("Sweep 没有走到删除候选")
+		}
+
+		got, meta := pullWith(t, svc, registryTarget("registry.test", path))
+		convey.So(got, convey.ShouldEqual, content)
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
+		close(repo.deleteGate)
+		result := <-done
+		convey.So(result.err, convey.ShouldBeNil)
+		convey.So(result.removed, convey.ShouldEqual, int64(0))
+		convey.So(repo.byKey(path), convey.ShouldNotBeNil)
+		convey.So(o.hits.Load(), convey.ShouldEqual, int64(0))
 	})
 }

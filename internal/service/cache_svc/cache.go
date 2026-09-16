@@ -214,11 +214,15 @@ func (c *cacheSvc) Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCl
 		return proxy_svc.Proxy().Fetch(ctx, target)
 	}
 	key := cacheKey(target)
-	body, meta, m := c.serveFromDisk(ctx, upstream, key)
+	immutable, protocolDefined := registryRequestImmutability(target)
+	if !protocolDefined {
+		immutable = cache.IsImmutable(upstream.ImmutablePatterns, key)
+	}
+	body, meta, m := c.serveFromDisk(ctx, upstream, key, immutable, protocolDefined && !immutable)
 	if m == nil {
 		return body, meta, nil
 	}
-	body, meta, err = c.fetchAndCache(ctx, target, upstream, key)
+	body, meta, err = c.fetchAndCache(ctx, target, upstream, key, immutable)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -314,7 +318,7 @@ func cacheKey(target *proxy_svc.Target) string {
 // 第三个返回值为 nil 表示这次是命中；否则它带着这次未命中的归因——判断只能在
 // 这里做，往上一层就只剩「查不到记录」这一个事实了。
 func (c *cacheSvc) serveFromDisk(ctx context.Context, upstream *upstream_entity.Upstream,
-	key string) (io.ReadCloser, *proxy_svc.Meta, *miss) {
+	key string, immutable, protocolMutable bool) (io.ReadCloser, *proxy_svc.Meta, *miss) {
 	repo := cache_repo.CacheObject()
 	object, err := repo.FindByKey(ctx, upstream.ID, key)
 	if err != nil {
@@ -326,6 +330,24 @@ func (c *cacheSvc) serveFromDisk(ctx context.Context, upstream *upstream_entity.
 	if object == nil {
 		// 表里什么都没有：可能从没缓存过，也可能是被我们自己收走的。
 		return nil, nil, &miss{reason: c.forgot.recall(upstream.ID, key)}
+	}
+	if protocolMutable && object.Immutable {
+		// 旧配置可能用宽泛模式把 tag manifest 或 referrers 写成了永久对象。
+		// 不继续发这份没有新鲜度边界的旧快照；回源成功后 saveRecord 会按 TTL
+		// 覆盖元数据，失败则保留旧记录供下次重试。
+		return nil, nil, &miss{reason: metrics.MissTTL, heldDigest: object.Digest}
+	}
+	if immutable && !object.Immutable {
+		// 旧版本只看 immutable_patterns，把 registry 的 digest 对象写成了带 TTL
+		// 的可变记录。先提升再判过期：即使旧 TTL 已到但 Sweep 还没来，这份由
+		// digest 寻址且校验完整的副本仍然有效，不必白白回源一次。
+		object.Immutable = true
+		object.ExpiresAt = 0
+		if err := repo.PromoteImmutable(ctx, object.ID); err != nil {
+			// 当前请求仍可按协议语义使用这份副本；下一次命中会继续尝试修正元数据。
+			logger.Ctx(ctx).Warn("提升缓存记录为不可变对象失败",
+				zap.Int64("id", object.ID), zap.String("key", key), zap.Error(err))
+		}
 	}
 	if object.Expired(time.Now().Unix()) {
 		// 记录还在，只是过期了——可变对象由 TTL 自行过期（缓存一节）。
@@ -433,7 +455,7 @@ func (c *cacheSvc) removeIfUnreferenced(ctx context.Context, digest string) {
 
 // fetchAndCache 未命中：回源，同一对象的并发请求合并成一次（决策 9）。
 func (c *cacheSvc) fetchAndCache(ctx context.Context, target *proxy_svc.Target,
-	upstream *upstream_entity.Upstream, key string) (io.ReadCloser, *proxy_svc.Meta, error) {
+	upstream *upstream_entity.Upstream, key string, immutable bool) (io.ReadCloser, *proxy_svc.Meta, error) {
 	flightKey := objectKey(upstream.ID, key)
 
 	c.mu.Lock()
@@ -472,7 +494,7 @@ func (c *cacheSvc) fetchAndCache(ctx context.Context, target *proxy_svc.Target,
 	// 计数要在起协程**之前**加：加在 pump 里面的话，Quiesce 可能刚好在协程还没
 	// 被调度到的时候看到一个空计数，于是「等干完」等了个寂寞。
 	c.pending.Add(1)
-	go c.pump(fetchCtx, flightKey, current, body, writer, upstream, key, meta)
+	go c.pump(fetchCtx, flightKey, current, body, writer, upstream, key, meta, immutable)
 	return c.attachOrFetch(ctx, current, target)
 }
 
@@ -501,7 +523,7 @@ func (c *cacheSvc) forget(flightKey string) {
 // 而写进去的字节一出现就能被读者看见（首字节不必等整份下载完成）。
 func (c *cacheSvc) pump(ctx context.Context, flightKey string, current *flight,
 	body io.ReadCloser, writer *cache.Writer, upstream *upstream_entity.Upstream,
-	key string, meta *proxy_svc.Meta) {
+	key string, meta *proxy_svc.Meta, immutable bool) {
 	defer func() {
 		_ = body.Close()
 		_ = writer.Close()
@@ -526,7 +548,7 @@ func (c *cacheSvc) pump(ctx context.Context, flightKey string, current *flight,
 			Digest:      digest,
 			Size:        size,
 			ContentType: meta.Header.Get("Content-Type"),
-			Immutable:   cache.IsImmutable(upstream.ImmutablePatterns, key),
+			Immutable:   immutable,
 			TTLSeconds:  int64(upstream.MutableTTLSeconds),
 		}); err != nil {
 			logger.Ctx(ctx).Error("写缓存记录失败", zap.String("key", key), zap.Error(err))
@@ -719,17 +741,30 @@ func (c *cacheSvc) Sweep(ctx context.Context) (int64, error) {
 		if len(expired) == 0 {
 			break
 		}
+		batchRemoved := int64(0)
 		for _, object := range expired {
-			if err := repo.Delete(ctx, object.ID); err != nil {
+			deleted, err := repo.DeleteExpired(ctx, object.ID, now)
+			if err != nil {
 				logger.Ctx(ctx).Error("删除过期缓存记录失败",
 					zap.Int64("id", object.ID), zap.Error(err))
 				return removed, err
+			}
+			if !deleted {
+				// 候选查询之后可能有命中路径把旧 registry digest 提升成不可变对象；
+				// 条件删除没动这一行时，它的记录与文件都必须原样留下。
+				continue
 			}
 			// 过期被收走的记录同样查不到了，但它是 TTL 到期，不是从没缓存过——
 			// 少了这一笔，一个全是可变对象的上游会显示成「几乎都是首次拉取」。
 			c.forgot.remember(object.UpstreamID, object.Key, metrics.MissTTL)
 			c.removeIfUnreferenced(ctx, object.Digest)
 			removed++
+			batchRemoved++
+		}
+		if batchRemoved == 0 {
+			// 候选状态可在查询后并发变化；即使 repository 实现或历史数据不一致，
+			// 一整页都没删掉时也不能立刻重查同一页形成忙循环。
+			break
 		}
 		if len(expired) < sweepBatch {
 			break

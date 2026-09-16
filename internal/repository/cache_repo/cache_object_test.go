@@ -162,6 +162,36 @@ func TestCacheObjectRepo_SetPinned(t *testing.T) {
 	})
 }
 
+func TestCacheObjectRepo_PromoteImmutable(t *testing.T) {
+	convey.Convey("旧记录提升时只清 TTL 并标成不可变", t, func() {
+		ctx, _, mock := testutils.Database(t)
+		mock.ExpectBegin()
+		mock.ExpectExec("UPDATE `cache_objects` SET `expires_at`=\\?,`immutable`=\\?,`updatetime`=\\? WHERE id=\\?").
+			WithArgs(int64(0), true, sqlmock.AnyArg(), int64(3)).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectCommit()
+
+		convey.So(NewCacheObject().PromoteImmutable(ctx, 3), convey.ShouldBeNil)
+		convey.So(mock.ExpectationsWereMet(), convey.ShouldBeNil)
+	})
+}
+
+func TestCacheObjectRepo_DeleteExpired(t *testing.T) {
+	convey.Convey("删除前原子复核记录仍是过期可变对象", t, func() {
+		ctx, _, mock := testutils.Database(t)
+		mock.ExpectBegin()
+		mock.ExpectExec("DELETE FROM `cache_objects` WHERE id=\\? AND immutable=\\? AND expires_at>0 AND expires_at<=\\? AND pinned=\\?").
+			WithArgs(int64(3), false, int64(1000), false).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectCommit()
+
+		removed, err := NewCacheObject().DeleteExpired(ctx, 3, 1000)
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(removed, convey.ShouldBeTrue)
+		convey.So(mock.ExpectationsWereMet(), convey.ShouldBeNil)
+	})
+}
+
 func TestCacheObjectRepo_Delete(t *testing.T) {
 	convey.Convey("删除一条缓存记录", t, func() {
 		ctx, _, mock := testutils.Database(t)
@@ -211,10 +241,10 @@ func TestCacheObjectRepo_SizeByUpstream(t *testing.T) {
 func TestCacheObjectRepo_ExpiredBefore(t *testing.T) {
 	convey.Convey("过期清理只挑真的过期了的可变对象", t, func() {
 		ctx, _, mock := testutils.Database(t)
-		// expires_at>0 这一条不能少：不可变对象存的就是 0，漏掉它这条查询会把
-		// 整个缓存当成「1970 年就过期了」一次清空。
-		mock.ExpectQuery("SELECT \\* FROM `cache_objects` WHERE expires_at>0 AND expires_at<=\\? AND pinned=\\? ORDER BY expires_at asc LIMIT \\?").
-			WithArgs(int64(1000), false, 2).
+		// expires_at>0 与 immutable=false 都不能少：正常不可变对象的 expires_at 是 0，
+		// 但升级遗留或人工修复可能留下 immutable=true 且旧 TTL 仍为正的组合。
+		mock.ExpectQuery("SELECT \\* FROM `cache_objects` WHERE expires_at>0 AND expires_at<=\\? AND immutable=\\? AND pinned=\\? ORDER BY expires_at asc LIMIT \\?").
+			WithArgs(int64(1000), false, false, 2).
 			WillReturnRows(sqlmock.NewRows([]string{"id", "size", "expires_at"}).
 				AddRow(9, 300, 500).AddRow(10, 400, 900))
 
