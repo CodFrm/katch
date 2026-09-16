@@ -1,4 +1,4 @@
-import { render, screen, within } from '@testing-library/react'
+import { act, render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, useLocation, useNavigate } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -748,6 +748,41 @@ function renderCache(path = '/admin/cache') {
   )
 }
 
+/**
+ * 把命中 match 的请求扣在半路，release 之后才放行；settled 是已经放行完的个数。
+ * 用来摆出「同一批被连点两次」「旧响应比新响应后到」这类只有时序才碰得到的场面。
+ */
+function holdFetch(match: (url: string) => boolean, limit = Infinity) {
+  const inner = globalThis.fetch
+  let release = () => {}
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const state = { held: 0, settled: 0, release: () => release() }
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: string, init?: RequestInit) => {
+      if (!match(url) || state.held >= limit) {
+        return inner(url, init)
+      }
+      state.held += 1
+      // 先问后端再扣：扣住的是一份按发出那一刻的库算出来的响应。
+      const response = await inner(url, init)
+      await gate
+      state.settled += 1
+      return response
+    })
+  )
+  return state
+}
+
+/** 让已经放行的响应把状态更新落完：json() 与 setState 各自还隔着几轮微任务。 */
+async function flush() {
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  })
+}
+
 function treeRow(table: HTMLElement, name: RegExp) {
   return within(table).getByRole('row', { name })
 }
@@ -855,6 +890,47 @@ describe('后台 · 缓存对象', () => {
     expect(within(table).getByText('g/')).toBeInTheDocument()
     expect(calls.some((call) => call.url.includes('offset=2'))).toBe(true)
     expect(within(table).queryByRole('button', { name: '加载更多' })).not.toBeInTheDocument()
+  })
+
+  it('「加载更多」在下一批回来之前连点两下，下一批也只接上一次', async () => {
+    backend.treeLimit = 2
+    backend.objects.push(cacheObject(108, 2, '/pool/main/z.deb'))
+    renderCache('/admin/cache?path=deb.debian.org/pool/main')
+    const table = await screen.findByRole('table', { name: '缓存对象' })
+    await within(table).findByText('g/')
+    const hold = holdFetch((url) => url.includes('offset=2'))
+
+    await userEvent.click(within(table).getByRole('button', { name: '加载更多' }))
+    await userEvent.click(within(table).getByRole('button', { name: '加载更多' }))
+    await vi.waitFor(() => expect(hold.held).toBe(2))
+    hold.release()
+    await vi.waitFor(() => expect(hold.settled).toBe(2))
+    await flush()
+
+    expect(within(table).getAllByText('z.deb')).toHaveLength(1)
+  })
+
+  it('同一层先后问了两次，先发的那次后回来时不盖掉后发的那次', async () => {
+    renderCache('/admin/cache?path=deb.debian.org')
+    const table = await screen.findByRole('table', { name: '缓存对象' })
+    await within(table).findByText('dists/')
+    const dists = `path=${encodeURIComponent('deb.debian.org/dists')}`
+    // 只扣第一次：它问到的是 dists 还没被清掉时的库。
+    const hold = holdFetch((url) => url.includes(dists), 1)
+
+    await userEvent.click(within(table).getByRole('button', { name: '展开 dists' }))
+    await vi.waitFor(() => expect(hold.held).toBe(1))
+    await userEvent.click(within(table).getByRole('button', { name: '收起 dists' }))
+    backend.objects = backend.objects.filter((object) => !object.key.startsWith('/dists/'))
+    await userEvent.click(within(table).getByRole('button', { name: '展开 dists' }))
+    await flush()
+    expect(within(table).queryByText('bookworm/')).not.toBeInTheDocument()
+
+    hold.release()
+    await vi.waitFor(() => expect(hold.settled).toBe(1))
+    await flush()
+
+    expect(within(table).queryByText('bookworm/')).not.toBeInTheDocument()
   })
 
   it('地址指向一个已经不存在的目录时给空状态，路径导航仍能点回上层', async () => {

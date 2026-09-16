@@ -128,6 +128,18 @@ func newFakeRepo(t *testing.T, stampAccess bool) *fakeRepo {
 			delete(f.rows, id)
 			return nil
 		})
+	m.EXPECT().DeleteUnchanged(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().
+		DoAndReturn(func(_ any, id int64, digest string, skipPinned bool) (bool, error) {
+			f.waitDelete()
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			row, ok := f.rows[id]
+			if !ok || row.Digest != digest || (skipPinned && row.Pinned) {
+				return false, nil
+			}
+			delete(f.rows, id)
+			return true, nil
+		})
 	m.EXPECT().DeleteExpired(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().
 		DoAndReturn(func(_ any, id, before int64) (bool, error) {
 			f.waitDelete()

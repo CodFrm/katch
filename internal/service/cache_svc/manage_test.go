@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/smartystreets/goconvey/convey"
 )
@@ -209,6 +210,83 @@ func TestTreePurge_KeepsSharedContentUntilLastReference(t *testing.T) {
 			_, ok := store.Has(digestOfString("same content"))
 			convey.So(ok, convey.ShouldBeFalse)
 		})
+	})
+}
+
+// purgeRacing 在清除走到删除那一步时停住，跑一遍 meanwhile，再放它删完。
+//
+// 列出与删除之间隔着整批对象的往返，这段时间里拉取可能把同一条记录（同一个 id）
+// 按新内容写回，人也可能把它 pin 上；删除只认列出时看到的那一份。
+func purgeRacing(t *testing.T, repo *fakeRepo, purge func() (int64, error), meanwhile func()) int64 {
+	t.Helper()
+	repo.deleteStarted = make(chan struct{}, 1)
+	repo.deleteGate = make(chan struct{})
+	type result struct {
+		removed int64
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		removed, err := purge()
+		done <- result{removed: removed, err: err}
+	}()
+	select {
+	case <-repo.deleteStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("清除没有走到删除")
+	}
+	meanwhile()
+	close(repo.deleteGate)
+	got := <-done
+	if got.err != nil {
+		t.Fatalf("清除失败：%v", got.err)
+	}
+	return got.removed
+}
+
+// TestTreePurge_SkipsRecordChangedSinceListing 列出之后被 pin 上、或被拉取按新内容
+// 写回的记录不能照旧删掉：前者抹掉了人刚要求常驻的对象，后者删了记录却只按旧摘要
+// 回收文件，新内容的文件就成了没有记录指着的孤儿。
+func TestTreePurge_SkipsRecordChangedSinceListing(t *testing.T) {
+	treePurge := func(svc CacheSvc) func() (int64, error) {
+		return func() (int64, error) {
+			resp, err := svc.TreePurge(context.Background(), &TreePurgeRequest{Path: "deb.debian.org/dists"})
+			if err != nil {
+				return 0, err
+			}
+			return resp.Removed, nil
+		}
+	}
+
+	convey.Convey("列出之后被 pin 上的记录留下", t, func() {
+		o := newOrigin(t, func(http.ResponseWriter, *http.Request) {})
+		svc, repo, store := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+		putObject(t, svc, "/dists/InRelease", "release v1", false)
+		id := repo.byKey("/dists/InRelease").ID
+
+		removed := purgeRacing(t, repo, treePurge(svc), func() {
+			convey.So(svc.Pin(context.Background(), &PinRequest{ID: id, Pinned: true}), convey.ShouldBeNil)
+		})
+		convey.So(removed, convey.ShouldEqual, 0)
+		convey.So(repo.byKey("/dists/InRelease"), convey.ShouldNotBeNil)
+		_, ok := store.Has(digestOfString("release v1"))
+		convey.So(ok, convey.ShouldBeTrue)
+	})
+
+	convey.Convey("列出之后按新内容写回的记录留下，新内容的文件不成孤儿", t, func() {
+		o := newOrigin(t, func(http.ResponseWriter, *http.Request) {})
+		svc, repo, store := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+		putObject(t, svc, "/dists/InRelease", "release v1", false)
+
+		removed := purgeRacing(t, repo, treePurge(svc), func() {
+			putObject(t, svc, "/dists/InRelease", "release v2", false)
+		})
+		convey.So(removed, convey.ShouldEqual, 0)
+		row := repo.byKey("/dists/InRelease")
+		convey.So(row, convey.ShouldNotBeNil)
+		convey.So(row.Digest, convey.ShouldEqual, digestOfString("release v2"))
+		_, ok := store.Has(digestOfString("release v2"))
+		convey.So(ok, convey.ShouldBeTrue)
 	})
 }
 

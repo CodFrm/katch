@@ -156,8 +156,8 @@ func TestCacheTreePurge(t *testing.T) {
 				{ID: 1, UpstreamID: 8, Key: "/pool/keep.deb", Digest: "sha256:keep", Pinned: true},
 				{ID: 2, UpstreamID: 8, Key: "/pool/drop.deb", Digest: "sha256:drop"},
 			}, nil)
-		// 只有未 pin 的那条会被删；Delete(1) 会让用例当场失败。
-		cacheRepo.EXPECT().Delete(gomock.Any(), int64(2)).Return(nil)
+		// 只有未 pin 的那条会被删；删 1 会让用例当场失败。
+		cacheRepo.EXPECT().DeleteUnchanged(gomock.Any(), int64(2), "sha256:drop", true).Return(true, nil)
 
 		resp := &admin.CacheTreePurgeResponse{}
 		convey.So(testMux.Do(context.Background(), &admin.CacheTreePurgeRequest{Path: "deb.debian.org/pool"},

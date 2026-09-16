@@ -1,11 +1,16 @@
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import App from '@/App'
 import i18n from '@/i18n'
-import { ADMIN_KEY_STORAGE } from '@/lib/api'
+import {
+  ADMIN_KEY_STORAGE,
+  type AdminUpstreamItem,
+  type CacheImageItem,
+  type CacheImageTag,
+} from '@/lib/api'
 
 // 覆盖任务目标（任务 5）：左栏在「Git 镜像」之后新增「容器镜像」并路由到 /admin/images；
 // 搜索、仅 registry 的上游筛选、镜像行展开 tag（摘要/pin/过期/变体数）、加载更多、
@@ -32,7 +37,7 @@ function rejected(code: number, msg: string) {
   return { ok: false, status: 400, json: async () => ({ code, msg, data: null }) }
 }
 
-function upstreamRows() {
+function upstreamRows(): AdminUpstreamItem[] {
   return [
     {
       id: 1,
@@ -80,7 +85,7 @@ function upstreamRows() {
 }
 
 /** 一条镜像记录，取值与后端 api/admin.CacheImageItem 一致（tags 由列表接口按需补）。 */
-function imageRows() {
+function imageRows(): CacheImageItem[] {
   return [
     {
       upstream_id: 1,
@@ -122,7 +127,7 @@ function imageRows() {
 }
 
 /** library/redis 的 tag 行：一个多变体、一个已固定、一个按摘要拉取且已过期。 */
-function redisTags() {
+function redisTags(): CacheImageTag[] {
   return [
     {
       reference: '7',
@@ -163,7 +168,7 @@ function redisTags() {
   ]
 }
 
-function prometheusTags() {
+function prometheusTags(): CacheImageTag[] {
   return [
     {
       reference: 'v2.53.0',
@@ -185,9 +190,9 @@ function tagKey(upstreamID: number, repository: string) {
 }
 
 interface Backend {
-  upstreams: ReturnType<typeof upstreamRows>
-  images: ReturnType<typeof imageRows>
-  tags: Record<string, ReturnType<typeof redisTags>>
+  upstreams: AdminUpstreamItem[]
+  images: CacheImageItem[]
+  tags: Record<string, CacheImageTag[]>
   /** 每页给几条，真实后端是 50；调小了才测得到「加载更多」。 */
   imageSize: number
   failPurge: { code: number; msg: string } | null
@@ -288,6 +293,40 @@ function stubFetch() {
       return { ok: false, status: 404, json: async () => ({}) }
     })
   )
+}
+
+/**
+ * 把命中 match 的请求扣在半路（先按发出那一刻的数据算好响应），release 之后才放行；
+ * limit 是最多扣几次。用来摆出只有时序才碰得到的场面。
+ */
+function holdFetch(match: (url: string) => boolean, limit = Infinity) {
+  const inner = globalThis.fetch
+  let release = () => {}
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const state = { held: 0, settled: 0, release: () => release() }
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: string, init?: RequestInit) => {
+      if (!match(url) || state.held >= limit) {
+        return inner(url, init)
+      }
+      state.held += 1
+      const response = await inner(url, init)
+      await gate
+      state.settled += 1
+      return response
+    })
+  )
+  return state
+}
+
+/** 让已经放行的响应把状态更新落完：json() 与 setState 各自还隔着几轮微任务。 */
+async function flush() {
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  })
 }
 
 function renderAdmin(path: string) {
@@ -426,6 +465,51 @@ describe('后台 · 容器镜像', () => {
     await userEvent.click(screen.getByRole('button', { name: '加载更多' }))
 
     expect(await within(table).findByRole('row', { name: /prometheus/ })).toBeInTheDocument()
+  })
+
+  it('「加载更多」在下一批回来之前连点两下，下一批也只接上一次', async () => {
+    backend.imageSize = 2
+    await renderImages()
+    const table = screen.getByRole('table', { name: '容器镜像' })
+    await within(table).findByRole('row', { name: /nginx/ })
+    const hold = holdFetch((url) => url.includes('offset=2'))
+
+    await userEvent.click(screen.getByRole('button', { name: '加载更多' }))
+    await userEvent.click(screen.getByRole('button', { name: '加载更多' }))
+    await vi.waitFor(() => expect(hold.held).toBe(2))
+    hold.release()
+    await vi.waitFor(() => expect(hold.settled).toBe(2))
+    await flush()
+
+    expect(within(table).getAllByRole('row', { name: /prometheus/ })).toHaveLength(1)
+  })
+
+  it('删除之后的重取先回来、之前发出的「加载更多」后回来时，不把删掉的镜像接回去', async () => {
+    backend.imageSize = 2
+    await renderImages()
+    const table = screen.getByRole('table', { name: '容器镜像' })
+    await within(table).findByRole('row', { name: /nginx/ })
+    // 下一批按删除之前的库算好，扣住。
+    const hold = holdFetch((url) => url.includes('offset=2'), 1)
+    await userEvent.click(screen.getByRole('button', { name: '加载更多' }))
+    await vi.waitFor(() => expect(hold.held).toBe(1))
+
+    backend.images = backend.images.filter((item) => item.repository !== 'prometheus/prometheus')
+    backend.imageSize = 50
+    const redisRow = within(table).getByRole('row', { name: /docker\.io\/library\/redis/ })
+    await userEvent.click(within(redisRow).getByRole('button', { name: '删除' }))
+    await userEvent.click(
+      within(await screen.findByRole('alertdialog')).getByRole('button', { name: '确认删除' })
+    )
+    await waitFor(() => {
+      expect(within(table).queryByRole('row', { name: /library\/redis/ })).not.toBeInTheDocument()
+    })
+
+    hold.release()
+    await vi.waitFor(() => expect(hold.settled).toBe(1))
+    await flush()
+
+    expect(within(table).queryByRole('row', { name: /prometheus/ })).not.toBeInTheDocument()
   })
 
   it('删除镜像要先确认，确认处写明未固定的对象数，完成后提示清除与跳过', async () => {

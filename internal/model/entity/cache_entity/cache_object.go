@@ -56,6 +56,15 @@ type SearchOption struct {
 	Limit      int
 }
 
+// 缓存键的变体段：路径（含查询串）之后是 0x1F，再接 VariantTag 与 VariantDigestLen 位
+// 十六进制摘要。写键的一侧（cache_svc）与按键搜索的一侧（cache_repo）共用这一份形状。
+const (
+	// VariantTag 变体段在分隔符之后的固定开头。
+	VariantTag = "accept="
+	// VariantDigestLen 变体段里摘要的十六进制位数。
+	VariantDigestLen = 16
+)
+
 // UpstreamTreeStat 目录树根上一个上游的合计。
 type UpstreamTreeStat struct {
 	UpstreamID   int64 `gorm:"column:upstream_id"`

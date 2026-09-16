@@ -125,13 +125,7 @@ function AdminWorkspace({
         ))}
         <Route
           path="cache"
-          element={
-            <CacheScreen
-              adminKey={adminKey}
-              upstreams={upstreams}
-              onUnauthorized={onUnauthorized}
-            />
-          }
+          element={<CacheScreen adminKey={adminKey} onUnauthorized={onUnauthorized} />}
         />
         <Route
           path="git"

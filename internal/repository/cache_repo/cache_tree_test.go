@@ -14,6 +14,16 @@ import (
 // 目录树的查询全在 SQL 里聚合（决策 1），所以这里要钉住的是 SQL 的形状：
 // 前缀的上下界与 LIKE 转义、分段只看查询串之前的 `/`、按名称排序与分页。
 
+// variantLike 变体段（0x1F 之后的 accept= 加 16 位摘要）在键尾的 LIKE 形状。
+const variantLike = "%accept=________________"
+
+// matchSQL 关键字匹配条件在 SQL 里的样子：rest 里含关键字，且带变体段的键要在
+// 变体段之前就含——变体段的摘要不是名字的一部分，界面上也看不见它。
+func matchSQL(rest string) string {
+	return "LOWER\\(" + rest + "\\) LIKE \\? ESCAPE '!' AND \\(`key` NOT LIKE \\? ESCAPE '!' OR LOWER\\(" +
+		rest + "\\) LIKE \\? ESCAPE '!'\\)"
+}
+
 // prefixWhere 前缀条件在 SQL 里的样子：范围给索引用，LIKE 给大小写不敏感的 MySQL 保证口径。
 const prefixWhere = "upstream_id=\\? AND `key`>=\\? AND `key`<\\? AND `key` LIKE \\? ESCAPE '!'"
 
@@ -112,13 +122,13 @@ func TestCacheObjectRepo_SearchTree(t *testing.T) {
 		repo := NewCacheObject()
 
 		convey.Convey("前缀之下的部分做不区分大小写的子串匹配，关键字里的通配符被转义", func() {
-			match := "LOWER\\(SUBSTR\\(`key`,7\\)\\) LIKE \\? ESCAPE '!'"
+			match := "\\(" + matchSQL("SUBSTR\\(`key`,7\\)") + "\\)"
 			mock.ExpectQuery("SELECT count\\(\\*\\) FROM `cache_objects` WHERE \\("+prefixWhere+"\\) AND "+match+"$").
-				WithArgs(int64(7), "/pool/", "/pool0", "/pool/%", "%redis!_7%").
+				WithArgs(int64(7), "/pool/", "/pool0", "/pool/%", "%redis!_7%", variantLike, "%redis!_7%"+variantLike).
 				WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(321))
 			mock.ExpectQuery("SELECT \\* FROM `cache_objects` WHERE \\("+prefixWhere+"\\) AND "+match+
 				" ORDER BY upstream_id,`key` LIMIT \\?$").
-				WithArgs(int64(7), "/pool/", "/pool0", "/pool/%", "%redis!_7%", 200).
+				WithArgs(int64(7), "/pool/", "/pool0", "/pool/%", "%redis!_7%", variantLike, "%redis!_7%"+variantLike, 200).
 				WillReturnRows(sqlmock.NewRows([]string{"id", "key"}).AddRow(1, "/pool/redis_7.deb"))
 
 			list, total, err := repo.SearchTree(ctx, &cache_entity.TreeSearchOption{
@@ -130,10 +140,10 @@ func TestCacheObjectRepo_SearchTree(t *testing.T) {
 		})
 
 		convey.Convey("根上搜索限定在已知上游里，主机名匹配的上游整体算命中", func() {
-			match := "LOWER\\(SUBSTR\\(`key`,1\\)\\) LIKE \\? ESCAPE '!'"
+			match := matchSQL("SUBSTR\\(`key`,1\\)")
 			mock.ExpectQuery("SELECT count\\(\\*\\) FROM `cache_objects` WHERE upstream_id IN \\(\\?,\\?\\) AND "+
-				"\\(upstream_id IN \\(\\?\\) OR "+match+"\\)$").
-				WithArgs(int64(7), int64(8), int64(8), "%debian%").
+				"\\(upstream_id IN \\(\\?\\) OR \\("+match+"\\)\\)$").
+				WithArgs(int64(7), int64(8), int64(8), "%debian%", variantLike, "%debian%"+variantLike).
 				WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(2))
 			mock.ExpectQuery("SELECT \\* FROM `cache_objects` WHERE .* ORDER BY upstream_id,`key` LIMIT \\?$").
 				WillReturnRows(sqlmock.NewRows([]string{"id", "key"}).AddRow(1, "/a").AddRow(2, "/b"))
@@ -185,13 +195,13 @@ func TestCacheObjectRepo_StatTreeMatch(t *testing.T) {
 		repo := NewCacheObject()
 
 		convey.Convey("命中按搜索目录之下的部分算，而不是按这个目录之下", func() {
-			match := "LOWER\\(SUBSTR\\(`key`,7\\)\\) LIKE \\? ESCAPE '!'"
+			match := "\\(" + matchSQL("SUBSTR\\(`key`,7\\)") + "\\)"
 			mock.ExpectQuery("SELECT COUNT\\(\\*\\) AS count,COALESCE\\(SUM\\(size\\),0\\) AS size,"+
 				"COALESCE\\(MAX\\(last_access_at\\),0\\) AS last_access_at,"+
 				"COALESCE\\(SUM\\(CASE WHEN "+match+" THEN 1 ELSE 0 END\\),0\\) AS matched_count,"+
 				"COALESCE\\(SUM\\(CASE WHEN "+match+" THEN size ELSE 0 END\\),0\\) AS matched_size "+
 				"FROM `cache_objects` WHERE "+prefixWhere+"$").
-				WithArgs("%main%", "%main%", int64(7), "/pool/main/", "/pool/main0", "/pool/main/%").
+				WithArgs("%main%", variantLike, "%main%"+variantLike, "%main%", variantLike, "%main%"+variantLike, int64(7), "/pool/main/", "/pool/main0", "/pool/main/%").
 				WillReturnRows(sqlmock.NewRows([]string{"count", "size", "last_access_at", "matched_count", "matched_size"}).
 					AddRow(10, 1000, 99, 4, 400))
 

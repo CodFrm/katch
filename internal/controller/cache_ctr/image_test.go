@@ -112,7 +112,7 @@ func TestCacheImagePurge(t *testing.T) {
 		cacheRepo.EXPECT().ListByPrefix(gomock.Any(), int64(7), "/redis/manifests/").Return(
 			[]*cache_entity.CacheObject{{ID: 3, UpstreamID: 7, Key: "/redis/manifests/7\x1faccept=a"}}, nil)
 		// 只有 3 会被删：1 被 pin，2 是另一个 tag。
-		cacheRepo.EXPECT().Delete(gomock.Any(), int64(3)).Return(nil)
+		cacheRepo.EXPECT().DeleteUnchanged(gomock.Any(), int64(3), "", true).Return(true, nil)
 
 		resp := &admin.PurgeCacheImageResponse{}
 		convey.So(testMux.Do(context.Background(), &admin.PurgeCacheImageRequest{

@@ -19,7 +19,6 @@ import {
   pinCacheObject,
   purgeCache,
   purgeCacheTree,
-  type AdminUpstreamItem,
   type CacheTreeObjectItem,
   type CacheTreeSearchDir,
   type CacheTreeSearchObject,
@@ -95,7 +94,6 @@ export function CacheScreen({
   onUnauthorized,
 }: {
   adminKey: string
-  upstreams: AdminUpstreamItem[]
   onUnauthorized: () => void
 }) {
   const { t } = useTranslation()

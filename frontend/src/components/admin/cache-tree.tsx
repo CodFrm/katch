@@ -8,20 +8,20 @@ import { formatBytes, formatCount, formatStamp } from '@/lib/format'
 /** 目录树一共几列：勾选、名称、对象数、大小、命中、最后访问、操作。 */
 export const TREE_COLUMNS = 7
 
-/** 目录行没有命中、对象行没有对象数：那一格写这个，不留白。 */
-const ABSENT = '—'
+/** 目录行没有命中、对象行没有对象数：那一格写这个，不留白。容器镜像页同用。 */
+export const ABSENT = '—'
 
 /** 目录名后面那一撇，表示它是目录。 */
 const DIR_SUFFIX = '/'
 
-/** 每深一层缩进多少像素。 */
-const INDENT_PX = 18
+/** 每深一层缩进多少像素。容器镜像页同用。 */
+export const INDENT_PX = 18
 
 /**
  * 摘要在表里只留一小截：整串 sha256 占满一行，而运维要的只是「这两条是不是同一份」。
  * 算法前缀换成 @，那是排版，不是文案。
  */
-function shortDigest(digest: string): string {
+export function shortDigest(digest: string): string {
   return digest.replace('sha256:', '@').slice(0, 10)
 }
 
@@ -51,7 +51,8 @@ export function Highlight({ text, keyword }: { text: string; keyword: string }) 
   return <>{parts}</>
 }
 
-function Stamp({ seconds }: { seconds: number }) {
+/** 最后访问时刻：今天只写时刻，昨天写「昨天」，更早写日期。 */
+export function Stamp({ seconds }: { seconds: number }) {
   const { t } = useTranslation()
   if (seconds <= 0) {
     return <>{ABSENT}</>

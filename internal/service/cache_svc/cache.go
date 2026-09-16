@@ -847,8 +847,6 @@ func (c *cacheSvc) Search(ctx context.Context, req *SearchRequest) (*SearchRespo
 
 func (c *cacheSvc) Purge(ctx context.Context, req *PurgeRequest) (*PurgeResponse, error) {
 	repo := cache_repo.CacheObject()
-	var objects []*cache_entity.CacheObject
-	skipped := int64(0)
 	switch {
 	case req.ID > 0:
 		object, err := repo.Find(ctx, req.ID)
@@ -862,39 +860,44 @@ func (c *cacheSvc) Purge(ctx context.Context, req *PurgeRequest) (*PurgeResponse
 		}
 		// 指名道姓清一条时不看 pinned：这是人指着这一条说「就清它」，
 		// 再拦一道只会逼他先解开 pin 再清，白绕一圈。
-		objects = append(objects, object)
+		removed, err := c.deleteObjects(ctx, []*cache_entity.CacheObject{object}, false)
+		if err != nil {
+			return nil, err
+		}
+		return &PurgeResponse{Removed: removed}, nil
 	case req.UpstreamID > 0:
 		list, err := repo.ListByUpstream(ctx, req.UpstreamID)
 		if err != nil {
 			return nil, err
 		}
-		for _, object := range list {
-			// pin 表达的是「这份内容要常驻」。它挡住了 LRU 淘汰，也必须挡住
-			// 批量清除，否则清一次上游就把所有 pin 过的对象顺手抹了。
-			if object.Pinned {
-				skipped++
-				continue
-			}
-			objects = append(objects, object)
+		// pin 挡住批量清除，否则清一次上游就把所有 pin 过的对象顺手抹了。
+		removed, skipped, err := c.purgeUnpinned(ctx, list)
+		if err != nil {
+			return nil, err
 		}
+		return &PurgeResponse{Removed: removed, Skipped: skipped}, nil
 	default:
 		// 不给「清空一切」留一个不写参数就能触发的形态。
 		return nil, i18n.NewError(ctx, code.PurgeTargetRequired)
 	}
-	removed, err := c.deleteObjects(ctx, objects)
-	if err != nil {
-		return nil, err
-	}
-	return &PurgeResponse{Removed: removed, Skipped: skipped}, nil
 }
 
 // deleteObjects 人手清除的删除循环：删记录、记下「再拉就是首次拉取」、内容无引用才删文件。
 // 按 ID、按上游、按目录、按镜像清除共用这一份。
-func (c *cacheSvc) deleteObjects(ctx context.Context, objects []*cache_entity.CacheObject) (int64, error) {
+//
+// 列出与删除之间隔着整批的往返：这期间拉取可能把同一条记录（同一个 id）按新内容写回，
+// 人也可能把它 pin 上。删除只认列出时的那份摘要（skipPinned 时还要求仍未 pin），
+// 没删成的不计数、不回收文件——否则删掉的是新内容的记录，回收的却是旧摘要，
+// 新内容的文件就没人再指着了。
+func (c *cacheSvc) deleteObjects(ctx context.Context, objects []*cache_entity.CacheObject, skipPinned bool) (int64, error) {
 	removed := int64(0)
 	for _, object := range objects {
-		if err := cache_repo.CacheObject().Delete(ctx, object.ID); err != nil {
+		deleted, err := cache_repo.CacheObject().DeleteUnchanged(ctx, object.ID, object.Digest, skipPinned)
+		if err != nil {
 			return 0, err
+		}
+		if !deleted {
+			continue
 		}
 		// 人手清掉的对象，再被拉回来就是一次首次拉取。这一笔还顺带盖掉它更早
 		// 之前留下的那条淘汰记录，否则清完缓存的第一次拉取会报成「被淘汰」。
@@ -920,7 +923,7 @@ func (c *cacheSvc) purgeUnpinned(ctx context.Context, objects []*cache_entity.Ca
 		}
 		targets = append(targets, object)
 	}
-	removed, err := c.deleteObjects(ctx, targets)
+	removed, err := c.deleteObjects(ctx, targets, true)
 	return removed, skipped, err
 }
 

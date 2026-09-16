@@ -192,6 +192,38 @@ func TestCacheObjectRepo_DeleteExpired(t *testing.T) {
 	})
 }
 
+func TestCacheObjectRepo_DeleteUnchanged(t *testing.T) {
+	convey.Convey("人手清除只删列出时看到的那一份", t, func() {
+		ctx, _, mock := testutils.Database(t)
+
+		convey.Convey("批量清除还要求它仍未被 pin", func() {
+			mock.ExpectBegin()
+			mock.ExpectExec("DELETE FROM `cache_objects` WHERE id=\\? AND digest=\\? AND pinned=\\?$").
+				WithArgs(int64(3), "sha256:a", false).
+				WillReturnResult(sqlmock.NewResult(0, 0))
+			mock.ExpectCommit()
+
+			removed, err := NewCacheObject().DeleteUnchanged(ctx, 3, "sha256:a", true)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(removed, convey.ShouldBeFalse)
+			convey.So(mock.ExpectationsWereMet(), convey.ShouldBeNil)
+		})
+
+		convey.Convey("指名清一条时不看 pin", func() {
+			mock.ExpectBegin()
+			mock.ExpectExec("DELETE FROM `cache_objects` WHERE id=\\? AND digest=\\?$").
+				WithArgs(int64(3), "sha256:a").
+				WillReturnResult(sqlmock.NewResult(0, 1))
+			mock.ExpectCommit()
+
+			removed, err := NewCacheObject().DeleteUnchanged(ctx, 3, "sha256:a", false)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(removed, convey.ShouldBeTrue)
+			convey.So(mock.ExpectationsWereMet(), convey.ShouldBeNil)
+		})
+	})
+}
+
 func TestCacheObjectRepo_Delete(t *testing.T) {
 	convey.Convey("删除一条缓存记录", t, func() {
 		ctx, _, mock := testutils.Database(t)

@@ -22,6 +22,9 @@ type CacheObjectRepo interface {
 	FindByKey(ctx context.Context, upstreamID int64, key string) (*cache_entity.CacheObject, error)
 	Save(ctx context.Context, object *cache_entity.CacheObject) error
 	Delete(ctx context.Context, id int64) error
+	// DeleteUnchanged 人手清除用：只在记录仍指着 digest（列出之后没被拉取按新内容写回）
+	// 时删除，skipPinned 为真时还要求它仍未被 pin。返回是否真的删掉了。
+	DeleteUnchanged(ctx context.Context, id int64, digest string, skipPinned bool) (bool, error)
 	// DeleteExpired 只在记录仍满足过期清理条件时删除，避免删掉并发提升的旧记录。
 	DeleteExpired(ctx context.Context, id, before int64) (bool, error)
 	// Touch 命中时只更新访问时间与命中数，不整行写回。
@@ -127,6 +130,15 @@ func (c *cacheObjectRepo) Save(ctx context.Context, object *cache_entity.CacheOb
 
 func (c *cacheObjectRepo) Delete(ctx context.Context, id int64) error {
 	return db.Ctx(ctx).Where("id=?", id).Delete(&cache_entity.CacheObject{}).Error
+}
+
+func (c *cacheObjectRepo) DeleteUnchanged(ctx context.Context, id int64, digest string, skipPinned bool) (bool, error) {
+	where, args := "id=? AND digest=?", []any{id, digest}
+	if skipPinned {
+		where, args = where+" AND pinned=?", append(args, false)
+	}
+	result := db.Ctx(ctx).Where(where, args...).Delete(&cache_entity.CacheObject{})
+	return result.RowsAffected > 0, result.Error
 }
 
 func (c *cacheObjectRepo) DeleteExpired(ctx context.Context, id, before int64) (bool, error) {

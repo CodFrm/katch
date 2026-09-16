@@ -363,11 +363,21 @@ export function useCacheTree(key: string, path: string, onUnauthorized: () => vo
   useEffect(() => {
     latest.current = state
   }, [state])
+  // 每一层的「代」：从第一批问起（展开、重取）或收起都换一代，接下一批沿用当代。
+  // 展开与加载更多发出的请求没有跟着谁一起取消，回来得晚的那些靠代号认出来扔掉——
+  // 否则先发后到的旧一批会盖掉清除之后重取的新一批。
+  const generations = useRef(new Map<string, number>())
+  const nextGeneration = useCallback((dir: string) => {
+    const generation = (generations.current.get(dir) ?? 0) + 1
+    generations.current.set(dir, generation)
+    return generation
+  }, [])
 
   const load = useCallback(
-    (root: string, dir: string, offset: number, signal?: AbortSignal) =>
-      fetchCacheTree(key, dir, offset, signal).then((result) => {
-        if (signal?.aborted) {
+    (root: string, dir: string, offset: number, signal?: AbortSignal) => {
+      const generation = offset > 0 ? (generations.current.get(dir) ?? 0) : nextGeneration(dir)
+      return fetchCacheTree(key, dir, offset, signal).then((result) => {
+        if (signal?.aborted || generations.current.get(dir) !== generation) {
           return
         }
         const data = unwrap(result, () => reject.current())
@@ -375,6 +385,10 @@ export function useCacheTree(key: string, path: string, onUnauthorized: () => vo
           const base =
             current.root === root ? current : { root, layers: {}, expanded: [] as string[] }
           const previous = base.layers[dir]
+          if (offset > 0 && previous?.nextOffset !== offset) {
+            // 同一批被连点了两次，或者这一层在此期间从头重取过：这一批已经不接在末尾了。
+            return current
+          }
           if (!data) {
             // 翻下一批失败时留着已经接上的那些；第一批就读不到，这一层按空的给。
             return offset > 0 && previous
@@ -392,8 +406,9 @@ export function useCacheTree(key: string, path: string, onUnauthorized: () => vo
           }
           return { ...base, layers: { ...base.layers, [dir]: layer } }
         })
-      }),
-    [key, reject]
+      })
+    },
+    [key, reject, nextGeneration]
   )
 
   useEffect(() => {
@@ -420,11 +435,14 @@ export function useCacheTree(key: string, path: string, onUnauthorized: () => vo
         }
         return { ...base, expanded: [...base.expanded, dir] }
       })
-      if (!open) {
+      if (open) {
+        // 还在路上的那些属于收起之前，回来了也不再接。
+        nextGeneration(dir)
+      } else {
         void load(path, dir, 0)
       }
     },
-    [path, load]
+    [path, load, nextGeneration]
   )
 
   const loadMore = useCallback(
@@ -586,36 +604,44 @@ export function useCacheImages(
     latest.current = state
   }, [state])
 
+  // 从第一批问起就换一代，接下一批沿用当代：理由同 useCacheTree。
+  const generation = useRef(0)
+
   const load = useCallback(
-    (targetUpstreamID: number, targetKeyword: string, offset: number, signal?: AbortSignal) =>
-      fetchCacheImages(
+    (targetUpstreamID: number, targetKeyword: string, offset: number, signal?: AbortSignal) => {
+      const current = offset > 0 ? generation.current : ++generation.current
+      return fetchCacheImages(
         key,
         { upstreamID: targetUpstreamID, keyword: targetKeyword, offset },
         signal
       ).then((result) => {
-        if (signal?.aborted) {
+        if (signal?.aborted || generation.current !== current) {
           return
         }
         const data = unwrap(result, () => reject.current())
-        setState((current) => {
-          const own = current.upstreamID === targetUpstreamID && current.keyword === targetKeyword
-          const previous = own ? current.list : []
+        setState((state) => {
+          const own = state.upstreamID === targetUpstreamID && state.keyword === targetKeyword
+          if (offset > 0 && !(own && state.nextOffset === offset)) {
+            // 同一批被连点了两次，或者参数在此期间换过：这一批已经不接在末尾了。
+            return state
+          }
           if (!data) {
-            return offset > 0 && own
-              ? current
+            return offset > 0
+              ? state
               : { ...EMPTY_IMAGES, upstreamID: targetUpstreamID, keyword: targetKeyword }
           }
           const list = data.list ?? []
           return {
             upstreamID: targetUpstreamID,
             keyword: targetKeyword,
-            list: offset > 0 && own ? [...previous, ...list] : list,
+            list: offset > 0 ? [...state.list, ...list] : list,
             total: data.total,
             hasMore: data.has_more,
             nextOffset: data.next_offset,
           }
         })
-      }),
+      })
+    },
     [key, reject]
   )
 

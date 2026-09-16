@@ -3,6 +3,7 @@ import { Fragment, useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { ScreenHeader } from '@/components/admin/admin-shell'
+import { ABSENT, INDENT_PX, shortDigest, Stamp } from '@/components/admin/cache-tree'
 import { Input } from '@/components/ui/input'
 import { Table } from '@/components/ui/table'
 import { useAdminAction } from '@/hooks/use-admin-action'
@@ -15,7 +16,7 @@ import {
   type CacheImageTag,
   type PurgeResult,
 } from '@/lib/api'
-import { formatBytes, formatCount, formatStamp } from '@/lib/format'
+import { formatBytes, formatCount } from '@/lib/format'
 
 /** 搜索的节流：同缓存对象页，一敲一个字就打一次库是自找的压力。 */
 const SEARCH_DEBOUNCE_MS = 250
@@ -23,39 +24,9 @@ const SEARCH_DEBOUNCE_MS = 250
 /** 搜索词的上限，同后端 ListCacheImagesRequest.Keyword。 */
 const KEYWORD_MAX = 256
 
-/** 每深一层缩进多少像素。 */
-const INDENT_PX = 18
-
-/** 没有可给的数字时那一格写这个，不留白（同 cache-tree 的 ABSENT）。 */
-const ABSENT = '—'
-
-/**
- * 摘要在表里只留一小截：整串 sha256 占满一行，而运维要的只是「这是同一份内容」。
- * 同 cache-tree.tsx 的 shortDigest，这里各写一遍——两处都是纯函数，拆到共享模块
- * 反而要多绕一层 import。
- */
-function shortDigest(digest: string): string {
-  return digest.replace('sha256:', '@').slice(0, 10)
-}
-
 /** 一个镜像行在这个页面里的身份：上游加仓库名，两者合在一起才唯一。 */
 function rowKey(upstreamID: number, repository: string): string {
   return `${upstreamID}:${repository}`
-}
-
-function Stamp({ seconds }: { seconds: number }) {
-  const { t } = useTranslation()
-  if (seconds <= 0) {
-    return <>{ABSENT}</>
-  }
-  const stamp = formatStamp(seconds)
-  if (stamp.day === 'today') {
-    return <>{stamp.time}</>
-  }
-  if (stamp.day === 'yesterday') {
-    return <>{t('admin.events.yesterday', { time: stamp.time })}</>
-  }
-  return <>{`${stamp.date} ${stamp.time}`}</>
 }
 
 /** 等着确认的删除：镜像或者一个 tag。count 是确认处写明的对象数。 */

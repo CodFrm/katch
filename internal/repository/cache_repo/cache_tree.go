@@ -59,9 +59,20 @@ func treeDirName(rest string) string {
 	return "SUBSTR(" + rest + ",1,INSTR(" + rest + ",'/')-1)"
 }
 
+// treeVariantLike 键尾变体段的 LIKE 形状：accept= 加定长摘要。不带 0x1F 本身——
+// MySQL 的排序规则把控制字节当成零权重，拿它做模式靠不住；定长的摘要把位置钉死在键尾。
+var treeVariantLike = "%" + cache_entity.VariantTag + strings.Repeat("_", cache_entity.VariantDigestLen)
+
 // treeMatch 关键字匹配条件：剩下的部分转小写后做子串匹配。
-func treeMatch(rest, keyword string) (string, any) {
-	return "LOWER(" + rest + ") LIKE ? ESCAPE '!'", "%" + likeEscaper.Replace(strings.ToLower(keyword)) + "%"
+//
+// 变体段不算名字：它在界面上被剥掉了，摘要又是十六进制，搜「7」这样的词会让几乎每条
+// manifest 变体都算命中。所以带变体段的键，关键字要出现在变体段之前。条件本身不带
+// 最外层括号，调用方按上下文加。
+func treeMatch(rest, keyword string) (string, []any) {
+	pattern := "%" + likeEscaper.Replace(strings.ToLower(keyword)) + "%"
+	lower := "LOWER(" + rest + ") LIKE ? ESCAPE '!'"
+	return lower + " AND (`key` NOT LIKE ? ESCAPE '!' OR " + lower + ")",
+		[]any{pattern, treeVariantLike, pattern + treeVariantLike}
 }
 
 // treeAggregate 目录合计的几列。pinned 用 CASE 数而不是直接 SUM：布尔列在两边的
@@ -148,19 +159,19 @@ func (c *cacheObjectRepo) SearchTree(ctx context.Context, opt *cache_entity.Tree
 		if err != nil {
 			return nil, 0, err
 		}
-		match, matchArg := treeMatch(treeRest(opt.Prefix), opt.Keyword)
-		query = query.Where(where, whereArgs...).Where(match, matchArg)
+		match, matchArgs := treeMatch(treeRest(opt.Prefix), opt.Keyword)
+		query = query.Where(where, whereArgs...).Where(match, matchArgs...)
 	} else {
 		// 根上搜索限定在已知上游里：上游删掉之后留下的记录在树上没有位置。
 		if len(opt.UpstreamIDs) == 0 {
 			return list, 0, nil
 		}
-		match, matchArg := treeMatch(treeRest(""), opt.Keyword)
+		match, matchArgs := treeMatch(treeRest(""), opt.Keyword)
 		query = query.Where("upstream_id IN ?", opt.UpstreamIDs)
 		if len(opt.HostMatched) > 0 {
-			query = query.Where("upstream_id IN ? OR "+match, opt.HostMatched, matchArg)
+			query = query.Where("upstream_id IN ? OR ("+match+")", append([]any{opt.HostMatched}, matchArgs...)...)
 		} else {
-			query = query.Where(match, matchArg)
+			query = query.Where(match, matchArgs...)
 		}
 	}
 	var total int64
@@ -194,8 +205,8 @@ func (c *cacheObjectRepo) StatTreeMatch(ctx context.Context, opt *cache_entity.T
 	}
 	match, matchArgs := "1=1", []any(nil)
 	if !opt.AllMatched {
-		cond, arg := treeMatch(treeRest(opt.SearchPrefix), opt.Keyword)
-		match, matchArgs = cond, []any{arg}
+		cond, args := treeMatch(treeRest(opt.SearchPrefix), opt.Keyword)
+		match, matchArgs = "("+cond+")", args
 	}
 	sql := "SELECT COUNT(*) AS count,COALESCE(SUM(size),0) AS size," +
 		"COALESCE(MAX(last_access_at),0) AS last_access_at," +

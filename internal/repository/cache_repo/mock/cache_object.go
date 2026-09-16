@@ -100,6 +100,21 @@ func (mr *MockCacheObjectRepoMockRecorder) DeleteExpired(ctx, id, before any) *g
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeleteExpired", reflect.TypeOf((*MockCacheObjectRepo)(nil).DeleteExpired), ctx, id, before)
 }
 
+// DeleteUnchanged mocks base method.
+func (m *MockCacheObjectRepo) DeleteUnchanged(ctx context.Context, id int64, digest string, skipPinned bool) (bool, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "DeleteUnchanged", ctx, id, digest, skipPinned)
+	ret0, _ := ret[0].(bool)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// DeleteUnchanged indicates an expected call of DeleteUnchanged.
+func (mr *MockCacheObjectRepoMockRecorder) DeleteUnchanged(ctx, id, digest, skipPinned any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeleteUnchanged", reflect.TypeOf((*MockCacheObjectRepo)(nil).DeleteUnchanged), ctx, id, digest, skipPinned)
+}
+
 // EvictCandidates mocks base method.
 func (m *MockCacheObjectRepo) EvictCandidates(ctx context.Context, limit int) ([]*cache_entity.CacheObject, error) {
 	m.ctrl.T.Helper()
