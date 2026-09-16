@@ -765,6 +765,100 @@ func TestGet_IfRangePassesThrough(t *testing.T) {
 	})
 }
 
+// TestGet_RangeAndIfRangePassThroughMarkMiss 带 Range 或 If-Range 的请求完整透传，
+// 但仍是真实回源：X-Katch-Cache 必须标成 MISS，手上有新鲜完整副本时也一样。
+//
+// 客户端只看得到「没有 HIT」时无法判定这一次回了源，运维验证与指标归因都少一档；
+// 只标 MISS 而不读不写那份副本，才能让同一 URL 的普通 GET 继续命中。
+func TestGet_RangeAndIfRangePassThroughMarkMiss(t *testing.T) {
+	const payload = "hello world"
+	origin := func() *originStub {
+		return newOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			if r.Header.Get("Range") != "" {
+				w.Header().Set("Content-Range", "bytes 0-4/11")
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = io.WriteString(w, "hello")
+				return
+			}
+			_, _ = io.WriteString(w, payload)
+		})
+	}
+
+	convey.Convey("没有副本时 Range 与 If-Range 就标 MISS", t, func() {
+		o := origin()
+		svc, repo, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+		const path = "/pool/part.deb"
+
+		rangeTg := target("deb.debian.org", path)
+		rangeTg.Header.Set("Range", "bytes=0-4")
+		body, meta, err := svc.Get(context.Background(), rangeTg)
+		convey.So(err, convey.ShouldBeNil)
+		got, _ := io.ReadAll(body)
+		convey.So(body.Close(), convey.ShouldBeNil)
+		convey.So(string(got), convey.ShouldEqual, "hello")
+		convey.So(meta.StatusCode, convey.ShouldEqual, http.StatusPartialContent)
+		convey.So(meta.Header.Get("Content-Range"), convey.ShouldEqual, "bytes 0-4/11")
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusMiss)
+
+		ifRangeTg := target("deb.debian.org", path)
+		ifRangeTg.Header.Set("If-Range", `"v1"`)
+		body, meta, err = svc.Get(context.Background(), ifRangeTg)
+		convey.So(err, convey.ShouldBeNil)
+		got, _ = io.ReadAll(body)
+		convey.So(body.Close(), convey.ShouldBeNil)
+		convey.So(string(got), convey.ShouldEqual, payload)
+		convey.So(meta.StatusCode, convey.ShouldEqual, http.StatusOK)
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusMiss)
+
+		// 两次都越过对象缓存：没有留下任何记录。
+		convey.So(len(repo.all()), convey.ShouldEqual, 0)
+		convey.So(o.hits.Load(), convey.ShouldEqual, 2)
+	})
+
+	convey.Convey("有新鲜完整副本时 Range 与 If-Range 仍标 MISS 且不动副本", t, func() {
+		o := origin()
+		svc, repo, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+		const path = "/pool/part.deb"
+
+		// 先落一份新鲜完整副本，作为下面两次透传的对照。
+		_, first := pullWith(t, svc, target("deb.debian.org", path))
+		convey.So(first.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusMiss)
+		row := repo.byKey(path)
+		convey.So(row, convey.ShouldNotBeNil)
+
+		ifRangeTg := target("deb.debian.org", path)
+		ifRangeTg.Header.Set("If-Range", `"v1"`)
+		body, meta, err := svc.Get(context.Background(), ifRangeTg)
+		convey.So(err, convey.ShouldBeNil)
+		got, _ := io.ReadAll(body)
+		convey.So(body.Close(), convey.ShouldBeNil)
+		convey.So(string(got), convey.ShouldEqual, payload)
+		convey.So(meta.StatusCode, convey.ShouldEqual, http.StatusOK)
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusMiss)
+
+		rangeTg := target("deb.debian.org", path)
+		rangeTg.Header.Set("Range", "bytes=0-4")
+		body, meta, err = svc.Get(context.Background(), rangeTg)
+		convey.So(err, convey.ShouldBeNil)
+		got, _ = io.ReadAll(body)
+		convey.So(body.Close(), convey.ShouldBeNil)
+		// 上游的 206 与 Range 头原样保留：本地不处理范围请求。
+		convey.So(string(got), convey.ShouldEqual, "hello")
+		convey.So(meta.StatusCode, convey.ShouldEqual, http.StatusPartialContent)
+		convey.So(meta.Header.Get("Content-Range"), convey.ShouldEqual, "bytes 0-4/11")
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusMiss)
+
+		// 两次透传都没有写入：记录还是 setup 那份完整内容，没有多出第二条。
+		convey.So(len(repo.all()), convey.ShouldEqual, 1)
+		convey.So(repo.byKey(path).Digest, convey.ShouldEqual, row.Digest)
+		// 也没把副本读坏或清掉：紧接着的普通 GET 仍由磁盘命中。
+		_, hit := pullWith(t, svc, target("deb.debian.org", path))
+		convey.So(hit.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
+		convey.So(o.hits.Load(), convey.ShouldEqual, 3)
+	})
+}
+
 // TestGet_ConditionalOnAbsentStaleOrBrokenCopyPassesThrough 条件请求遇到没有可用
 // 副本的三种形态时一律透传：无副本、已过期、磁盘上的字节已损坏。
 //

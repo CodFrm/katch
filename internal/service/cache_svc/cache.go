@@ -209,7 +209,11 @@ func Register(svc CacheSvc) {
 
 func (c *cacheSvc) Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCloser, *proxy_svc.Meta, error) {
 	if !c.usable() || !objectCacheEligible(target) {
-		return proxy_svc.Proxy().Fetch(ctx, target)
+		body, meta, err := proxy_svc.Proxy().Fetch(ctx, target)
+		if err != nil {
+			return nil, nil, err
+		}
+		return body, rangePassthroughMiss(target, meta), nil
 	}
 	upstream, err := upstream_svc.Upstream().FindByHost(ctx, target.Host)
 	if err != nil || upstream == nil {
@@ -288,12 +292,41 @@ func objectCacheEligible(target *proxy_svc.Target) bool {
 	if target.Method != http.MethodGet && target.Method != http.MethodHead {
 		return false
 	}
+	return !rangeRequest(target)
+}
+
+// rangeRequest 这次请求带 Range 或 If-Range：本地不处理范围请求，一律完整透传。
+func rangeRequest(target *proxy_svc.Target) bool {
 	for _, h := range []string{"Range", "If-Range"} {
 		if target.Header.Get(h) != "" {
-			return false
+			return true
 		}
 	}
-	return true
+	return false
+}
+
+// rangePassthroughMiss 给一次带 Range/If-Range 的透传补上未命中归因。
+//
+// 它不进对象缓存，但和 HEAD/条件请求的透传一样是一次由缓存判定发生的真实回源
+// （本地答不了范围请求）。X-Katch-Cache 是运维验证与客户端判定「这一次有没有回源」
+// 的唯一依据：少了它，客户端只看得到「没有 HIT」，无从区分「回源了」和「被本地
+// 回答但没标」。
+//
+// git 的应答不在这里标：它自己带 X-Katch-Git，一次协商结果不是一个对象（见 web
+// 包的同名说明）；上游已经是 HIT 时也不盖，那一句说的是上游那一跳。
+func rangePassthroughMiss(target *proxy_svc.Target, meta *proxy_svc.Meta) *proxy_svc.Meta {
+	if meta == nil || target.Git.IsGit() || !rangeRequest(target) {
+		return meta
+	}
+	if meta.Header.Get(cacheStatusHeader) == cacheStatusHit {
+		return meta
+	}
+	if meta.Header == nil {
+		meta.Header = make(http.Header, 2)
+	}
+	meta.Header.Set(cacheStatusHeader, cacheStatusMiss)
+	// 归因与 HEAD/条件请求的透传保持一档：手上没有任何可复用的副本，算首次拉取。
+	return (&miss{reason: metrics.MissFirst}).stamp(meta)
 }
 
 // writableRequest 未命中时这次请求能不能写缓存。

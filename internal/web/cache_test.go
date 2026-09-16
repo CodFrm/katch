@@ -206,18 +206,26 @@ func TestProxy_HeadAndConditionalRequestsServedLocally(t *testing.T) {
 		// 以上全部由本地答完，一次都没有回源。
 		convey.So(hits.Load(), convey.ShouldEqual, 1)
 
-		// Range 完整透传，也不写对象缓存：接下来的普通 GET 仍拿到完整内容。
+		// Range 完整透传，也不写对象缓存：它是真实回源，标 MISS，但接下来的普通 GET 仍命中完整内容。
 		ranged := cacheRequest(t, http.MethodGet, path, http.Header{"Range": []string{"bytes=0-4"}})
 		convey.So(ranged.Code, convey.ShouldEqual, http.StatusPartialContent)
 		convey.So(ranged.Body.String(), convey.ShouldEqual, "hello")
-		convey.So(ranged.Header().Get("X-Katch-Cache"), convey.ShouldBeEmpty)
+		convey.So(ranged.Header().Get("Content-Range"), convey.ShouldEqual, "bytes 0-4/11")
+		convey.So(ranged.Header().Get("X-Katch-Cache"), convey.ShouldEqual, "MISS")
 		convey.So(hits.Load(), convey.ShouldEqual, 2)
+
+		// If-Range 同样完整透传并标 MISS：本地答不了范围请求，判断交回上游。
+		ifRanged := cacheRequest(t, http.MethodGet, path, http.Header{"If-Range": []string{`"v1"`}})
+		convey.So(ifRanged.Code, convey.ShouldEqual, http.StatusOK)
+		convey.So(ifRanged.Body.String(), convey.ShouldEqual, payload)
+		convey.So(ifRanged.Header().Get("X-Katch-Cache"), convey.ShouldEqual, "MISS")
+		convey.So(hits.Load(), convey.ShouldEqual, 3)
 
 		full := cacheRequest(t, http.MethodGet, path, nil)
 		convey.So(full.Code, convey.ShouldEqual, http.StatusOK)
 		convey.So(full.Body.String(), convey.ShouldEqual, payload)
 		convey.So(full.Header().Get("X-Katch-Cache"), convey.ShouldEqual, "HIT")
-		convey.So(hits.Load(), convey.ShouldEqual, 2)
+		convey.So(hits.Load(), convey.ShouldEqual, 3)
 	})
 }
 
