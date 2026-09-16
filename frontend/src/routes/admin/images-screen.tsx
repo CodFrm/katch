@@ -68,6 +68,8 @@ export function ImagesScreen({
     keys: [],
   })
   const [tags, setTags] = useState<Record<string, CacheImageTag[]>>({})
+  /** tag 没读出来的那些行：读不出来不等于这个镜像没有 tag，要说出来。 */
+  const [tagsFailed, setTagsFailed] = useState<string[]>([])
   const [target, setTarget] = useState<PurgeTarget | null>(null)
   const [purged, setPurged] = useState<PurgeResult | null>(null)
   const action = useAdminAction(onUnauthorized)
@@ -78,6 +80,15 @@ export function ImagesScreen({
     const timer = setTimeout(() => setCommitted(keyword.trim()), SEARCH_DEBOUNCE_MS)
     return () => clearTimeout(timer)
   }, [keyword])
+
+  // 读不出来的列表或 tag 用管理操作的错误提示说出来；写操作的错误更具体，先说它。
+  const errorKey =
+    action.errorKey ??
+    (images.failed
+      ? 'admin.images.loadFailed'
+      : tagsFailed.length > 0
+        ? 'admin.images.tagsFailed'
+        : null)
 
   function isExpanded(item: CacheImageItem): boolean {
     const key = rowKey(item.upstream_id, item.repository)
@@ -121,9 +132,12 @@ export function ImagesScreen({
           return
         }
         if (result.ok) {
+          setTagsFailed((current) => current.filter((entry) => entry !== key))
           setTags((current) => ({ ...current, [key]: result.data.list ?? [] }))
         } else if (result.reason === 'unauthorized') {
           onUnauthorized()
+        } else {
+          setTagsFailed((current) => (current.includes(key) ? current : [...current, key]))
         }
       })
     }
@@ -132,6 +146,7 @@ export function ImagesScreen({
 
   function toggleRow(item: CacheImageItem) {
     const key = rowKey(item.upstream_id, item.repository)
+    setTagsFailed((current) => current.filter((entry) => entry !== key))
     setManualToggle((state) => {
       const keys = state.keyword === committed ? state.keys : []
       return {
@@ -142,6 +157,7 @@ export function ImagesScreen({
   }
 
   function refresh() {
+    setTagsFailed([])
     images.reload()
   }
 
@@ -277,9 +293,9 @@ export function ImagesScreen({
           </p>
         )}
 
-        {action.errorKey && (
+        {errorKey && (
           <p role="alert" className="text-destructive text-[12.5px]">
-            {t(action.errorKey)}
+            {t(errorKey)}
           </p>
         )}
 
@@ -332,7 +348,7 @@ export function ImagesScreen({
             })}
           </tbody>
         </Table>
-        {images.data.length === 0 && (
+        {images.data.length === 0 && !images.failed && (
           <p className="text-muted-foreground text-[13px]">{t('admin.images.empty')}</p>
         )}
         {images.hasMore && (

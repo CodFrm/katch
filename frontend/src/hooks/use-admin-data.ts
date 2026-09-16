@@ -570,6 +570,11 @@ export interface CacheImagesView {
   data: CacheImageItem[]
   total: number
   hasMore: boolean
+  /**
+   * 最近一次没读出来。读不出来不等于没有镜像：当成空列表给，界面就会说「没有镜像缓存」，
+   * 把一次故障说成了事实（同 CacheTreeView.failed）。
+   */
+  failed: boolean
   /** 把下一批接在后面。 */
   loadMore: () => void
   /** 写操作之后重取（从第一批取起）。 */
@@ -583,6 +588,7 @@ interface ImagesState {
   total: number
   hasMore: boolean
   nextOffset: number
+  failed: boolean
 }
 
 const EMPTY_IMAGES: ImagesState = {
@@ -592,6 +598,7 @@ const EMPTY_IMAGES: ImagesState = {
   total: 0,
   hasMore: false,
   nextOffset: 0,
+  failed: false,
 }
 
 /**
@@ -636,9 +643,15 @@ export function useCacheImages(
             return state
           }
           if (!data) {
-            return offset > 0
-              ? state
-              : { ...EMPTY_IMAGES, upstreamID: targetUpstreamID, keyword: targetKeyword }
+            // 已经接上的那些（翻下一批、写操作之后重取）留着，只记下这次没读出来。
+            return own
+              ? { ...state, failed: true }
+              : {
+                  ...EMPTY_IMAGES,
+                  upstreamID: targetUpstreamID,
+                  keyword: targetKeyword,
+                  failed: true,
+                }
           }
           const list = data.list ?? []
           return {
@@ -648,6 +661,7 @@ export function useCacheImages(
             total: data.total,
             hasMore: data.has_more,
             nextOffset: data.next_offset,
+            failed: false,
           }
         })
       })
@@ -673,6 +687,7 @@ export function useCacheImages(
     data: own ? state.list : [],
     total: own ? state.total : 0,
     hasMore: own ? state.hasMore : false,
+    failed: own && state.failed,
     loadMore,
     reload,
   }

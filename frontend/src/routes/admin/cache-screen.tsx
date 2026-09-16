@@ -76,10 +76,11 @@ function groupSearch(dirs: CacheTreeSearchDir[], objects: CacheTreeSearchObject[
   return levels
 }
 
-/** 等着确认的按目录清除。count 是将清除的未固定对象数，还没问到时是 null。 */
+/** 等着确认的按目录清除。count 是将清除的未固定对象数，还没问到时是 null；failed 是没问到。 */
 interface PurgeTarget {
   path: string
   count: number | null
+  failed?: boolean
 }
 
 /**
@@ -121,7 +122,8 @@ export function CacheScreen({
   }, [keyword])
 
   // 搜索结果里的目录行没有「其中几个已固定」，确认前要单独问一次那一层的合计。
-  const pendingCount = target !== null && target.count === null ? target.path : null
+  const pendingCount =
+    target !== null && target.count === null && !target.failed ? target.path : null
   useEffect(() => {
     if (pendingCount === null) {
       return
@@ -136,6 +138,11 @@ export function CacheScreen({
         setTarget((current) => (current?.path === pendingCount ? { ...current, count } : current))
       } else if (result.reason === 'unauthorized') {
         onUnauthorized()
+      } else {
+        // 问不到合计就说不出将清除几个：确认按钮点不了，得把原因说出来。
+        setTarget((current) =>
+          current?.path === pendingCount ? { ...current, failed: true } : current
+        )
       }
     })
     return () => controller.abort()
@@ -177,7 +184,8 @@ export function CacheScreen({
     : tree.failed
       ? 'admin.cache.tree.loadFailed'
       : null
-  const errorKey = action.errorKey ?? loadErrorKey
+  const errorKey =
+    action.errorKey ?? (target?.failed ? 'admin.cache.tree.loadFailed' : loadErrorKey)
 
   // 选中的全是已固定的对象时，这枚按钮换成放开——只给 pin 不给 unpin 的界面
   // 会让一个钉住的对象再也清不掉。

@@ -347,6 +347,8 @@
       "upstreamFilter": "按上游筛选",
       "allUpstreams": "全部上游",
       "empty": "没有镜像缓存。",
+      "loadFailed": "镜像列表没有读出来，稍后刷新再试。",
+      "tagsFailed": "tag 列表没有读出来，稍后刷新再试。",
       "loadMore": "加载更多",
       "expand": "展开 {{name}}",
       "collapse": "收起 {{name}}",

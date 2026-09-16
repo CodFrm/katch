@@ -37,6 +37,11 @@ function rejected(code: number, msg: string) {
   return { ok: false, status: 400, json: async () => ({ code, msg, data: null }) }
 }
 
+/** 后端内部出错（比如 SQL 执行失败）时的回应：500 加上泛泛的「系统错误」。 */
+function systemError() {
+  return { ok: false, status: 500, json: async () => ({ code: -1, msg: '系统错误', data: null }) }
+}
+
 function upstreamRows(): AdminUpstreamItem[] {
   return [
     {
@@ -196,6 +201,10 @@ interface Backend {
   /** 每页给几条，真实后端是 50；调小了才测得到「加载更多」。 */
   imageSize: number
   failPurge: { code: number; msg: string } | null
+  /** 让镜像列表出内部错误。 */
+  failImages: boolean
+  /** 让 tag 列表出内部错误。 */
+  failTags: boolean
 }
 
 let backend: Backend
@@ -244,6 +253,9 @@ function stubFetch() {
         return envelope({ range: '24h', from: 0, to: TO, list: [] })
       }
       if (path === '/api/v1/admin/cache/images' && method === 'GET') {
+        if (backend.failImages) {
+          return systemError()
+        }
         return envelope(
           cacheImages(
             Number(query.get('upstream_id') ?? '0'),
@@ -253,6 +265,9 @@ function stubFetch() {
         )
       }
       if (path === '/api/v1/admin/cache/images/tags' && method === 'GET') {
+        if (backend.failTags) {
+          return systemError()
+        }
         const key = tagKey(Number(query.get('upstream_id') ?? '0'), query.get('repository') ?? '')
         return envelope({ list: backend.tags[key] ?? [] })
       }
@@ -358,6 +373,8 @@ beforeEach(async () => {
     },
     imageSize: 50,
     failPurge: null,
+    failImages: false,
+    failTags: false,
   }
   await i18n.changeLanguage('zh-CN')
   stubFetch()
@@ -596,6 +613,24 @@ describe('后台 · 容器镜像', () => {
     backend.images = []
     await renderImages()
     expect(await screen.findByText('没有镜像缓存。')).toBeInTheDocument()
+  })
+
+  it('镜像列表读不出来时给错误提示，不当成没有镜像缓存', async () => {
+    backend.failImages = true
+    await renderImages()
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('镜像列表没有读出来，稍后刷新再试。')
+    expect(screen.queryByText('没有镜像缓存。')).not.toBeInTheDocument()
+  })
+
+  it('展开的镜像读不出 tag 时给错误提示', async () => {
+    backend.failTags = true
+    const table = (await renderImages(), screen.getByRole('table', { name: '容器镜像' }))
+    const redisRow = await within(table).findByRole('row', { name: /docker\.io\/library\/redis/ })
+
+    await userEvent.click(within(redisRow).getByRole('button', { name: /展开/ }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('tag 列表没有读出来，稍后刷新再试。')
   })
 
   it('表格下方常驻体积口径说明', async () => {

@@ -453,6 +453,8 @@ interface Backend {
   failTree: boolean
   /** 让目录搜索出内部错误。 */
   failTreeSearch: boolean
+  /** 让根以下的目录层读取出内部错误，但只在搜索开始之后（搜索结果里按目录清除要单独问合计）。 */
+  failTreeAfterSearch: boolean
 }
 
 let backend: Backend
@@ -550,7 +552,12 @@ function stubFetch() {
         return envelope(ruleTest(String(body.host ?? ''), String(body.path ?? '')))
       }
       if (path === '/api/v1/admin/cache/tree') {
-        if (backend.failTree && (query.get('path') ?? '') !== '') {
+        if (
+          (backend.failTree ||
+            (backend.failTreeAfterSearch &&
+              calls.some((item) => item.url.startsWith('/api/v1/admin/cache/tree/search')))) &&
+          (query.get('path') ?? '') !== ''
+        ) {
           return systemError()
         }
         return envelope(cacheTree(query.get('path') ?? '', Number(query.get('offset') ?? '0')))
@@ -642,6 +649,7 @@ beforeEach(async () => {
     failTreePurge: false,
     failTree: false,
     failTreeSearch: false,
+    failTreeAfterSearch: false,
   }
   await i18n.changeLanguage('zh-CN')
   stubFetch()
@@ -1155,6 +1163,19 @@ describe('后台 · 缓存对象', () => {
     expect(await screen.findByRole('alertdialog')).toHaveTextContent(
       '清除 deb.debian.org/pool/main/g/glibc 下 0 个未固定的对象？'
     )
+  })
+
+  it('搜索结果里的目录清除前问不到合计时给错误提示，不停在一个点不了的确认上', async () => {
+    backend.failTreeAfterSearch = true
+    renderCache()
+
+    const table = await screen.findByRole('table', { name: '缓存对象' })
+    await within(table).findByText('docker.io/')
+    await userEvent.type(screen.getByLabelText('搜索缓存对象'), 'glibc')
+    const glibc = await within(table).findByRole('row', { name: /glibc\/.*匹配 1/ })
+    await userEvent.click(within(glibc).getByRole('button', { name: '清除' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('这一层没有读出来，稍后刷新再试。')
   })
 
   it('路径导航旁的「清除本目录」在根上不出现', async () => {

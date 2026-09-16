@@ -347,6 +347,8 @@
       "upstreamFilter": "Filter by upstream",
       "allUpstreams": "All upstreams",
       "empty": "No cached images yet.",
+      "loadFailed": "The image list could not be loaded. Refresh and try again later.",
+      "tagsFailed": "The tags could not be loaded. Refresh and try again later.",
       "loadMore": "Load more",
       "expand": "Expand {{name}}",
       "collapse": "Collapse {{name}}",
