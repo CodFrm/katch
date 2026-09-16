@@ -221,6 +221,48 @@ func TestProxy_HeadAndConditionalRequestsServedLocally(t *testing.T) {
 	})
 }
 
+// TestProxy_MissPassthroughCarriesMissHeader 由缓存判定而发生的真实回源，即使
+// 不能写缓存，响应头也必须标成 MISS。
+//
+// 规格：缓存未命中、已过期、损坏或 validator 不足而发生的真实回源仍按现有指标与
+// 响应头归为未命中。只靠「没有 HIT」不是「归为 MISS」——运维验证以 X-Katch-Cache
+// 为准，README 也把缺 validator 的那次透传写成 MISS。
+func TestProxy_MissPassthroughCarriesMissHeader(t *testing.T) {
+	convey.Convey("HEAD 无副本与条件请求缺 validator 的透传标 MISS", t, func() {
+		srv, hits := countingOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = io.WriteString(w, "hello world")
+		})
+		upstreamTable(t, &upstream_entity.Upstream{
+			ID: 1, Host: "deb.debian.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+			Origin: srv.URL, Enabled: true,
+			ImmutablePatterns: upstream_entity.PatternList{"/pool/"},
+			MutableTTLSeconds: 60,
+		})
+		withDiskCache(t)
+		const path = "/deb.debian.org/pool/n/nginx.deb"
+
+		// 无副本的 HEAD：真实回源，标 MISS，但不写缓存记录。
+		head := cacheRequest(t, http.MethodHead, path, nil)
+		convey.So(head.Code, convey.ShouldEqual, http.StatusOK)
+		convey.So(head.Header().Get("X-Katch-Cache"), convey.ShouldEqual, "MISS")
+		convey.So(head.Body.Len(), convey.ShouldEqual, 0)
+		convey.So(hits.Load(), convey.ShouldEqual, 1)
+
+		// 先落一份没有 validator 的副本，条件请求就会因缺 validator 而透传。
+		first := cacheRequest(t, http.MethodGet, path, nil)
+		convey.So(first.Code, convey.ShouldEqual, http.StatusOK)
+		convey.So(hits.Load(), convey.ShouldEqual, 2)
+
+		conditional := cacheRequest(t, http.MethodGet, path,
+			http.Header{"If-None-Match": []string{`"v1"`}})
+		convey.So(conditional.Code, convey.ShouldEqual, http.StatusOK)
+		convey.So(conditional.Body.String(), convey.ShouldEqual, "hello world")
+		convey.So(conditional.Header().Get("X-Katch-Cache"), convey.ShouldEqual, "MISS")
+		convey.So(hits.Load(), convey.ShouldEqual, 3)
+	})
+}
+
 // TestProxy_SecondPullIsServedFromDisk
 //
 // 目标 (a)：两次相同拉取只回源一次，第二次由磁盘服务。这条此前只在 cache_svc

@@ -228,8 +228,20 @@ func (c *cacheSvc) Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCl
 	}
 	if !writableRequest(target) {
 		// HEAD 与条件请求未命中（无副本、已过期、副本损坏，或缺少对应 validator）：
-		// 判断交回上游，这一次不留记录。
-		return proxy_svc.Proxy().Fetch(ctx, target)
+		// 判断交回上游，这一次不留记录。它仍是一次由缓存判定发生的真实回源，
+		// 按现有归因标成未命中——只写 X-Katch-Miss 而不写 X-Katch-Cache 的话，
+		// 客户端只看得到「没有 HIT」，无法据此判定这一次回了源。
+		body, meta, err = proxy_svc.Proxy().Fetch(ctx, target)
+		if err != nil {
+			return nil, nil, err
+		}
+		if meta != nil && meta.Header.Get(cacheStatusHeader) != cacheStatusHit {
+			if meta.Header == nil {
+				meta.Header = make(http.Header, 1)
+			}
+			meta.Header.Set(cacheStatusHeader, cacheStatusMiss)
+		}
+		return body, m.stamp(meta), nil
 	}
 	body, meta, err = c.fetchAndCache(ctx, target, upstream, key, immutable)
 	if err != nil {
