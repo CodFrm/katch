@@ -523,7 +523,12 @@ describe('后台 · 访问规则', () => {
     renderAdmin('/admin/upstreams/1/rules')
 
     const table = await screen.findByRole('table', { name: '访问规则' })
-    await within(table).findByText('library/*')
+    expect(table).toHaveClass('table-fixed', 'min-w-[640px]')
+    expect(table.parentElement).toHaveAttribute('data-slot', 'table-container')
+    expect(table.parentElement).toHaveClass('min-w-0', 'overflow-x-auto')
+    const pattern = await within(table).findByText('library/*')
+    expect(pattern).toHaveClass('block', 'truncate')
+    expect(pattern).toHaveAttribute('title', 'library/*')
     const rows = within(table).getAllByRole('row').slice(1)
     expect(rows).toHaveLength(2)
     expect(rows.map((row) => row.textContent).join(' ')).toContain('library/*')
@@ -569,11 +574,16 @@ describe('后台 · 缓存对象', () => {
     renderAdmin('/admin/cache')
 
     const table = await screen.findByRole('table', { name: '缓存对象' })
+    expect(table).toHaveClass('table-fixed', 'min-w-[860px]')
+    expect(table.parentElement).toHaveAttribute('data-slot', 'table-container')
+    expect(table.parentElement).toHaveClass('min-w-0', 'overflow-x-auto')
     expect(within(table).getAllByRole('row').slice(1)).toHaveLength(2)
 
     await userEvent.type(screen.getByLabelText('搜索缓存对象'), 'redis')
 
-    expect(await within(table).findByText('library/redis:7')).toBeInTheDocument()
+    const objectKey = await within(table).findByText('library/redis:7')
+    expect(objectKey).toHaveClass('block', 'truncate')
+    expect(objectKey).toHaveAttribute('title', 'library/redis:7')
     await vi.waitFor(() => {
       expect(within(table).queryByText(/libc6/)).not.toBeInTheDocument()
     })

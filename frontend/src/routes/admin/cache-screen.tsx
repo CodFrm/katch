@@ -5,6 +5,7 @@ import { useSearchParams } from 'react-router-dom'
 
 import { ScreenHeader } from '@/components/admin/admin-shell'
 import { Input } from '@/components/ui/input'
+import { Table } from '@/components/ui/table'
 import { useAdminAction } from '@/hooks/use-admin-action'
 import { useAdminSettings, useCacheObjects, useUpstreamCacheSizes } from '@/hooks/use-admin-data'
 import { pinCacheObject, purgeCache, type AdminUpstreamItem, type CacheObjectItem } from '@/lib/api'
@@ -234,7 +235,7 @@ export function CacheScreen({
           </p>
         )}
 
-        <table aria-label={t('admin.cache.title')} className="w-full text-left">
+        <Table aria-label={t('admin.cache.title')} className="min-w-[860px] table-fixed text-left">
           <thead>
             <tr className="border-border text-ink-3 border-b text-[11px] tracking-[0.12em]">
               <th scope="col" className="w-7 py-2 font-normal">
@@ -272,7 +273,7 @@ export function CacheScreen({
               />
             ))}
           </tbody>
-        </table>
+        </Table>
         {page.data && objects.length === 0 && (
           <p className="text-muted-foreground text-[13px]">{t('admin.cache.empty')}</p>
         )}
@@ -308,20 +309,31 @@ function ObjectRow({
           className="accent-primary size-3"
         />
       </td>
-      <td className="py-2.5">
-        <div className="flex items-baseline gap-2">
-          <span className="text-foreground font-mono text-[13px]">{object.key}</span>
+      <td className="min-w-0 py-2.5">
+        <div className="flex min-w-0 items-baseline gap-2">
+          <span
+            className="text-foreground block min-w-0 flex-1 truncate font-mono text-[13px]"
+            title={object.key}
+          >
+            {object.key}
+          </span>
           {object.digest && (
-            <span className="text-ink-3 font-mono text-[11px]">{shortDigest(object.digest)}</span>
+            <span className="text-ink-3 shrink-0 font-mono text-[11px]">
+              {shortDigest(object.digest)}
+            </span>
           )}
           {object.pinned && (
-            <span className="text-primary border-primary border px-1.5 text-[10.5px]">
+            <span className="text-primary border-primary shrink-0 border px-1.5 text-[10.5px]">
               {t('admin.cache.pinned')}
             </span>
           )}
         </div>
       </td>
-      <td className="text-muted-foreground py-2.5 font-mono text-[13px]">{host}</td>
+      <td className="text-muted-foreground min-w-0 py-2.5 font-mono text-[13px]">
+        <span className="block truncate pr-4" title={host}>
+          {host}
+        </span>
+      </td>
       <td className="text-muted-foreground py-2.5 font-mono text-[13px]">
         {size.value} {size.unit}
       </td>

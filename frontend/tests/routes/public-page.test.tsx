@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react'
+import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -167,7 +167,12 @@ describe('支持的上游', () => {
     stubFetch(allPublic)
     renderPage()
 
-    const rows = await screen.findAllByRole('row')
+    const table = await screen.findByRole('table')
+    expect(table).toHaveClass('table-fixed', 'min-w-[640px]')
+    expect(table.parentElement).toHaveAttribute('data-slot', 'table-container')
+    expect(table.parentElement).toHaveClass('min-w-0', 'overflow-x-auto')
+
+    const rows = within(table).getAllByRole('row')
     const body = rows.slice(1)
     expect(body).toHaveLength(2)
     expect(body[0]).toHaveTextContent('docker.io')
@@ -178,6 +183,10 @@ describe('支持的上游', () => {
     expect(body[1]).toHaveTextContent('deb.debian.org')
     expect(body[1]).toHaveTextContent('静态资源')
     expect(body[1]).toHaveTextContent('限流中')
+
+    const host = within(body[0]).getByText('docker.io')
+    expect(host).toHaveClass('block', 'truncate')
+    expect(host).toHaveAttribute('title', 'docker.io')
   })
 
   it('只渲染接口返回的两种状态，不臆造第三种', async () => {
