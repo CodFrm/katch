@@ -498,6 +498,32 @@ func TestGit_GzippedNegotiationRequest(t *testing.T) {
 			convey.So(gotEncoding, convey.ShouldBeEmpty)
 		})
 
+		convey.Convey("保不开的 gzip 原样交给上游，声明跟着走", func() {
+			var gotBody, gotEncoding string
+			origin := fakeOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+				b, _ := io.ReadAll(r.Body)
+				gotBody = string(b)
+				gotEncoding = r.Header.Get("Content-Encoding")
+				w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
+				_, _ = io.WriteString(w, "0008NAK\n")
+			})
+			gitUpstream(t, origin, upstream_entity.ProtocolStatic, upstream_entity.ProtocolGit)
+			withMirror(t, &fakeMirror{})
+
+			// 声称压过、其实是一个字节都没压的体。
+			bogus := "并不是 gzip 的一体"
+			header := http.Header{}
+			header.Set("Content-Type", "application/x-git-upload-pack-request")
+			header.Set("Content-Encoding", "gzip")
+			w := gitRequest(t, http.MethodPost, uploadPackPath, bogus, header)
+
+			convey.So(w.Code, convey.ShouldEqual, http.StatusOK)
+			// 解不开就不替上游下结论，但声明不能丢：给它一个「声明 gzip、送明文」
+			// 的请求，比把一份解不开的数据原样交给它更槽。
+			convey.So(gotBody, convey.ShouldEqual, bogus)
+			convey.So(gotEncoding, convey.ShouldEqual, "gzip")
+		})
+
 		convey.Convey("本地镜像拿到的是明文，因此照常命中", func() {
 			result := "0008NAK\nPACKDATA"
 			hits := &atomic.Int64{}
