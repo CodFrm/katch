@@ -18,6 +18,7 @@ const MESSAGES: Record<number, string> = {
   10006: 'admin.error.purgeTargetRequired',
   10007: 'admin.error.settingKeyUnknown',
   10008: 'admin.error.settingValueInvalid',
+  10010: 'admin.error.cacheTreePathInvalid',
 }
 
 /**

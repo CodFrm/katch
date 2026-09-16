@@ -392,12 +392,66 @@ export interface CacheObjectItem {
   updatetime: number
 }
 
-/** 缓存搜索的一页。page/size 是后端归一化之后的值，分页器按它画。 */
-export interface CacheSearchResult {
-  list: CacheObjectItem[]
-  total: number
-  page: number
+/** 目录树里的缓存对象：比对象搜索多一个主机名。 */
+export interface CacheTreeObjectItem extends CacheObjectItem {
+  host: string
+}
+
+/**
+ * 目录树一层里的一个子项，取值与后端 api/admin.CacheTreeNode 一致。
+ *
+ * 目录行的 count/size/last_access_at 是其下（递归）全部对象的合计；对象行的数字
+ * 看 object。name 已经去掉了变体段，variant 表示它是同一路径按 Accept 分出的变体之一。
+ */
+export type CacheTreeNode =
+  | {
+      kind: 'dir'
+      name: string
+      path: string
+      count: number
+      pinned_count: number
+      size: number
+      last_access_at: number
+    }
+  | { kind: 'object'; name: string; path: string; variant: boolean; object: CacheTreeObjectItem }
+
+/** 目录树的一层：子项（目录在前、对象在后）、当前目录的合计与下一批从哪儿接。 */
+export interface CacheTreeResult {
+  path: string
+  total_count: number
+  total_pinned: number
+  total_size: number
+  children: CacheTreeNode[]
+  has_more: boolean
+  next_offset: number
+}
+
+/** 目录搜索匹配到的一个对象。 */
+export interface CacheTreeSearchObject {
+  name: string
+  path: string
+  variant: boolean
+  object: CacheTreeObjectItem
+}
+
+/** 匹配对象的一个上级目录：全部对象与其中匹配部分的合计；name_match 是目录名本身含关键字。 */
+export interface CacheTreeSearchDir {
+  path: string
+  name_match: boolean
+  count: number
   size: number
+  matched_count: number
+  matched_size: number
+  last_access_at: number
+}
+
+/** 目录搜索的结果：objects 至多一批，matched 是匹配总数，超出时 truncated 为真。 */
+export interface CacheTreeSearchResult {
+  path: string
+  matched: number
+  truncated: boolean
+  objects: CacheTreeSearchObject[]
+  dirs: CacheTreeSearchDir[]
 }
 
 /** 清缓存清掉了几条、因为被固定而留下几条。 */
@@ -487,19 +541,24 @@ export function saveUpstream(key: string, upstream: UpstreamDraft) {
     : adminSend<{ id: number }>('/api/v1/admin/upstreams', key, 'POST', spec)
 }
 
-export function searchCacheObjects(
-  key: string,
-  query: { keyword: string; upstreamID: number; page: number },
-  signal?: AbortSignal
-) {
-  const params = new URLSearchParams({ page: String(query.page) })
-  if (query.keyword) {
-    params.set('keyword', query.keyword)
+/** 目录树的一层。path 为空是根（有缓存对象的上游主机），offset 取上一批的 next_offset。 */
+export function fetchCacheTree(key: string, path: string, offset: number, signal?: AbortSignal) {
+  const params = new URLSearchParams({ path })
+  if (offset > 0) {
+    params.set('offset', String(offset))
   }
-  if (query.upstreamID > 0) {
-    params.set('upstream_id', String(query.upstreamID))
-  }
-  return adminGet<CacheSearchResult>(`/api/v1/admin/cache/objects?${params}`, key, signal)
+  return adminGet<CacheTreeResult>(`/api/v1/admin/cache/tree?${params}`, key, signal)
+}
+
+/** 在一个目录下按路径做不区分大小写的子串搜索。 */
+export function searchCacheTree(key: string, path: string, keyword: string, signal?: AbortSignal) {
+  const params = new URLSearchParams({ path, keyword })
+  return adminGet<CacheTreeSearchResult>(`/api/v1/admin/cache/tree/search?${params}`, key, signal)
+}
+
+/** 按目录清除：清掉 path 下（递归到底）全部未固定的对象，固定过的报在 skipped 里。 */
+export function purgeCacheTree(key: string, path: string) {
+  return adminSend<PurgeResult>('/api/v1/admin/cache/tree/purge', key, 'POST', { path })
 }
 
 /** 清缓存：给 id 清一条，给 upstreamID 清整个上游（固定过的会留下）。 */

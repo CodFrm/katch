@@ -206,7 +206,8 @@
       "cacheObjectNotFound": "That cache object is gone.",
       "purgeTargetRequired": "Say which object or which upstream to purge.",
       "settingKeyUnknown": "One setting is unknown to this katch — the UI may be newer than the backend.",
-      "settingValueInvalid": "One setting has a value outside the allowed range. Fix it and save again."
+      "settingValueInvalid": "One setting has a value outside the allowed range. Fix it and save again.",
+      "cacheTreePathInvalid": "That directory path is invalid. Refresh and try again."
     },
     "rules": {
       "title": "Access rules",
@@ -272,9 +273,8 @@
       "quota": "/ quota {{size}}",
       "watermark": "LRU reclaim starts at {{percent}}%",
       "search": "Search cache objects",
-      "searchPlaceholder": "library/*",
+      "searchPlaceholder": "Search paths under this directory",
       "found": "{{total}} found",
-      "filterUpstream": "Filter by upstream",
       "allUpstreams": "All upstreams",
       "selected": "{{total}} selected",
       "purge": "Purge",
@@ -287,12 +287,29 @@
       "purged": "Purged {{removed}} object(s)",
       "purgedWithSkipped": "Purged {{removed}} object(s); {{skipped}} pinned one(s) stayed",
       "columns": {
-        "object": "Object",
-        "upstream": "Upstream",
+        "name": "Name",
+        "count": "Objects",
         "size": "Size",
         "hits": "Hits",
         "lastAccess": "Last access",
         "operations": "Actions"
+      },
+      "tree": {
+        "crumbs": "Directory path",
+        "summary": "{{count}} objects · {{size}}",
+        "expand": "Expand {{name}}",
+        "collapse": "Collapse {{name}}",
+        "enter": "Open {{name}}",
+        "variant": "Variant",
+        "loadMore": "Load more",
+        "emptyDir": "No cached objects under this directory.",
+        "matched": "{{count}} matched",
+        "truncated": "Showing only the first {{shown}} matches. Type a more specific path or open a directory first.",
+        "purgeDir": "Purge this directory",
+        "purgeQuestion": "Purge {{count}} unpinned object(s) under {{path}}?",
+        "purgeConfirm": "Confirm purge",
+        "purgeCancel": "Cancel",
+        "purged": "Purged {{removed}}, skipped {{skipped}} pinned"
       }
     },
     "git": {
