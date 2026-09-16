@@ -144,6 +144,45 @@ func TestCacheTreeRejectsBadInput(t *testing.T) {
 	})
 }
 
+// TestCacheTreePurge 按目录清除的对外形态：未 pin 对象被清、pin 的跳过并报数。
+func TestCacheTreePurge(t *testing.T) {
+	cacheRepo, testMux, _ := setupCacheTest(t)
+	upRepo := registerUpstreams(t)
+	convey.Convey("按目录清除，跳过 pin 的对象并报数", t, func() {
+		upRepo.EXPECT().FindByHost(gomock.Any(), "deb.debian.org").
+			Return(&upstream_entity.Upstream{ID: 8, Host: "deb.debian.org"}, nil)
+		cacheRepo.EXPECT().ListByPrefix(gomock.Any(), int64(8), "/pool/").Return(
+			[]*cache_entity.CacheObject{
+				{ID: 1, UpstreamID: 8, Key: "/pool/keep.deb", Digest: "sha256:keep", Pinned: true},
+				{ID: 2, UpstreamID: 8, Key: "/pool/drop.deb", Digest: "sha256:drop"},
+			}, nil)
+		// 只有未 pin 的那条会被删；Delete(1) 会让用例当场失败。
+		cacheRepo.EXPECT().Delete(gomock.Any(), int64(2)).Return(nil)
+
+		resp := &admin.CacheTreePurgeResponse{}
+		convey.So(testMux.Do(context.Background(), &admin.CacheTreePurgeRequest{Path: "deb.debian.org/pool"},
+			resp, adminHeader(adminKey)), convey.ShouldBeNil)
+		convey.So(resp.Removed, convey.ShouldEqual, 1)
+		convey.So(resp.Skipped, convey.ShouldEqual, 1)
+	})
+}
+
+// TestCacheTreePurgeRejectsBadInput 根路径与非法路径一律 400，且不碰任何仓储。
+func TestCacheTreePurgeRejectsBadInput(t *testing.T) {
+	// cacheRepo 上没有 EXPECT：校验一旦漏放行，mock 会当场失败。
+	_, testMux, _ := setupCacheTest(t)
+	registerUpstreams(t)
+	convey.Convey("非法参数一律 400，不删任何东西", t, func() {
+		for _, path := range []string{"", "deb.debian.org/../etc", "..", "deb.debian.org//pool",
+			"/deb.debian.org", "deb.debian.org/", strings.Repeat("a", 1025)} {
+			err := testMux.Do(context.Background(), &admin.CacheTreePurgeRequest{Path: path},
+				&admin.CacheTreePurgeResponse{}, adminHeader(adminKey))
+			convey.So(err, convey.ShouldNotBeNil)
+			convey.So(statusOf(t, err), convey.ShouldEqual, http.StatusBadRequest)
+		}
+	})
+}
+
 // TestCacheTreeAuth 目录树与搜索和其余管理接口同一道密钥闸。
 func TestCacheTreeAuth(t *testing.T) {
 	_, testMux, engine := setupCacheTest(t)
@@ -152,6 +191,7 @@ func TestCacheTreeAuth(t *testing.T) {
 		for _, req := range []any{
 			&admin.CacheTreeRequest{Path: "deb.debian.org"},
 			&admin.CacheTreeSearchRequest{Keyword: "redis"},
+			&admin.CacheTreePurgeRequest{Path: "deb.debian.org"},
 		} {
 			httpReq, err := testMux.Request(context.Background(), req)
 			convey.So(err, convey.ShouldBeNil)

@@ -131,6 +131,8 @@ type CacheSvc interface {
 	Tree(ctx context.Context, req *TreeRequest) (*TreeResponse, error)
 	// TreeSearch 在目录树的一个目录下搜索对象，见 tree.go。
 	TreeSearch(ctx context.Context, req *TreeSearchRequest) (*TreeSearchResponse, error)
+	// TreePurge 按目录路径清除缓存对象，见 tree.go。
+	TreePurge(ctx context.Context, req *TreePurgeRequest) (*TreePurgeResponse, error)
 	// Sweep 收走已经过期的可变对象，返回收走了几条，然后按当下的配额回收一次。
 	//
 	// 「可变对象由 TTL 自行过期」（缓存一节）在读路径上只做到了「过期的不再命中」；

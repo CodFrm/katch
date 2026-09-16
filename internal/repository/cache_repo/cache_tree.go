@@ -173,6 +173,20 @@ func (c *cacheObjectRepo) SearchTree(ctx context.Context, opt *cache_entity.Tree
 	return list, total, nil
 }
 
+// ListByPrefix 前缀下（递归到底）全部对象：与 ListTreeObjects 相比不排除子目录，
+// 按目录清除要连子目录里的对象一起收走。
+func (c *cacheObjectRepo) ListByPrefix(ctx context.Context, upstreamID int64, prefix string) ([]*cache_entity.CacheObject, error) {
+	where, whereArgs, err := treePrefix(upstreamID, prefix)
+	if err != nil {
+		return nil, err
+	}
+	list := make([]*cache_entity.CacheObject, 0)
+	if err := db.Ctx(ctx).Where(where, whereArgs...).Find(&list).Error; err != nil {
+		return nil, err
+	}
+	return list, nil
+}
+
 func (c *cacheObjectRepo) StatTreeMatch(ctx context.Context, opt *cache_entity.TreeMatchOption) (*cache_entity.TreeMatchStat, error) {
 	where, whereArgs, err := treePrefix(opt.UpstreamID, opt.Prefix)
 	if err != nil {

@@ -274,6 +274,20 @@ func newFakeRepo(t *testing.T, stampAccess bool) *fakeRepo {
 			}
 			return list, nil
 		})
+	// ListByPrefix 供按目录清除用：和真实实现一样按「键以前缀开头」匹配，
+	// 不排除子目录里的对象——这正是按目录清除要连子目录一起收走的地方。
+	m.EXPECT().ListByPrefix(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().
+		DoAndReturn(func(_ any, upstreamID int64, prefix string) ([]*cache_entity.CacheObject, error) {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			list := make([]*cache_entity.CacheObject, 0)
+			for _, row := range f.rows {
+				if row.UpstreamID == upstreamID && strings.HasPrefix(row.Key, prefix) {
+					list = append(list, clone(row))
+				}
+			}
+			return list, nil
+		})
 	// 用完还原。cache_repo 的注册是进程级的一份，只写不还的话，用例之间就靠
 	// 「谁后跑谁说了算」联系在一起：这个用例留下的后台协程会拿着**下一个**用例的
 	// 仓储去读写，而两边的断言各自看起来都还成立。由 harness_test.go 守着。

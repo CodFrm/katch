@@ -135,6 +135,15 @@ func (c *Cache) TreeSearch(ctx context.Context, req *admin.CacheTreeSearchReques
 	return resp, nil
 }
 
+// TreePurge 按目录路径清除缓存对象：跳过被 pin 的对象并报出跳过条数。
+func (c *Cache) TreePurge(ctx context.Context, req *admin.CacheTreePurgeRequest) (*admin.CacheTreePurgeResponse, error) {
+	result, err := cache_svc.Cache().TreePurge(ctx, &cache_svc.TreePurgeRequest{Path: req.Path})
+	if err != nil {
+		return nil, err
+	}
+	return &admin.CacheTreePurgeResponse{Removed: result.Removed, Skipped: result.Skipped}, nil
+}
+
 func toTreeItem(object *cache_entity.CacheObject, host string) *admin.CacheTreeObjectItem {
 	return &admin.CacheTreeObjectItem{CacheObjectItem: *toItem(object), Host: host}
 }

@@ -156,6 +156,29 @@ func TestCacheObjectRepo_SearchTree(t *testing.T) {
 	})
 }
 
+func TestCacheObjectRepo_ListByPrefix(t *testing.T) {
+	convey.Convey("按前缀取整棵子树下的全部对象（不排除子目录），供按目录清除用", t, func() {
+		ctx, _, mock := testutils.Database(t)
+		mock.ExpectQuery("SELECT \\* FROM `cache_objects` WHERE "+prefixWhere+"$").
+			WithArgs(int64(7), "/pool/", "/pool0", "/pool/%").
+			WillReturnRows(sqlmock.NewRows([]string{"id", "key"}).
+				AddRow(1, "/pool/a.deb").AddRow(2, "/pool/main/b.deb"))
+
+		got, err := NewCacheObject().ListByPrefix(ctx, 7, "/pool/")
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(len(got), convey.ShouldEqual, 2)
+		convey.So(got[0].Key, convey.ShouldEqual, "/pool/a.deb")
+		convey.So(got[1].Key, convey.ShouldEqual, "/pool/main/b.deb")
+		convey.So(mock.ExpectationsWereMet(), convey.ShouldBeNil)
+	})
+
+	convey.Convey("前缀必须以 / 开头和结尾，否则上界算不出来", t, func() {
+		ctx, _, _ := testutils.Database(t)
+		_, err := NewCacheObject().ListByPrefix(ctx, 7, "/pool")
+		convey.So(err, convey.ShouldEqual, ErrTreePrefix)
+	})
+}
+
 func TestCacheObjectRepo_StatTreeMatch(t *testing.T) {
 	convey.Convey("搜索结果里一个目录的合计与命中部分的合计", t, func() {
 		ctx, _, mock := testutils.Database(t)

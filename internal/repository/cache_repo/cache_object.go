@@ -71,6 +71,8 @@ type CacheObjectRepo interface {
 	SearchTree(ctx context.Context, opt *cache_entity.TreeSearchOption) ([]*cache_entity.CacheObject, int64, error)
 	// StatTreeMatch 搜索结果里一个目录的合计与命中部分的合计。
 	StatTreeMatch(ctx context.Context, opt *cache_entity.TreeMatchOption) (*cache_entity.TreeMatchStat, error)
+	// ListByPrefix 前缀下（递归到底，不排除子目录）全部对象，供按目录清除用。
+	ListByPrefix(ctx context.Context, upstreamID int64, prefix string) ([]*cache_entity.CacheObject, error)
 }
 
 var defaultCacheObject CacheObjectRepo

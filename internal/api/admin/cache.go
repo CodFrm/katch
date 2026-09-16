@@ -161,3 +161,19 @@ type CacheTreeSearchResponse struct {
 	Objects   []*CacheTreeSearchObject `json:"objects"`
 	Dirs      []*CacheTreeSearchDir    `json:"dirs"`
 }
+
+// CacheTreePurgeRequest 按目录路径清除缓存对象：清掉 Path 下（递归到底）全部
+// 未 pin 的对象。Path 必填——根路径横跨全部上游，不给「清空一切」留一个只填
+// 根路径就能触发的形态；`..`、空段、超长同 CacheTreeRequest 一样按参数错误拒绝。
+type CacheTreePurgeRequest struct {
+	mux.Meta `path:"/admin/cache/tree/purge" method:"POST"`
+	Path     string `json:"path" binding:"required,max=1024" label:"目录"`
+}
+
+// CacheTreePurgeResponse 清掉了几条、跳过了几条已固定的对象。
+type CacheTreePurgeResponse struct {
+	Removed int64 `json:"removed"`
+	// Skipped 因为被 pin 而留下的条数。不报出来的话，界面只能说「清了 N 条」，
+	// 看不出还有几条留在那里。
+	Skipped int64 `json:"skipped"`
+}

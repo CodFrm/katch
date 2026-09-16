@@ -160,6 +160,21 @@ func (mr *MockCacheObjectRepoMockRecorder) FindByKey(ctx, upstreamID, key any) *
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "FindByKey", reflect.TypeOf((*MockCacheObjectRepo)(nil).FindByKey), ctx, upstreamID, key)
 }
 
+// ListByPrefix mocks base method.
+func (m *MockCacheObjectRepo) ListByPrefix(ctx context.Context, upstreamID int64, prefix string) ([]*cache_entity.CacheObject, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ListByPrefix", ctx, upstreamID, prefix)
+	ret0, _ := ret[0].([]*cache_entity.CacheObject)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ListByPrefix indicates an expected call of ListByPrefix.
+func (mr *MockCacheObjectRepoMockRecorder) ListByPrefix(ctx, upstreamID, prefix any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListByPrefix", reflect.TypeOf((*MockCacheObjectRepo)(nil).ListByPrefix), ctx, upstreamID, prefix)
+}
+
 // ListByUpstream mocks base method.
 func (m *MockCacheObjectRepo) ListByUpstream(ctx context.Context, upstreamID int64) ([]*cache_entity.CacheObject, error) {
 	m.ctrl.T.Helper()

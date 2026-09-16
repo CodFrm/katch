@@ -8,6 +8,7 @@ import (
 
 	"github.com/cago-frame/cago/pkg/i18n"
 
+	"github.com/CodFrm/katch/internal/metrics"
 	"github.com/CodFrm/katch/internal/model/entity/cache_entity"
 	"github.com/CodFrm/katch/internal/pkg/code"
 	"github.com/CodFrm/katch/internal/repository/cache_repo"
@@ -66,6 +67,21 @@ type TreeResponse struct {
 	Children    []*TreeNode
 	HasMore     bool
 	NextOffset  int
+}
+
+// TreePurgeRequest 按目录路径清除缓存对象（决策 6）。
+//
+// 根路径（空串）不是一个合法目标：它横跨全部上游，清它等于清空整个缓存，
+// 不给「清空一切」留一个只填根路径就能触发的形态，语义同 Purge 对「两个
+// 目标都不给」的拒绝。
+type TreePurgeRequest struct {
+	Path string
+}
+
+// TreePurgeResponse 清掉了几条，以及因为被 pin 而跳过了几条。
+type TreePurgeResponse struct {
+	Removed int64
+	Skipped int64
 }
 
 // TreeSearchRequest 在目录下搜索。
@@ -283,6 +299,48 @@ func (c *cacheSvc) TreeSearch(ctx context.Context, req *TreeSearchRequest) (*Tre
 		})
 	}
 	return resp, nil
+}
+
+// TreePurge 清除一个目录路径下（递归到底）全部未 pin 的对象，复用 Purge 的删除
+// 循环（Delete → forgot.remember → removeIfUnreferenced → metrics.RecordEviction）：
+// 按目录清除和按上游清除是同一套「跳过 pin、内容无引用才删文件」的语义。
+func (c *cacheSvc) TreePurge(ctx context.Context, req *TreePurgeRequest) (*TreePurgeResponse, error) {
+	segments, err := parseTreePath(ctx, req.Path)
+	if err != nil {
+		return nil, err
+	}
+	if len(segments) == 0 {
+		return nil, i18n.NewError(ctx, code.CacheTreePathInvalid)
+	}
+	upstream, err := upstream_repo.Upstream().FindByHost(ctx, segments[0])
+	if err != nil {
+		return nil, err
+	}
+	if upstream == nil {
+		// 指向不存在目录的清除相当于空操作，不算错误，同 Tree 对空目录的处理。
+		return &TreePurgeResponse{}, nil
+	}
+	objects, err := cache_repo.CacheObject().ListByPrefix(ctx, upstream.ID, treeKeyPrefix(segments))
+	if err != nil {
+		return nil, err
+	}
+	removed, skipped := int64(0), int64(0)
+	for _, object := range objects {
+		if object.Pinned {
+			skipped++
+			continue
+		}
+		if err := cache_repo.CacheObject().Delete(ctx, object.ID); err != nil {
+			return nil, err
+		}
+		c.forgot.remember(object.UpstreamID, object.Key, metrics.MissFirst)
+		if c.store != nil {
+			c.removeIfUnreferenced(ctx, object.Digest)
+		}
+		removed++
+	}
+	metrics.RecordEviction(metrics.EvictionManual, removed)
+	return &TreePurgeResponse{Removed: removed, Skipped: skipped}, nil
 }
 
 // parseTreePath 把对外路径拆成段。空串是根；以 / 开头或结尾、含空段或 ..、超长的

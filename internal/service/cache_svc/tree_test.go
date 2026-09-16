@@ -241,6 +241,39 @@ func TestTree_EmptyAndInvalid(t *testing.T) {
 	})
 }
 
+// TestTreePurge_RejectsBadPath 根路径与非法路径一律拒绝，且不碰任何仓储——
+// mock 对没 EXPECT 过的调用会当场失败，这就是「不删任何东西」的断言。
+func TestTreePurge_RejectsBadPath(t *testing.T) {
+	convey.Convey("根路径不是一个可以按目录清除的目标", t, func() {
+		svc, _, _ := setupTree(t)
+		_, err := svc.TreePurge(context.Background(), &TreePurgeRequest{Path: ""})
+		shouldBeTreeCode(err, code.CacheTreePathInvalid)
+	})
+
+	convey.Convey("..、空段与超长路径按参数错误拒绝，不查库", t, func() {
+		svc, _, _ := setupTree(t)
+		for _, path := range []string{"..", "deb.debian.org/../x", "/deb.debian.org", "deb.debian.org/",
+			"deb.debian.org//pool", strings.Repeat("a", maxTreePathLen+1)} {
+			_, err := svc.TreePurge(context.Background(), &TreePurgeRequest{Path: path})
+			shouldBeTreeCode(err, code.CacheTreePathInvalid)
+		}
+	})
+}
+
+// TestTreePurge_UnknownHostIsNoop 指向不存在的上游（例如已经被并发清空）不算错误，
+// 只是清不掉任何东西，与 Tree 对空目录的处理一致。
+func TestTreePurge_UnknownHostIsNoop(t *testing.T) {
+	convey.Convey("主机不存在时是空操作", t, func() {
+		svc, _, upRepo := setupTree(t)
+		upRepo.EXPECT().FindByHost(gomock.Any(), "gone.example").Return(nil, nil)
+
+		resp, err := svc.TreePurge(context.Background(), &TreePurgeRequest{Path: "gone.example/x"})
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(resp.Removed, convey.ShouldEqual, 0)
+		convey.So(resp.Skipped, convey.ShouldEqual, 0)
+	})
+}
+
 // matchRecorder 记下 StatTreeMatch 被问过哪些目录，按前缀给出合计。
 type matchRecorder struct {
 	mu   sync.Mutex
