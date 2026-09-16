@@ -313,12 +313,10 @@ func rangeRequest(target *proxy_svc.Target) bool {
 // 回答但没标」。
 //
 // git 的应答不在这里标：它自己带 X-Katch-Git，一次协商结果不是一个对象（见 web
-// 包的同名说明）；上游已经是 HIT 时也不盖，那一句说的是上游那一跳。
+// 包的同名说明）。上游带来的缓存状态必须覆盖：这里确实发生了真实回源，本跳只能
+// 归为 MISS，否则上游的 HIT 会冒充成本地回答。
 func rangePassthroughMiss(target *proxy_svc.Target, meta *proxy_svc.Meta) *proxy_svc.Meta {
 	if meta == nil || target.Git.IsGit() || !rangeRequest(target) {
-		return meta
-	}
-	if meta.Header.Get(cacheStatusHeader) == cacheStatusHit {
 		return meta
 	}
 	if meta.Header == nil {

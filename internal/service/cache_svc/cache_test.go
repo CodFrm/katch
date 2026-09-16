@@ -785,6 +785,24 @@ func TestGet_RangeAndIfRangePassThroughMarkMiss(t *testing.T) {
 		})
 	}
 
+	convey.Convey("上游 HIT 不能冒充本地命中", t, func() {
+		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set(cacheStatusHeader, cacheStatusHit)
+			_, _ = io.WriteString(w, payload)
+		})
+		svc, _, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+		tg := target("deb.debian.org", "/pool/upstream-hit.deb")
+		tg.Header.Set("Range", "bytes=0-4")
+
+		body, meta, err := svc.Get(context.Background(), tg)
+		convey.So(err, convey.ShouldBeNil)
+		_, _ = io.ReadAll(body)
+		convey.So(body.Close(), convey.ShouldBeNil)
+		// 这台 katch 确实回了源；上游自己的缓存状态不能改变本跳归因。
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusMiss)
+		convey.So(o.hits.Load(), convey.ShouldEqual, 1)
+	})
+
 	convey.Convey("没有副本时 Range 与 If-Range 就标 MISS", t, func() {
 		o := origin()
 		svc, repo, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
