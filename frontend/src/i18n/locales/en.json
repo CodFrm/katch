@@ -194,7 +194,20 @@
         "defaultPolicy": "Default policy",
         "note": "Note",
         "save": "Save upstream",
-        "cancel": "Cancel"
+        "cancel": "Cancel",
+        "cachePolicy": "Cache policy",
+        "cachePolicyHint": "A preset only fills the patterns below; the saved request carries the patterns, not the preset name.",
+        "immutablePatterns": "Immutable path patterns",
+        "mutableTTL": "Mutable object TTL (seconds)",
+        "mutableTTLHint": "0 means the global default TTL.",
+        "ttlInvalid": "TTL must be a non-negative integer"
+      },
+      "preset": {
+        "custom": "Custom",
+        "apt": "APT packages",
+        "go": "Go module proxy",
+        "git": "Git commit static files",
+        "pypi": "PyPI files"
       }
     },
     "error": {

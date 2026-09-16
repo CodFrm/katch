@@ -194,7 +194,20 @@
         "defaultPolicy": "默认策略",
         "note": "备注",
         "save": "保存上游",
-        "cancel": "取消"
+        "cancel": "取消",
+        "cachePolicy": "缓存策略",
+        "cachePolicyHint": "预设只填下面的模式；保存的是模式本身，不保存预设名称。",
+        "immutablePatterns": "不可变路径模式",
+        "mutableTTL": "可变对象 TTL（秒）",
+        "mutableTTLHint": "0 表示使用全局默认 TTL。",
+        "ttlInvalid": "TTL 必须是不小于 0 的整数"
+      },
+      "preset": {
+        "custom": "自定义",
+        "apt": "APT 软件包",
+        "go": "Go Module Proxy",
+        "git": "Git commit 静态文件",
+        "pypi": "PyPI 文件"
       }
     },
     "error": {
