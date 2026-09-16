@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/cago-frame/cago/pkg/logger"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/CodFrm/katch/internal/metrics"
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
+	"github.com/CodFrm/katch/internal/proxy/destination"
 	"github.com/CodFrm/katch/internal/proxy/dispatch"
 	"github.com/CodFrm/katch/internal/proxy/origin"
 	"github.com/CodFrm/katch/internal/proxy/registry"
@@ -86,6 +88,10 @@ type Gate interface {
 type Options struct {
 	// Gate 退避闸。nil 表示不退避，一律放行。
 	Gate Gate
+	// RewriteConfig 提供目标白名单的同版本快照。
+	RewriteConfig RewriteConfigSource
+	// DestinationResolver 可由测试替换；nil 时从 RewriteConfig 构造。
+	DestinationResolver destination.DestinationResolver
 	// Runtime 运行时设置的来源，nil 表示进程级的那一个（setting_svc）。
 	//
 	// 回源并发上限、上游超时与重试次数都从这里现读，不在构造时抄成字段：
@@ -125,17 +131,52 @@ func (p *proxySvc) metrics() *metrics.Recorder {
 
 // New 构造拉取路径的业务层。
 func New(opt Options) ProxySvc {
-	client := origin.New()
+	if opt.RewriteConfig == nil {
+		opt.RewriteConfig = NewRewriteConfigSource()
+	}
+	if opt.DestinationResolver == nil {
+		opt.DestinationResolver = destination.New(destination.Options{
+			Source: destinationConfigSource{source: opt.RewriteConfig},
+		})
+	}
+	client := origin.New(origin.Options{Resolver: opt.DestinationResolver})
 	if opt.Runtime == nil {
 		opt.Runtime = setting_svc.Setting()
 	}
 	return &proxySvc{
-		origin:   client,
-		registry: registry.New(registry.Options{Origin: client, Metrics: opt.Metrics}),
+		origin: client,
+		registry: registry.New(registry.Options{
+			Origin: client, Resolver: opt.DestinationResolver, Metrics: opt.Metrics,
+		}),
 		gate:     opt.Gate,
 		runtime:  opt.Runtime,
 		recorder: opt.Metrics,
 	}
+}
+
+type destinationConfigSource struct {
+	source RewriteConfigSource
+}
+
+func (s destinationConfigSource) Snapshot(ctx context.Context) (*destination.RewriteSnapshot, error) {
+	snapshot, err := s.source.Snapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if snapshot == nil {
+		return nil, nil
+	}
+	out := &destination.RewriteSnapshot{
+		Upstreams: make(map[string]destination.RewriteUpstream, len(snapshot.Upstreams)),
+	}
+	for host, upstream := range snapshot.Upstreams {
+		host = strings.ToLower(strings.TrimSuffix(host, "."))
+		out.Upstreams[host] = destination.RewriteUpstream{
+			Profile:    upstream.Profile,
+			Transports: append(upstream_entity.ProtocolSet(nil), upstream.Transports...),
+		}
+	}
+	return out, nil
 }
 
 var defaultProxy = New(Options{})
@@ -348,6 +389,7 @@ func (p *proxySvc) fetchWithRetry(ctx context.Context, target *Target,
 func (p *proxySvc) fetchUpstream(
 	ctx context.Context, target *Target, upstream *upstream_entity.Upstream,
 ) (*origin.Response, error) {
+	requirement := destinationRequirement(target, upstream)
 	if target.Kind == dispatch.KindRegistry {
 		return p.registry.Do(ctx, &registry.Request{
 			Host:              target.Host,
@@ -357,6 +399,7 @@ func (p *proxySvc) fetchUpstream(
 			Method:            target.Method,
 			Header:            target.Header,
 			LibraryCompletion: upstream.LibraryCompletion,
+			Requirement:       requirement,
 		})
 	}
 	return p.origin.Do(ctx, &origin.Request{
@@ -367,7 +410,29 @@ func (p *proxySvc) fetchUpstream(
 		Header:        target.Header,
 		Body:          target.Body,
 		ContentLength: target.ContentLength,
+		Requirement:   requirement,
 	})
+}
+
+func destinationRequirement(
+	target *Target, upstream *upstream_entity.Upstream,
+) destination.DestinationRequirement {
+	requirement := destination.DestinationRequirement{AddressPolicy: destination.AllowPrivateAddresses}
+	switch target.Kind {
+	case dispatch.KindRegistry:
+		requirement.Transport = upstream_entity.ProtocolRegistry
+	case dispatch.KindStatic:
+		if target.Git.IsGit() {
+			requirement.Transport = upstream_entity.ProtocolGit
+		} else {
+			requirement.Transport = upstream_entity.ProtocolStatic
+		}
+		requirement.Profile = upstream_entity.NormalizePackageProfile(upstream.PackageProfile)
+		if requirement.Profile != upstream_entity.PackageProfileNone {
+			requirement.AddressPolicy = destination.PublicAddressesOnly
+		}
+	}
+	return requirement
 }
 
 // protocolMatches 校验请求形态所需的协议，这条上游开没开。

@@ -2,15 +2,20 @@ package registry
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/smartystreets/goconvey/convey"
+
+	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
+	"github.com/CodFrm/katch/internal/proxy/destination"
 )
 
 // TestUpstreamPath 路径补全是纯函数，穷举着测。
@@ -121,12 +126,29 @@ func read(t *testing.T, body io.ReadCloser) string {
 	return string(b)
 }
 
+type localResolver struct{}
+
+func (localResolver) Resolve(
+	_ context.Context, target *url.URL, _ destination.DestinationRequirement,
+) (*destination.ResolvedTarget, error) {
+	cloned := *target
+	return &destination.ResolvedTarget{URL: &cloned, Authority: target.Host, Host: target.Host,
+		ServerName: target.Hostname(), DialAddress: target.Host}, nil
+}
+
+func testAdapter(opt Options) *Adapter {
+	if opt.Resolver == nil {
+		opt.Resolver = localResolver{}
+	}
+	return New(opt)
+}
+
 // TestDo_ClientCredentialsAreNeverForwarded 决策 11 的那一半：katch 换来的 token
 // 出去了，客户端自己的 Authorization 一个字节都不许出去。
 func TestDo_ClientCredentialsAreNeverForwarded(t *testing.T) {
 	convey.Convey("上游看见的只有 katch 换来的 token", t, func() {
 		f := newFakeUpstream(t, "", http.StatusOK, 300)
-		resp, err := New(Options{}).Do(context.Background(), f.request())
+		resp, err := testAdapter(Options{}).Do(context.Background(), f.request())
 
 		convey.So(err, convey.ShouldBeNil)
 		convey.So(resp.StatusCode, convey.ShouldEqual, http.StatusOK)
@@ -148,7 +170,7 @@ func TestDo_StripsChallengeOnAnyStatus(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		resp, err := New(Options{}).Do(context.Background(), &Request{
+		resp, err := testAdapter(Options{}).Do(context.Background(), &Request{
 			Host: "ghcr.io", Origin: srv.URL, Path: "/o/r/manifests/7", Method: http.MethodGet,
 		})
 		convey.So(err, convey.ShouldBeNil)
@@ -184,7 +206,7 @@ func TestDo_UnusableChallenge(t *testing.T) {
 				}))
 				defer srv.Close()
 
-				resp, err := New(Options{}).Do(context.Background(), &Request{
+				resp, err := testAdapter(Options{}).Do(context.Background(), &Request{
 					Host: "reg.example.com", Origin: srv.URL,
 					Path: "/o/r/manifests/7", Method: http.MethodGet,
 				})
@@ -207,7 +229,7 @@ func TestDo_StillUnauthorizedAfterExchange(t *testing.T) {
 		f := newFakeUpstream(t, "", http.StatusOK, 300)
 		f.acceptAuth.Store(false)
 
-		resp, err := New(Options{}).Do(context.Background(), f.request())
+		resp, err := testAdapter(Options{}).Do(context.Background(), f.request())
 		convey.So(err, convey.ShouldBeNil)
 		convey.So(resp.StatusCode, convey.ShouldEqual, http.StatusForbidden)
 		convey.So(resp.Header.Get("WWW-Authenticate"), convey.ShouldBeBlank)
@@ -227,7 +249,7 @@ func TestDo_TokenEndpointFailureIsAFetchError(t *testing.T) {
 	convey.Convey("鉴权端点出错时返回 error", t, func() {
 		f := newFakeUpstream(t, "", http.StatusInternalServerError, 300)
 
-		resp, err := New(Options{}).Do(context.Background(), f.request())
+		resp, err := testAdapter(Options{}).Do(context.Background(), f.request())
 		convey.So(err, convey.ShouldNotBeNil)
 		convey.So(resp, convey.ShouldBeNil)
 	})
@@ -238,7 +260,7 @@ func TestDo_TokenIsReusedUntilItExpires(t *testing.T) {
 	convey.Convey("token 按（上游、仓库、scope）缓存", t, func() {
 		f := newFakeUpstream(t, "", http.StatusOK, 60)
 		now := time.Now()
-		adapter := New(Options{Now: func() time.Time { return now }})
+		adapter := testAdapter(Options{Now: func() time.Time { return now }})
 
 		resp, err := adapter.Do(context.Background(), f.request())
 		convey.So(err, convey.ShouldBeNil)
@@ -285,6 +307,175 @@ func TestParseChallenge_ScopeWithComma(t *testing.T) {
 		convey.So(c.Service, convey.ShouldEqual, "registry.docker.io")
 		convey.So(c.Scope, convey.ShouldEqual, "repository:library/redis:pull,push")
 	})
+}
+
+func TestTokenRealmRejectsUserinfoAndHTTPSDowngrade(t *testing.T) {
+	t.Run("userinfo is rejected as an opaque destination denial", func(t *testing.T) {
+		_, err := parseChallenge(`Bearer realm="https://user:secret@auth.example.com/token"`)
+		if !errors.Is(err, destination.ErrDestinationNotAllowed) ||
+			err.Error() != destination.ErrDestinationNotAllowed.Error() {
+			t.Fatalf("error = %v, want uniform destination denial", err)
+		}
+	})
+
+	t.Run("HTTPS registry cannot downgrade its token realm", func(t *testing.T) {
+		var hits atomic.Int64
+		tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			hits.Add(1)
+			_, _ = io.WriteString(w, `{"token":"unexpected"}`)
+		}))
+		defer tokenServer.Close()
+		adapter := testAdapter(Options{})
+		_, err := adapter.exchange(context.Background(), "https://registry.example.com",
+			challenge{Realm: tokenServer.URL + "/token"}, "")
+		if !errors.Is(err, destination.ErrDestinationNotAllowed) ||
+			err.Error() != destination.ErrDestinationNotAllowed.Error() {
+			t.Fatalf("error = %v, want uniform destination denial", err)
+		}
+		if hits.Load() != 0 {
+			t.Fatalf("downgraded token realm was dialed %d times", hits.Load())
+		}
+	})
+}
+
+func TestDo_TokenRealmDestinationSafety(t *testing.T) {
+	t.Run("registered cross-host realm is pinned and receives no client credentials", func(t *testing.T) {
+		const token = "realm-token"
+		var tokenHits atomic.Int64
+		var tokenAuthorization string
+		tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			tokenHits.Add(1)
+			tokenAuthorization = r.Header.Get("Authorization")
+			_, _ = io.WriteString(w, `{"token":"`+token+`","expires_in":300}`)
+		}))
+		defer tokenServer.Close()
+		tokenURL := mappedRegistryURL(t, tokenServer.URL, "auth.example.com")
+
+		registryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Authorization") == "Bearer "+token {
+				_, _ = io.WriteString(w, "manifest")
+				return
+			}
+			w.Header().Set("WWW-Authenticate", `Bearer realm="`+tokenURL+`/token",service="registry.example.com"`)
+			w.WriteHeader(http.StatusUnauthorized)
+		}))
+		defer registryServer.Close()
+		registryURL := mappedRegistryURL(t, registryServer.URL, "registry.example.com")
+		resolver := &realmResolver{
+			dials: map[string]string{
+				mustRegistryURL(t, registryURL).Host: serverRegistryAddress(t, registryServer.URL),
+				mustRegistryURL(t, tokenURL).Host:    serverRegistryAddress(t, tokenServer.URL),
+			},
+			registered: map[string]bool{"auth.example.com": true},
+		}
+
+		resp, err := New(Options{Resolver: resolver}).Do(context.Background(), &Request{
+			Host: "registry.example.com", Origin: registryURL,
+			Path: "/o/r/manifests/7", Method: http.MethodGet,
+			Header: http.Header{"Authorization": {"Bearer client-secret"}},
+		})
+		if err != nil {
+			t.Fatalf("Do() error = %v", err)
+		}
+		if got := read(t, resp.Body); got != "manifest" {
+			t.Fatalf("body = %q", got)
+		}
+		if tokenHits.Load() != 1 || tokenAuthorization != "" {
+			t.Fatalf("token hits/Authorization = %d/%q", tokenHits.Load(), tokenAuthorization)
+		}
+		var realmRequirement destination.DestinationRequirement
+		for _, call := range resolver.calls {
+			if mustRegistryURL(t, call.target).Hostname() == "auth.example.com" {
+				realmRequirement = call.requirement
+			}
+		}
+		if !realmRequirement.RequireRegistered ||
+			realmRequirement.Transport != upstream_entity.ProtocolStatic ||
+			realmRequirement.AddressPolicy != destination.PublicAddressesOnly {
+			t.Fatalf("realm requirement = %+v", realmRequirement)
+		}
+	})
+
+	t.Run("unregistered cross-host realm is rejected before dial", func(t *testing.T) {
+		var tokenHits atomic.Int64
+		tokenServer := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			tokenHits.Add(1)
+		}))
+		defer tokenServer.Close()
+		tokenURL := mappedRegistryURL(t, tokenServer.URL, "blocked-auth.example.com")
+		registryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="`+tokenURL+`/token"`)
+			w.WriteHeader(http.StatusUnauthorized)
+		}))
+		defer registryServer.Close()
+		registryURL := mappedRegistryURL(t, registryServer.URL, "registry.example.com")
+		resolver := &realmResolver{dials: map[string]string{
+			mustRegistryURL(t, registryURL).Host: serverRegistryAddress(t, registryServer.URL),
+			mustRegistryURL(t, tokenURL).Host:    serverRegistryAddress(t, tokenServer.URL),
+		}, registered: map[string]bool{}}
+
+		resp, err := New(Options{Resolver: resolver}).Do(context.Background(), &Request{
+			Host: "registry.example.com", Origin: registryURL,
+			Path: "/o/r/manifests/7", Method: http.MethodGet,
+		})
+		if resp != nil || !errors.Is(err, destination.ErrDestinationNotAllowed) {
+			t.Fatalf("response/error = %#v/%v", resp, err)
+		}
+		if err.Error() != destination.ErrDestinationNotAllowed.Error() {
+			t.Fatalf("error leaked destination detail: %q", err)
+		}
+		if tokenHits.Load() != 0 {
+			t.Fatalf("blocked token realm was dialed %d times", tokenHits.Load())
+		}
+	})
+}
+
+type realmResolverCall struct {
+	target      string
+	requirement destination.DestinationRequirement
+}
+
+type realmResolver struct {
+	dials      map[string]string
+	registered map[string]bool
+	calls      []realmResolverCall
+}
+
+func (r *realmResolver) Resolve(
+	_ context.Context, target *url.URL, requirement destination.DestinationRequirement,
+) (*destination.ResolvedTarget, error) {
+	r.calls = append(r.calls, realmResolverCall{target: target.String(), requirement: requirement})
+	if requirement.RequireRegistered && !r.registered[target.Hostname()] {
+		return nil, destination.ErrDestinationNotAllowed
+	}
+	dial, ok := r.dials[target.Host]
+	if !ok {
+		return nil, destination.ErrDestinationNotAllowed
+	}
+	cloned := *target
+	return &destination.ResolvedTarget{URL: &cloned, Authority: target.Host, Host: target.Host,
+		ServerName: target.Hostname(), DialAddress: dial}, nil
+}
+
+func mustRegistryURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u
+}
+
+func mappedRegistryURL(t *testing.T, serverURL, hostname string) string {
+	t.Helper()
+	u := mustRegistryURL(t, serverURL)
+	u.Host = hostname + ":" + u.Port()
+	return u.String()
+}
+
+func serverRegistryAddress(t *testing.T, serverURL string) string {
+	t.Helper()
+	return mustRegistryURL(t, serverURL).Host
 }
 
 // TestLifetime 余量不能把短命的 token 变成一次性的。

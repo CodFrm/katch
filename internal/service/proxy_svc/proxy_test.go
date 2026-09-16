@@ -12,6 +12,7 @@ import (
 	"go.uber.org/mock/gomock"
 
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
+	"github.com/CodFrm/katch/internal/proxy/destination"
 	"github.com/CodFrm/katch/internal/proxy/dispatch"
 	"github.com/CodFrm/katch/internal/repository/upstream_repo"
 	mock_upstream_repo "github.com/CodFrm/katch/internal/repository/upstream_repo/mock"
@@ -24,6 +25,58 @@ func setupRepo(t *testing.T) *mock_upstream_repo.MockUpstreamRepo {
 	// 假源站之外唯一被打到的是 List（缓存一次性装载整张表），而不是 FindByHost。
 	upstream_repo.RegisterUpstream(NewCachedUpstreamRepo(repo))
 	return repo
+}
+
+func TestFetch_PackageOriginRejectsPrivateDial(t *testing.T) {
+	convey.Convey("package profile 的显式 origin 也必须满足公网地址策略", t, func() {
+		var hits int
+		srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			hits++
+		}))
+		defer srv.Close()
+
+		repo := setupRepo(t)
+		repo.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{{
+			ID: 1, Host: "packages.example.com", Origin: srv.URL, Enabled: true,
+			Protocols:      upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+			PackageProfile: upstream_entity.PackageProfileNPM,
+		}}, nil).AnyTimes()
+
+		svc := New(Options{DestinationResolver: destination.New(destination.Options{})})
+		body, meta, err := svc.Fetch(context.Background(), &Target{
+			Kind: dispatch.KindStatic, Host: "packages.example.com", Path: "/x", Method: http.MethodGet,
+		})
+		convey.So(errors.Is(err, destination.ErrDestinationNotAllowed), convey.ShouldBeTrue)
+		convey.So(body, convey.ShouldBeNil)
+		convey.So(meta, convey.ShouldBeNil)
+		convey.So(hits, convey.ShouldEqual, 0)
+	})
+}
+
+func TestDestinationConfigSourceUsesCoherentRewriteSnapshot(t *testing.T) {
+	source := &staticRewriteSource{snapshot: &RewriteSnapshot{Upstreams: map[string]RewriteUpstream{
+		"cdn.example.com": {
+			Profile:    upstream_entity.PackageProfileNPM,
+			Transports: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+		},
+	}}}
+	got, err := (destinationConfigSource{source: source}).Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream := got.Upstreams["cdn.example.com"]
+	if upstream.Profile != upstream_entity.PackageProfileNPM ||
+		!upstream.Transports.Has(upstream_entity.ProtocolStatic) {
+		t.Fatalf("converted upstream = %+v", upstream)
+	}
+}
+
+type staticRewriteSource struct {
+	snapshot *RewriteSnapshot
+}
+
+func (s *staticRewriteSource) Snapshot(context.Context) (*RewriteSnapshot, error) {
+	return s.snapshot, nil
 }
 
 // TestFetch_StaticUpstreamIsPassedThrough
