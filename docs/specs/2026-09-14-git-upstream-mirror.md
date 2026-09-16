@@ -1,6 +1,6 @@
 # git 上游：协议集合、穿透与本地镜像
 
-> Status: Draft
+> Status: Approved
 > Owner: katch
 > Last updated: 2026-09-14
 
@@ -26,7 +26,7 @@
    这类纯 GET 资产。`kindMatches`（`internal/service/proxy_svc/proxy.go:343`）是条双向
    断言，一条记录声明成什么就只能从对应的路径空间进来，两者无法并存。
 4. **架构文档对 git 的判断需要更正。** `docs/architecture.md:129` 把 git 描述为
-   「chunked POST、响应不可缓存」，那是穿透方案的性质；本轮采用的是穿透 + 本地镜像
+   「chunked POST、响应不可缓存」，那是穿透方案的性质；katch 采用的是穿透 + 本地镜像
    双路径，本地应答那一侧的响应是 katch 自己按客户端协商现打的包。
 
 ## Actors and user stories
@@ -158,8 +158,8 @@ git 的每一次拉取记一次请求事件，标签区分**本地应答**与**�
 
 ## 契约变更与兼容
 
-本轮破坏管理接口的既有契约，不保留兼容别名：上游的读写结构体上 `kind`（字符串）
-换成 `protocols`（字符串数组），必填且非空。katch 尚未发布（0.1.0），保留别名意味着
+管理接口的既有契约就此变更，不保留兼容别名：上游的读写结构体上 `kind`（字符串）
+换成 `protocols`（字符串数组），必填且非空。保留别名意味着
 两个字段长期并存、且要定义「两个都传且互相矛盾」的行为，代价高于一次性换掉。
 
 连带要改的还有两处 `kind` 的读取点与一处写出点：命中 registry 缓存时补
@@ -172,14 +172,14 @@ README 与 `docs/architecture.md` 里所有以 `kind` 为前提的说明一并�
 
 ## Out of scope
 
-- **push / `git-receive-pack`**：一律 403，不在本轮也不在后续计划内。
+- **push / `git-receive-pack`**：一律 403，不在本 spec 内，也不在计划内。
 - **私有仓库与任何需要客户端凭据的操作**：与首版 spec 决策 11 冲突，永久非目标。
 - **SSH 协议**：katch 是 HTTP 入口。
 - **本地应答支持协议 v2、shallow、partial clone**：受 go-git 服务端能力限制，
-  这些形态走穿透。换成 git 二进制才能解除，那是另一轮的决定。
+  这些形态走穿透。换成 git 二进制才能解除，不在本 spec 内。
 - **大仓库的本地镜像**：超过单仓上限的仓库永久穿透。
-- **git LFS 对象**：它们在另一台主机上，需要单独加一条上游，本轮不做特殊处理。
-- **`registry` 与 `static` 同时开在一条记录上**：模型允许，但本轮没有既有上游会用到；
+- **git LFS 对象**：它们在另一台主机上，需要单独加一条上游，不在本 spec 内。
+- **`registry` 与 `static` 同时开在一条记录上**：模型允许，但现有上游都不会用到；
   判定与校验必须对这种组合成立，界面不为它做专门引导。
 
 ## Testing decisions
@@ -196,9 +196,9 @@ README 与 `docs/architecture.md` 里所有以 `kind` 为前提的说明一并�
 | 真 git 客户端对拉 | 起一个本地 upstream 仓库，经 katch 走完「穿透 clone → 后台建镜像 → 本地应答 clone」，两次拿到的提交一致；`--depth 1` 走穿透且成功 | `internal/proxy/extension` |
 | `scripts/smoke.sh` | 用 `make build` 的真二进制，经管理接口开 git 协议、真实 clone 一次、确认应答来源头的取值 | 现有 smoke 的上游注册与命中判据 |
 
-真 git 客户端对拉这一条是本轮唯一能证明「协议真的对」的判据——协议层的用例只能证明
+真 git 客户端对拉这一条是唯一能证明「协议真的对」的判据——协议层的用例只能证明
 katch 发出的字节符合我们的理解，不能证明 git 认这些字节。它需要环境里有 git 客户端；
-若 CI 环境不具备，这一条降级为本地验证并在收尾时以运行时观察补上。
+若 CI 环境不具备，这一条降级为以本地的运行时观察覆盖。
 
 ## Open questions
 

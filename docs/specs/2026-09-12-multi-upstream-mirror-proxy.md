@@ -1,6 +1,6 @@
 # 多上游镜像代理
 
-> Status: Draft
+> Status: Approved
 > Owner: katch
 > Last updated: 2026-09-12
 
@@ -256,14 +256,15 @@ raw 路径按 commit SHA 请求时不可变，按分支名请求时短 TTL。rel
 
 ## Out of scope
 
-- **git clone 代理**（`git-upload-pack` 的 chunked POST、不可缓存语义与这一轮完全不同）——下一轮；
+- **git clone 代理**（`git-upload-pack` 的 chunked POST、响应不可缓存）：不在本 spec 内，
+  由 [`2026-09-14-git-upstream-mirror.md`](2026-09-14-git-upstream-mirror.md) 覆盖；
 - **私有仓库**：只代理公开资源，不转发客户端凭据；
 - **多用户与角色**：只有一把管理密钥，没有账号体系；
 - **按用户的配额与限流**：首版靠上游表和部署侧限流；
 - **多副本共享缓存**：首版是单进程本地磁盘缓存，`traffic_rollup` 也按单实例写入；
 - **规则的审批流与版本回滚**：变更记进事件流，但不做草稿与回滚；
 - **下载中途写满磁盘时转为透传**：开头就写不进去（目录不可写）已经能正确降级，
-  但中途失败要先把扇出缓冲与落盘拆开，是一次独立的缓冲层改造，不塞进本轮；
+  但中途失败要先把扇出缓冲与落盘拆开，是一次独立的缓冲层改造，不在本 spec 内；
 - **链路追踪**：见 docs/observability.md 的说明。
 
 ## Testing decisions
