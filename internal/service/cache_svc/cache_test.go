@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -499,6 +500,334 @@ func TestPut_LeavesValidatorsEmpty(t *testing.T) {
 		convey.So(hitMeta.Header.Get("Last-Modified"), convey.ShouldBeEmpty)
 		// 命中由磁盘服务，没有回源。
 		convey.So(o.hits.Load(), convey.ShouldEqual, 0)
+	})
+}
+
+// TestGet_HeadServedFromDisk 持有新鲜完整副本时，普通 HEAD 由本地 200 应答。
+//
+// 「与 GET 相同的元数据」是这条的全部意义：HEAD 是客户端在不下载正文的前提下
+// 核对一份内容的那条路，元数据只要少一个（长度、类型、validator），客户端就会
+// 得出一个与 GET 不同的结论——而它据此决定要不要接着 GET。
+func TestGet_HeadServedFromDisk(t *testing.T) {
+	convey.Convey("新鲜副本的普通 HEAD 本地命中且不发响应体", t, func() {
+		const body = "package bytes"
+		const etag = `"v1"`
+		const lastModified = "Wed, 21 Oct 2015 07:28:00 GMT"
+		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/vnd.debian.binary-package")
+			w.Header().Set("Etag", etag)
+			w.Header().Set("Last-Modified", lastModified)
+			_, _ = io.WriteString(w, body)
+		})
+		const path = "/pool/main/n/nginx.deb"
+		svc, repo, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+		pullWith(t, svc, target("deb.debian.org", path))
+
+		head := target("deb.debian.org", path)
+		head.Method = http.MethodHead
+		got, meta, err := svc.Get(context.Background(), head)
+		convey.So(err, convey.ShouldBeNil)
+		payload, err := io.ReadAll(got)
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(got.Close(), convey.ShouldBeNil)
+		convey.So(string(payload), convey.ShouldBeEmpty)
+		convey.So(meta.StatusCode, convey.ShouldEqual, http.StatusOK)
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
+		convey.So(meta.Header.Get("Content-Type"), convey.ShouldEqual, "application/vnd.debian.binary-package")
+		convey.So(meta.Header.Get("Content-Length"), convey.ShouldEqual, strconv.Itoa(len(body)))
+		convey.So(meta.ContentLength, convey.ShouldEqual, int64(len(body)))
+		convey.So(meta.Header.Get("Etag"), convey.ShouldEqual, etag)
+		convey.So(meta.Header.Get("Last-Modified"), convey.ShouldEqual, lastModified)
+		// 本地答完，没有回源。
+		convey.So(o.hits.Load(), convey.ShouldEqual, 1)
+		// HEAD 不该产生或改写任何记录。
+		convey.So(len(repo.all()), convey.ShouldEqual, 1)
+	})
+}
+
+// TestGet_HeadWithoutCopyPassesThrough 没有可用副本时 HEAD 继续透传，也不写缓存。
+//
+// HEAD 没有响应体，把它「下」进缓存只会留下一条零字节、却声称自己是一份完整
+// 对象的记录。
+func TestGet_HeadWithoutCopyPassesThrough(t *testing.T) {
+	convey.Convey("无副本的 HEAD 透传且不创建记录", t, func() {
+		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Length", "12")
+		})
+		svc, repo, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+		head := target("deb.debian.org", "/pool/main/n/nginx.deb")
+		head.Method = http.MethodHead
+		got, meta, err := svc.Get(context.Background(), head)
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(got.Close(), convey.ShouldBeNil)
+		convey.So(meta.StatusCode, convey.ShouldEqual, http.StatusOK)
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldNotEqual, cacheStatusHit)
+		convey.So(o.hits.Load(), convey.ShouldEqual, 1)
+		convey.So(len(repo.all()), convey.ShouldEqual, 0)
+	})
+}
+
+// TestGet_IfNoneMatchIsEvaluatedLocally If-None-Match 的弱比较、逗号列表与星号。
+//
+// 匹配返回 304、不匹配返回缓存的 200，两条都不能回源：回源一次就抵消了条件
+// 请求省下来的那次传输，而 304 的意义正是「不必再传一遍」。
+func TestGet_IfNoneMatchIsEvaluatedLocally(t *testing.T) {
+	convey.Convey("If-None-Match 在本地求值", t, func() {
+		const body = "package bytes"
+		const etag = `"v1"`
+		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			w.Header().Set("Etag", etag)
+			_, _ = io.WriteString(w, body)
+		})
+		const path = "/pool/main/n/nginx.deb"
+		svc, _, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+		pullWith(t, svc, target("deb.debian.org", path))
+
+		cases := []struct {
+			name   string
+			value  string
+			status int
+			body   string
+			method string
+		}{
+			{"强比较命中", `"v1"`, http.StatusNotModified, "", ""},
+			{"弱 tag 命中", `W/"v1"`, http.StatusNotModified, "", ""},
+			{"列表里任一项命中", `"a", W/"v1", "b"`, http.StatusNotModified, "", ""},
+			{"星号命中", "*", http.StatusNotModified, "", ""},
+			{"均不匹配返回缓存的 200", `"a", "b"`, http.StatusOK, body, ""},
+			{"语法无效按未提供处理", "v1", http.StatusOK, body, ""},
+			{"HEAD 同样按弱比较求值", `W/"v1"`, http.StatusNotModified, "", http.MethodHead},
+		}
+		for _, c := range cases {
+			convey.Convey(c.name, func() {
+				tg := target("deb.debian.org", path)
+				if c.method != "" {
+					tg.Method = c.method
+				}
+				tg.Header.Set("If-None-Match", c.value)
+				got, meta, err := svc.Get(context.Background(), tg)
+				convey.So(err, convey.ShouldBeNil)
+				payload, err := io.ReadAll(got)
+				convey.So(err, convey.ShouldBeNil)
+				convey.So(got.Close(), convey.ShouldBeNil)
+				convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
+				convey.So(meta.StatusCode, convey.ShouldEqual, c.status)
+				convey.So(string(payload), convey.ShouldEqual, c.body)
+				if c.status == http.StatusNotModified {
+					// 304 不带实体，也就不声明实体长度与类型。
+					convey.So(meta.Header.Get("Content-Length"), convey.ShouldBeEmpty)
+					convey.So(meta.Header.Get("Content-Type"), convey.ShouldBeEmpty)
+				}
+			})
+		}
+		// 所有条件都由本地答完，一次都没有回源。
+		convey.Convey("条件请求不回源", func() {
+			convey.So(o.hits.Load(), convey.ShouldEqual, 1)
+		})
+	})
+}
+
+// TestGet_IfModifiedSinceOnlyWithoutIfNoneMatch If-Modified-Since 只在没有
+// If-None-Match 时求值，且资源未晚于请求时间才返回 304。
+func TestGet_IfModifiedSinceOnlyWithoutIfNoneMatch(t *testing.T) {
+	convey.Convey("If-Modified-Since 的优先级与日期比较", t, func() {
+		const body = "package bytes"
+		const etag = `"v1"`
+		const lastModified = "Wed, 21 Oct 2015 07:28:00 GMT"
+		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			w.Header().Set("Etag", etag)
+			w.Header().Set("Last-Modified", lastModified)
+			_, _ = io.WriteString(w, body)
+		})
+		const path = "/pool/main/n/nginx.deb"
+		svc, _, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+		pullWith(t, svc, target("deb.debian.org", path))
+
+		cases := []struct {
+			name   string
+			inm    string
+			ims    string
+			status int
+			body   string
+		}{
+			{"资源时间等于请求时间", "", lastModified, http.StatusNotModified, ""},
+			{"资源早于请求时间", "", "Thu, 22 Oct 2015 07:28:00 GMT", http.StatusNotModified, ""},
+			{"资源较新", "", "Tue, 20 Oct 2015 07:28:00 GMT", http.StatusOK, body},
+			{"请求日期无效按未提供处理", "", "not a date", http.StatusOK, body},
+			{"If-None-Match 不匹配压过 If-Modified-Since", `"other"`, lastModified, http.StatusOK, body},
+			{"If-None-Match 命中压过日期", etag, "Tue, 20 Oct 2015 07:28:00 GMT", http.StatusNotModified, ""},
+		}
+		for _, c := range cases {
+			convey.Convey(c.name, func() {
+				tg := target("deb.debian.org", path)
+				if c.inm != "" {
+					tg.Header.Set("If-None-Match", c.inm)
+				}
+				if c.ims != "" {
+					tg.Header.Set("If-Modified-Since", c.ims)
+				}
+				got, meta, err := svc.Get(context.Background(), tg)
+				convey.So(err, convey.ShouldBeNil)
+				payload, err := io.ReadAll(got)
+				convey.So(err, convey.ShouldBeNil)
+				convey.So(got.Close(), convey.ShouldBeNil)
+				convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
+				convey.So(meta.StatusCode, convey.ShouldEqual, c.status)
+				convey.So(string(payload), convey.ShouldEqual, c.body)
+				if c.status == http.StatusNotModified {
+					convey.So(meta.Header.Get("Content-Length"), convey.ShouldBeEmpty)
+				}
+			})
+		}
+		convey.Convey("条件请求不回源", func() {
+			convey.So(o.hits.Load(), convey.ShouldEqual, 1)
+		})
+	})
+}
+
+// TestGet_IfModifiedSinceNeedsStoredDate 有效条件但副本没有可解析的 Last-Modified
+// 时继续透传，而不是猜一个结论。
+func TestGet_IfModifiedSinceNeedsStoredDate(t *testing.T) {
+	convey.Convey("缺 Last-Modified 的副本遇到有效 If-Modified-Since 时回源", t, func() {
+		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = io.WriteString(w, "body")
+		})
+		const path = "/pool/main/n/nginx.deb"
+		svc, _, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+		pullWith(t, svc, target("deb.debian.org", path))
+
+		tg := target("deb.debian.org", path)
+		tg.Header.Set("If-Modified-Since", "Wed, 21 Oct 2015 07:28:00 GMT")
+		got, meta, err := svc.Get(context.Background(), tg)
+		convey.So(err, convey.ShouldBeNil)
+		_, _ = io.ReadAll(got)
+		convey.So(got.Close(), convey.ShouldBeNil)
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldNotEqual, cacheStatusHit)
+		convey.So(o.hits.Load(), convey.ShouldEqual, 2)
+	})
+}
+
+// TestGet_ConditionalWithoutValidatorPassesThrough 有效条件存在但副本缺少对应
+// validator 时，判断交回上游——历史记录因此不会得到一个推测出来的 304。
+func TestGet_ConditionalWithoutValidatorPassesThrough(t *testing.T) {
+	convey.Convey("缺 validator 的条件请求透传", t, func() {
+		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = io.WriteString(w, "body")
+		})
+		const path = "/pool/main/n/nginx.deb"
+		svc, repo, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+		pullWith(t, svc, target("deb.debian.org", path))
+
+		get := target("deb.debian.org", path)
+		get.Header.Set("If-None-Match", `"v1"`)
+		body, meta, err := svc.Get(context.Background(), get)
+		convey.So(err, convey.ShouldBeNil)
+		_, _ = io.ReadAll(body)
+		convey.So(body.Close(), convey.ShouldBeNil)
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldNotEqual, cacheStatusHit)
+		convey.So(o.hits.Load(), convey.ShouldEqual, 2)
+
+		head := target("deb.debian.org", path)
+		head.Method = http.MethodHead
+		head.Header.Set("If-None-Match", `"v1"`)
+		body, _, err = svc.Get(context.Background(), head)
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(body.Close(), convey.ShouldBeNil)
+		convey.So(o.hits.Load(), convey.ShouldEqual, 3)
+
+		// 透传不写缓存：记录的 validator 仍是空，数量也没有变。
+		convey.So(len(repo.all()), convey.ShouldEqual, 1)
+		convey.So(repo.byKey(path).ETag, convey.ShouldBeEmpty)
+	})
+}
+
+// TestGet_IfRangePassesThrough If-Range 与 Range 一样完整透传，且不写对象缓存。
+func TestGet_IfRangePassesThrough(t *testing.T) {
+	convey.Convey("带 If-Range 的请求不进缓存", t, func() {
+		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = io.WriteString(w, "full body")
+		})
+		svc, repo, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+		tg := target("deb.debian.org", "/pool/part.deb")
+		tg.Header.Set("If-Range", `"v1"`)
+		body, meta, err := svc.Get(context.Background(), tg)
+		convey.So(err, convey.ShouldBeNil)
+		got, _ := io.ReadAll(body)
+		convey.So(body.Close(), convey.ShouldBeNil)
+		convey.So(string(got), convey.ShouldEqual, "full body")
+		convey.So(meta.StatusCode, convey.ShouldEqual, http.StatusOK)
+		convey.So(len(repo.all()), convey.ShouldEqual, 0)
+	})
+}
+
+// TestGet_ConditionalOnAbsentStaleOrBrokenCopyPassesThrough 条件请求遇到没有可用
+// 副本的三种形态时一律透传：无副本、已过期、磁盘上的字节已损坏。
+//
+// 本地拿不出一份可信的副本时硬答一个 304，就是告诉客户端「你手上那份就是最新的」——
+// 而这句话没有任何根据。
+func TestGet_ConditionalOnAbsentStaleOrBrokenCopyPassesThrough(t *testing.T) {
+	convey.Convey("条件请求在无可用副本时透传", t, func() {
+		const etag = `"v1"`
+		origin := func() *originStub {
+			return newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/plain")
+				w.Header().Set("Etag", etag)
+				_, _ = io.WriteString(w, "body")
+			})
+		}
+		convey.Convey("无副本", func() {
+			o := origin()
+			svc, repo, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+			tg := target("deb.debian.org", "/pool/main/n/nginx.deb")
+			tg.Header.Set("If-None-Match", etag)
+			got, meta, err := svc.Get(context.Background(), tg)
+			convey.So(err, convey.ShouldBeNil)
+			_, _ = io.ReadAll(got)
+			convey.So(got.Close(), convey.ShouldBeNil)
+			convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldNotEqual, cacheStatusHit)
+			convey.So(o.hits.Load(), convey.ShouldEqual, 1)
+			convey.So(len(repo.all()), convey.ShouldEqual, 0)
+		})
+
+		convey.Convey("已过期", func() {
+			o := origin()
+			svc, repo, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+			// 不在 /pool/ 下，按 TTL 可变。
+			const key = "/dists/stable/InRelease"
+			pullWith(t, svc, target("deb.debian.org", key))
+			repo.expire(key)
+			tg := target("deb.debian.org", key)
+			tg.Header.Set("If-None-Match", etag)
+			got, meta, err := svc.Get(context.Background(), tg)
+			convey.So(err, convey.ShouldBeNil)
+			_, _ = io.ReadAll(got)
+			convey.So(got.Close(), convey.ShouldBeNil)
+			convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldNotEqual, cacheStatusHit)
+			convey.So(o.hits.Load(), convey.ShouldEqual, 2)
+		})
+
+		convey.Convey("副本损坏", func() {
+			o := origin()
+			svc, repo, store := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+			const key = "/pool/main/n/broken.deb"
+			pullWith(t, svc, target("deb.debian.org", key))
+			corruptBlob(t, store, repo, key)
+			tg := target("deb.debian.org", key)
+			tg.Header.Set("If-None-Match", etag)
+			got, meta, err := svc.Get(context.Background(), tg)
+			convey.So(err, convey.ShouldBeNil)
+			_, _ = io.ReadAll(got)
+			convey.So(got.Close(), convey.ShouldBeNil)
+			convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldNotEqual, cacheStatusHit)
+			convey.So(o.hits.Load(), convey.ShouldEqual, 2)
+			// 坏记录已被丢弃，不会再冒充一份可用的副本。
+			convey.So(len(repo.all()), convey.ShouldEqual, 0)
+		})
 	})
 }
 

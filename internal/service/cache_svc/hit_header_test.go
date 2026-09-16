@@ -1,6 +1,7 @@
 package cache_svc
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
@@ -111,6 +112,71 @@ func TestGet_StaticHitReplaysUpstreamValidators(t *testing.T) {
 		convey.So(hitMeta.Header.Get("Docker-Content-Digest"), convey.ShouldEqual, "")
 		convey.So(hitMeta.Header.Get("Etag"), convey.ShouldEqual, etag)
 		convey.So(hitMeta.Header.Get("Last-Modified"), convey.ShouldEqual, lastModified)
+		convey.So(o.hits.Load(), convey.ShouldEqual, 1)
+	})
+}
+
+// TestGet_StaticNotModifiedKeepsValidators 本地 304 复用 200 的 validator 与归因，
+// 但摘掉实体相关的字段。
+//
+// 304 不带响应体，声明了长度或类型就与「这次没有实体」自相矛盾。
+func TestGet_StaticNotModifiedKeepsValidators(t *testing.T) {
+	convey.Convey("本地 304 的形状", t, func() {
+		const etag = `"origin-own-etag"`
+		const lastModified = "Wed, 21 Oct 2015 07:28:00 GMT"
+		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			w.Header().Set("Etag", etag)
+			w.Header().Set("Last-Modified", lastModified)
+			_, _ = io.WriteString(w, "hello")
+		})
+		svc, _, _ := setupSvc(t, o, staticUpstream("files.test"), Options{})
+		const path = "/pool/main/h/hello.txt"
+		pullWith(t, svc, target("files.test", path))
+
+		tg := target("files.test", path)
+		tg.Header.Set("If-None-Match", etag)
+		got, meta, err := svc.Get(context.Background(), tg)
+		convey.So(err, convey.ShouldBeNil)
+		payload, err := io.ReadAll(got)
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(got.Close(), convey.ShouldBeNil)
+		convey.So(string(payload), convey.ShouldBeEmpty)
+		convey.So(meta.StatusCode, convey.ShouldEqual, http.StatusNotModified)
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
+		convey.So(meta.Header.Get("Etag"), convey.ShouldEqual, etag)
+		convey.So(meta.Header.Get("Last-Modified"), convey.ShouldEqual, lastModified)
+		convey.So(meta.Header.Get("Content-Length"), convey.ShouldBeEmpty)
+		convey.So(meta.Header.Get("Content-Type"), convey.ShouldBeEmpty)
+		convey.So(meta.ContentLength, convey.ShouldEqual, int64(0))
+		convey.So(o.hits.Load(), convey.ShouldEqual, 1)
+	})
+}
+
+// TestGet_RegistryDigestETagAnswersConditional registry 没有上游 ETag 时，
+// 本地条件请求用内容摘要推导出来的那一串比较。
+//
+// 这正是 registry 客户端手里有的那个强校验符（响应里的 Etag 与
+// Docker-Content-Digest），不拿它求值，带 If-None-Match 的拉取就永远回源。
+func TestGet_RegistryDigestETagAnswersConditional(t *testing.T) {
+	convey.Convey("registry 用推导出的摘要 ETag 回答条件请求", t, func() {
+		o := manifestOrigin(t)
+		svc, _, _ := setupSvc(t, o, registryUpstream("registry.test"), Options{})
+		const path = "/library/redis/manifests/7"
+		body, _ := pullWith(t, svc, registryTarget("registry.test", path, ociManifestType))
+
+		sum := sha256.Sum256([]byte(body))
+		digest := "sha256:" + hex.EncodeToString(sum[:])
+		tg := registryTarget("registry.test", path, ociManifestType)
+		tg.Header.Set("If-None-Match", `"`+digest+`"`)
+		got, meta, err := svc.Get(context.Background(), tg)
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(got.Close(), convey.ShouldBeNil)
+		convey.So(meta.StatusCode, convey.ShouldEqual, http.StatusNotModified)
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
+		convey.So(meta.Header.Get("Etag"), convey.ShouldEqual, `"`+digest+`"`)
+		convey.So(meta.Header.Get("Docker-Content-Digest"), convey.ShouldEqual, digest)
+		convey.So(meta.Header.Get("Content-Length"), convey.ShouldBeEmpty)
 		convey.So(o.hits.Load(), convey.ShouldEqual, 1)
 	})
 }
