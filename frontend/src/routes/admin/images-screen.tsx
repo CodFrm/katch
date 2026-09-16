@@ -7,7 +7,7 @@ import { ABSENT, INDENT_PX, shortDigest, Stamp } from '@/components/admin/cache-
 import { Input } from '@/components/ui/input'
 import { Table } from '@/components/ui/table'
 import { useAdminAction } from '@/hooks/use-admin-action'
-import { useCacheImages } from '@/hooks/use-admin-data'
+import { unwrap, useCacheImages } from '@/hooks/use-admin-data'
 import {
   fetchCacheImageTags,
   purgeCacheImage,
@@ -81,15 +81,6 @@ export function ImagesScreen({
     return () => clearTimeout(timer)
   }, [keyword])
 
-  // 读不出来的列表或 tag 用管理操作的错误提示说出来；写操作的错误更具体，先说它。
-  const errorKey =
-    action.errorKey ??
-    (images.failed
-      ? 'admin.images.loadFailed'
-      : tagsFailed.length > 0
-        ? 'admin.images.tagsFailed'
-        : null)
-
   function isExpanded(item: CacheImageItem): boolean {
     const key = rowKey(item.upstream_id, item.repository)
     const toggled = manualToggle.keyword === committed && manualToggle.keys.includes(key)
@@ -111,6 +102,18 @@ export function ImagesScreen({
     .map((item) => rowKey(item.upstream_id, item.repository))
     .join(',')
 
+  // 读不出来的列表或 tag 用管理操作的错误提示说出来；写操作的错误更具体，先说它。
+  // tag 只算眼下还展开着、列表里还在的那些：换了筛选或收起之后，那一行已经不在眼前，
+  // 提示还挂着就成了说一件看不见的事。
+  const pendingList = pendingKeys === '' ? [] : pendingKeys.split(',')
+  const errorKey =
+    action.errorKey ??
+    (images.failed
+      ? 'admin.images.loadFailed'
+      : tagsFailed.some((key) => pendingList.includes(key))
+        ? 'admin.images.tagsFailed'
+        : null)
+
   useEffect(() => {
     if (pendingKeys === '') {
       return
@@ -131,11 +134,10 @@ export function ImagesScreen({
         if (controller.signal.aborted) {
           return
         }
-        if (result.ok) {
+        const data = unwrap(result, onUnauthorized)
+        if (data) {
           setTagsFailed((current) => current.filter((entry) => entry !== key))
-          setTags((current) => ({ ...current, [key]: result.data.list ?? [] }))
-        } else if (result.reason === 'unauthorized') {
-          onUnauthorized()
+          setTags((current) => ({ ...current, [key]: data.list ?? [] }))
         } else {
           setTagsFailed((current) => (current.includes(key) ? current : [...current, key]))
         }

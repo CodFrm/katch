@@ -958,6 +958,25 @@ describe('后台 · 缓存对象', () => {
     expect(within(table).queryByText('bookworm/')).not.toBeInTheDocument()
   })
 
+  it('展开还在路上时进了别的目录，那次展开后回来也不把新目录的内容冲掉', async () => {
+    renderCache('/admin/cache?path=deb.debian.org')
+    const table = await screen.findByRole('table', { name: '缓存对象' })
+    await within(table).findByText('dists/')
+    const dists = `path=${encodeURIComponent('deb.debian.org/dists')}`
+    const hold = holdFetch((url) => url.includes(dists), 1)
+
+    await userEvent.click(within(table).getByRole('button', { name: '展开 dists' }))
+    await vi.waitFor(() => expect(hold.held).toBe(1))
+    await userEvent.click(within(table).getByRole('button', { name: 'pool/' }))
+    expect(await within(table).findByText('main/')).toBeInTheDocument()
+
+    hold.release()
+    await vi.waitFor(() => expect(hold.settled).toBe(1))
+    await flush()
+
+    expect(within(table).getByText('main/')).toBeInTheDocument()
+  })
+
   it('地址指向一个已经不存在的目录时给空状态，路径导航仍能点回上层', async () => {
     renderCache('/admin/cache?path=deb.debian.org/gone')
 

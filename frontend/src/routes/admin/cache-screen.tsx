@@ -10,6 +10,7 @@ import { Table } from '@/components/ui/table'
 import { useAdminAction } from '@/hooks/use-admin-action'
 import {
   useAdminSettings,
+  unwrap,
   useCacheTree,
   useCacheTreeSearch,
   useUpstreamCacheSizes,
@@ -133,11 +134,10 @@ export function CacheScreen({
       if (controller.signal.aborted) {
         return
       }
-      if (result.ok) {
-        const count = result.data.total_count - result.data.total_pinned
+      const data = unwrap(result, onUnauthorized)
+      if (data) {
+        const count = data.total_count - data.total_pinned
         setTarget((current) => (current?.path === pendingCount ? { ...current, count } : current))
-      } else if (result.reason === 'unauthorized') {
-        onUnauthorized()
       } else {
         // 问不到合计就说不出将清除几个：确认按钮点不了，得把原因说出来。
         setTarget((current) =>

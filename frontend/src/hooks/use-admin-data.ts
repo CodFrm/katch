@@ -51,7 +51,7 @@ function useRejectOnUnauthorized(onUnauthorized: () => void) {
   return ref
 }
 
-function unwrap<T>(result: AdminResult<T>, reject: () => void): T | null {
+export function unwrap<T>(result: AdminResult<T>, reject: () => void): T | null {
   if (result.ok) {
     return result.data
   }
@@ -367,6 +367,12 @@ export function useCacheTree(key: string, path: string, onUnauthorized: () => vo
   useEffect(() => {
     latest.current = state
   }, [state])
+  // 眼下的当前目录。展开与加载更多的请求不跟着换目录取消，回来时要是已经换了目录，
+  // 它们不许把状态拨回旧目录——那会把新目录已经取到的那一层扔掉，页面停在一片空白上。
+  const activePath = useRef(path)
+  useEffect(() => {
+    activePath.current = path
+  }, [path])
   // 每一层的「代」：从第一批问起（展开、重取）或收起都换一代，接下一批沿用当代。
   // 展开与加载更多发出的请求没有跟着谁一起取消，回来得晚的那些靠代号认出来扔掉——
   // 否则先发后到的旧一批会盖掉清除之后重取的新一批。
@@ -386,6 +392,9 @@ export function useCacheTree(key: string, path: string, onUnauthorized: () => vo
         }
         const data = unwrap(result, () => reject.current())
         setState((current) => {
+          if (root !== activePath.current) {
+            return current
+          }
           const base: TreeState =
             current.root === root ? current : { root, layers: {}, expanded: [], failed: [] }
           const previous = base.layers[dir]

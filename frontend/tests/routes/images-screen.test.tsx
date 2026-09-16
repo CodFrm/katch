@@ -633,6 +633,22 @@ describe('后台 · 容器镜像', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('tag 列表没有读出来，稍后刷新再试。')
   })
 
+  it('读不出 tag 的那一行不在列表里之后，错误提示跟着收起', async () => {
+    backend.failTags = true
+    await renderImages()
+    const table = screen.getByRole('table', { name: '容器镜像' })
+    const redisRow = await within(table).findByRole('row', { name: /docker\.io\/library\/redis/ })
+    await userEvent.click(within(redisRow).getByRole('button', { name: /展开/ }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('tag 列表没有读出来，稍后刷新再试。')
+
+    await userEvent.selectOptions(screen.getByLabelText('按上游筛选'), 'quay.io')
+    await within(table).findByRole('row', { name: /quay\.io\/prometheus\/prometheus/ })
+    await flush()
+
+    expect(within(table).queryByRole('row', { name: /library\/redis/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
   it('表格下方常驻体积口径说明', async () => {
     const table = await renderImages().then(() => screen.getByRole('table', { name: '容器镜像' }))
     const note = screen.getAllByText('体积按该仓库下已缓存对象合计，共用层会在各自镜像里各算一次。')
