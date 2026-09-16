@@ -4,6 +4,7 @@ import {
   fetchAdminEvents,
   fetchAdminOverview,
   fetchAdminUpstreams,
+  fetchCacheImages,
   fetchCacheTree,
   fetchGitMirrors,
   fetchRecentRequests,
@@ -16,6 +17,7 @@ import {
   type AdminResult,
   type AdminRuleItem,
   type AdminUpstreamItem,
+  type CacheImageItem,
   type CacheTreeNode,
   type CacheTreeSearchResult,
   type EventItem,
@@ -534,6 +536,110 @@ export function useAdminSettings(
   }, [key, token, reject])
 
   return { data: settings, reload }
+}
+
+export interface CacheImagesView {
+  data: CacheImageItem[]
+  total: number
+  hasMore: boolean
+  /** 把下一批接在后面。 */
+  loadMore: () => void
+  /** 写操作之后重取（从第一批取起）。 */
+  reload: () => void
+}
+
+interface ImagesState {
+  upstreamID: number
+  keyword: string
+  list: CacheImageItem[]
+  total: number
+  hasMore: boolean
+  nextOffset: number
+}
+
+const EMPTY_IMAGES: ImagesState = {
+  upstreamID: 0,
+  keyword: '',
+  list: [],
+  total: 0,
+  hasMore: false,
+  nextOffset: 0,
+}
+
+/**
+ * 按仓库列出镜像，一页一批、由服务端聚合（同 useCacheTree 的理由）。
+ *
+ * 换了上游筛选或搜索词就是另外一次查询：旧一批已经接起来的列表属于上一次的
+ * 参数组合，不能借着「加载更多」接在新参数的结果后面。
+ */
+export function useCacheImages(
+  key: string,
+  upstreamID: number,
+  keyword: string,
+  onUnauthorized: () => void
+): CacheImagesView {
+  const reject = useRejectOnUnauthorized(onUnauthorized)
+  const [state, setState] = useState<ImagesState>({ ...EMPTY_IMAGES, upstreamID, keyword })
+  const [token, reload] = useReloadToken()
+  const latest = useRef(state)
+  useEffect(() => {
+    latest.current = state
+  }, [state])
+
+  const load = useCallback(
+    (targetUpstreamID: number, targetKeyword: string, offset: number, signal?: AbortSignal) =>
+      fetchCacheImages(
+        key,
+        { upstreamID: targetUpstreamID, keyword: targetKeyword, offset },
+        signal
+      ).then((result) => {
+        if (signal?.aborted) {
+          return
+        }
+        const data = unwrap(result, () => reject.current())
+        setState((current) => {
+          const own = current.upstreamID === targetUpstreamID && current.keyword === targetKeyword
+          const previous = own ? current.list : []
+          if (!data) {
+            return offset > 0 && own
+              ? current
+              : { ...EMPTY_IMAGES, upstreamID: targetUpstreamID, keyword: targetKeyword }
+          }
+          const list = data.list ?? []
+          return {
+            upstreamID: targetUpstreamID,
+            keyword: targetKeyword,
+            list: offset > 0 && own ? [...previous, ...list] : list,
+            total: data.total,
+            hasMore: data.has_more,
+            nextOffset: data.next_offset,
+          }
+        })
+      }),
+    [key, reject]
+  )
+
+  useEffect(() => {
+    const controller = new AbortController()
+    void load(upstreamID, keyword, 0, controller.signal)
+    return () => controller.abort()
+  }, [upstreamID, keyword, token, load])
+
+  const loadMore = useCallback(() => {
+    const snapshot = latest.current
+    if (snapshot.upstreamID === upstreamID && snapshot.keyword === keyword && snapshot.hasMore) {
+      void load(upstreamID, keyword, snapshot.nextOffset)
+    }
+  }, [upstreamID, keyword, load])
+
+  const own = state.upstreamID === upstreamID && state.keyword === keyword
+  return {
+    data: own ? state.list : [],
+    total: own ? state.total : 0,
+    hasMore: own ? state.hasMore : false,
+    loadMore,
+    reload,
+  }
 }
 
 /** 全部 git 本地镜像。规模有配额顶着，后端不分页（同 useAdminRules）。 */

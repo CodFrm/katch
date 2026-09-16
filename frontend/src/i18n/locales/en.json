@@ -54,6 +54,7 @@
       "upstreams": "Upstreams",
       "cache": "Cache objects",
       "git": "Git mirrors",
+      "images": "Container images",
       "settings": "Settings",
       "addUpstream": "Add upstream"
     },
@@ -207,7 +208,9 @@
       "purgeTargetRequired": "Say which object or which upstream to purge.",
       "settingKeyUnknown": "One setting is unknown to this katch — the UI may be newer than the backend.",
       "settingValueInvalid": "One setting has a value outside the allowed range. Fix it and save again.",
-      "cacheTreePathInvalid": "That directory path is invalid. Refresh and try again."
+      "cacheTreePathInvalid": "That directory path is invalid. Refresh and try again.",
+      "cacheImageRepositoryInvalid": "That repository name is invalid. Refresh and try again.",
+      "cacheImageReferenceInvalid": "That tag is invalid. Refresh and try again."
     },
     "rules": {
       "title": "Access rules",
@@ -331,6 +334,34 @@
         "ready": "Ready",
         "failed": "Failed",
         "rejected": "Passthrough (over limit)"
+      }
+    },
+    "images": {
+      "title": "Container images",
+      "count": "{{count}} image(s) total",
+      "sizeNote": "Size sums the cached objects under that repository; shared layers count once per image.",
+      "search": "Search container images",
+      "searchPlaceholder": "Search by repository or tag",
+      "upstreamFilter": "Filter by upstream",
+      "allUpstreams": "All upstreams",
+      "empty": "No cached images yet.",
+      "loadMore": "Load more",
+      "expand": "Expand {{name}}",
+      "collapse": "Collapse {{name}}",
+      "variants": "{{count}} variant(s)",
+      "expired": "Expired — next pull refetches",
+      "delete": "Delete",
+      "deleteConfirm": "Confirm delete",
+      "deleteCancel": "Cancel",
+      "deleteImageQuestion": "Delete image {{name}}? This purges {{count}} unpinned object(s) under it.",
+      "deleteTagQuestion": "Delete tag {{name}}? This purges {{count}} object(s) under it; pinned ones are skipped.",
+      "columns": {
+        "name": "Name",
+        "tagCount": "Tags",
+        "size": "Size",
+        "hits": "Hits",
+        "lastAccess": "Last access",
+        "operations": "Actions"
       }
     },
     "settings": {

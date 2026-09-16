@@ -461,6 +461,55 @@ export interface PurgeResult {
 }
 
 /**
+ * 一个 manifest 引用（tag 或摘要）合并全部 Accept 变体之后的一行，取值与后端
+ * api/admin.CacheImageTag 一致。
+ *
+ * digest 取最近访问的那个变体；expired 表示那个变体是已过过期时刻的可变
+ * manifest，下次拉取会回源；任意一个变体被 pin 时 pinned 为真。
+ */
+export interface CacheImageTag {
+  reference: string
+  by_digest: boolean
+  digest: string
+  variants: number
+  object_count: number
+  pinned: boolean
+  expired: boolean
+  hit_count: number
+  last_access_at: number
+}
+
+/**
+ * 一个镜像：体积、命中、对象数是仓库下全部缓存对象的合计，共用层在各自镜像里
+ * 各算一次（决策 10）。tags 仅在关键字命中 tag 时给出命中的那些，否则为空数组。
+ */
+export interface CacheImageItem {
+  upstream_id: number
+  host: string
+  repository: string
+  tag_count: number
+  object_count: number
+  pinned_count: number
+  size: number
+  hit_count: number
+  last_access_at: number
+  tags: CacheImageTag[]
+}
+
+/** 一页镜像：子项、总数与下一批从哪儿接。 */
+export interface CacheImagesResult {
+  total: number
+  has_more: boolean
+  next_offset: number
+  list: CacheImageItem[]
+}
+
+/** 一个镜像的全部 tag，按最后访问倒序。 */
+export interface CacheImageTagsResult {
+  list: CacheImageTag[]
+}
+
+/**
  * 一份本地 git 镜像，取值与后端 api/admin.GitMirrorItem 一致。
  *
  * state 取值见后端 git_entity 的 Mirror* 常量：pending / ready / failed / rejected。
@@ -573,6 +622,66 @@ export function pinCacheObject(key: string, id: number, pinned: boolean) {
   return adminSend<Record<string, never>>(`/api/v1/admin/cache/objects/${id}/pin`, key, 'POST', {
     pinned,
   })
+}
+
+/**
+ * 按仓库列出协议含 registry 的上游下缓存过的镜像。
+ *
+ * upstreamID 留空（0）表示全部 registry 上游；offset 取上一批的 next_offset，
+ * size 留空时后端按默认每页 50 个给。
+ */
+export function fetchCacheImages(
+  key: string,
+  params: { upstreamID?: number; keyword?: string; offset?: number; size?: number },
+  signal?: AbortSignal
+) {
+  const query = new URLSearchParams()
+  if (params.upstreamID) {
+    query.set('upstream_id', String(params.upstreamID))
+  }
+  if (params.keyword) {
+    query.set('keyword', params.keyword)
+  }
+  if (params.offset) {
+    query.set('offset', String(params.offset))
+  }
+  if (params.size) {
+    query.set('size', String(params.size))
+  }
+  return adminGet<CacheImagesResult>(`/api/v1/admin/cache/images?${query}`, key, signal)
+}
+
+/** 一个镜像的全部 tag。keyword 留空表示不限，按最后访问倒序给回。 */
+export function fetchCacheImageTags(
+  key: string,
+  upstreamID: number,
+  repository: string,
+  keyword: string,
+  signal?: AbortSignal
+) {
+  const query = new URLSearchParams({ upstream_id: String(upstreamID), repository })
+  if (keyword) {
+    query.set('keyword', keyword)
+  }
+  return adminGet<CacheImageTagsResult>(`/api/v1/admin/cache/images/tags?${query}`, key, signal)
+}
+
+/**
+ * 删除镜像（不给 reference）或删除一个 tag：清掉仓库下（不给 reference 时）
+ * 全部未固定对象，或该引用的全部变体记录（不连带清除层）。
+ */
+export function purgeCacheImage(
+  key: string,
+  target: { upstreamID: number; repository: string; reference?: string }
+) {
+  const body: Record<string, unknown> = {
+    upstream_id: target.upstreamID,
+    repository: target.repository,
+  }
+  if (target.reference) {
+    body.reference = target.reference
+  }
+  return adminSend<PurgeResult>('/api/v1/admin/cache/images/purge', key, 'POST', body)
 }
 
 /** 全部 git 本地镜像，不分页——同上游列表，规模有配额顶着。 */

@@ -19,6 +19,8 @@ const MESSAGES: Record<number, string> = {
   10007: 'admin.error.settingKeyUnknown',
   10008: 'admin.error.settingValueInvalid',
   10010: 'admin.error.cacheTreePathInvalid',
+  10012: 'admin.error.cacheImageRepositoryInvalid',
+  10013: 'admin.error.cacheImageReferenceInvalid',
 }
 
 /**

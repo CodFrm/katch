@@ -1,4 +1,12 @@
-import { Database, GitBranch, LayoutGrid, LogOut, Plus, SlidersHorizontal } from 'lucide-react'
+import {
+  Container,
+  Database,
+  GitBranch,
+  LayoutGrid,
+  LogOut,
+  Plus,
+  SlidersHorizontal,
+} from 'lucide-react'
 import type { ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { NavLink } from 'react-router-dom'
@@ -20,6 +28,7 @@ const NAV = [
   { to: '/admin', end: true, icon: LayoutGrid, label: 'admin.nav.overview' },
   { to: '/admin/cache', end: false, icon: Database, label: 'admin.nav.cache' },
   { to: '/admin/git', end: false, icon: GitBranch, label: 'admin.nav.git' },
+  { to: '/admin/images', end: false, icon: Container, label: 'admin.nav.images' },
   { to: '/admin/settings', end: false, icon: SlidersHorizontal, label: 'admin.nav.settings' },
 ]
 
