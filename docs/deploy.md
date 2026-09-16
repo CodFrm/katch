@@ -220,7 +220,25 @@ chart 里 `metrics.serviceMonitor.enabled=true` 可以生成一个 ServiceMonito
 **界面上的命中率不依赖 Prometheus**：那是库里的分钟桶（决策 16），
 装不装外部监控都不影响后台能看。
 
+## CI（Gitea Actions）
+
+`main` 有新提交时，Gitea（gitea.icodef.com）会跑
+[`.gitea/workflows/deploy.yaml`](../.gitea/workflows/deploy.yaml)：走一遍 `make test`、
+构建 `gitea.icodef.com/codfrm/katch:main.<短 sha>`，再 `helm upgrade --install` 到
+k3s-master-1 那台集群的 ns `app`，release 名 `katch`。GitHub 上那套
+（ci / nightly / release）不受影响，管的是 ghcr.io 上的发版镜像与 Release。
+
+集群相关的值入库在
+[`deploy/helm/katch/values-ggnb.yaml`](../deploy/helm/katch/values-ggnb.yaml)：域名
+`katch.ggnb.top`、`ssd-nfs-client`、ingress class `k3s-main-nginx`、通配证书
+`ggnb-top-tls`。拉镜像的 `dockersecret` 也是 ns app 里本来就有的那份。
+
+升级跑在 runner 上，不登机器，也不带 `--wait`（集群里那个 deploy SA 没有读
+replicasets 的权限，而 helm 判断 rollout 完成要读它）：升起来没有要看 Pod。
+
 ## 升级
+
+手动升级（CI 之外的路子）：
 
 ```bash
 # compose
@@ -244,5 +262,6 @@ helm upgrade katch deploy/helm/katch --reuse-values --set image.tag=0.2.0
 | 后台全是 401 | `admin.initialKey` 没配，或者库里已经有一个轮换过的密钥了（配置文件覆盖不了它） |
 | 后台「最近请求」整块是空的 | 这个上游确实没被拉过，或者历史已经被 `recent_request_retention_seconds` 裁掉。日志开关、日志文件在不在卷里都不影响这块面板 |
 | 升级卡在 `ContainerCreating` | `strategy` 不是 `Recreate`，RWO 的卷把新旧 Pod 锁死了 |
+| Pod 停在 `ImagePullBackOff`，报 401 | `dockersecret` 过期或没了（镜像在 gitea 私有包里，节点匿名拉不到）。见上面「CI」 |
 | 界面上停用了上游，可还在回源 | 开了多副本。见「为什么只能一个副本」 |
 | 大文件传一半断 / 首字节特别慢 | 反代的响应缓冲没关、超时没调大。见「放在反代后面」 |
