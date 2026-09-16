@@ -122,6 +122,10 @@ type PinRequest struct {
 type CacheSvc interface {
 	// Get 取一个对象：命中由磁盘服务，未命中回源并边转发边写入缓存。
 	// 与 proxy_svc.Fetch 的返回约定一致，上游的 4xx/5xx 是正常返回值。
+	//
+	// HEAD 与条件请求也走这里：它们只在读路径上被本地副本回答（命中 200/304、
+	// HEAD 无响应体），答不了就完整透传，绝不写缓存。返回的响应体始终可以安全
+	// 关闭——无实体时是 http.NoBody。
 	Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCloser, *proxy_svc.Meta, error)
 	Put(ctx context.Context, req *PutRequest) error
 	Search(ctx context.Context, req *SearchRequest) (*SearchResponse, error)
@@ -204,8 +208,12 @@ func Register(svc CacheSvc) {
 }
 
 func (c *cacheSvc) Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCloser, *proxy_svc.Meta, error) {
-	if !c.usable() || !cacheableRequest(target) {
-		return proxy_svc.Proxy().Fetch(ctx, target)
+	if !c.usable() || !objectCacheEligible(target) {
+		body, meta, err := proxy_svc.Proxy().Fetch(ctx, target)
+		if err != nil {
+			return nil, nil, err
+		}
+		return body, rangePassthroughMiss(target, meta), nil
 	}
 	upstream, err := upstream_svc.Upstream().FindByHost(ctx, target.Host)
 	if err != nil || upstream == nil {
@@ -218,9 +226,20 @@ func (c *cacheSvc) Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCl
 	if !protocolDefined {
 		immutable = cache.IsImmutable(upstream.ImmutablePatterns, key)
 	}
-	body, meta, m := c.serveFromDisk(ctx, upstream, key, immutable, protocolDefined && !immutable)
+	body, meta, m := c.serveFromDisk(ctx, target, upstream, key, immutable, protocolDefined && !immutable)
 	if m == nil {
 		return body, meta, nil
+	}
+	if !writableRequest(target) {
+		// HEAD 与条件请求未命中（无副本、已过期、副本损坏，或缺少对应 validator）：
+		// 判断交回上游，这一次不留记录。它仍是一次由缓存判定发生的真实回源，
+		// 按现有归因标成未命中——只写 X-Katch-Miss 而不写 X-Katch-Cache 的话，
+		// 客户端只看得到「没有 HIT」，无法据此判定这一次回了源。
+		body, meta, err = proxy_svc.Proxy().Fetch(ctx, target)
+		if err != nil {
+			return nil, nil, err
+		}
+		return body, stampPassthroughMiss(meta, m), nil
 	}
 	body, meta, err = c.fetchAndCache(ctx, target, upstream, key, immutable)
 	if err != nil {
@@ -252,21 +271,74 @@ func (c *cacheSvc) usable() bool {
 	return c.store != nil && cache_repo.CacheObject() != nil
 }
 
-// cacheableRequest 只有「要一份完整对象」的 GET 才走缓存。
+// objectCacheEligible 这个请求能不能走对象缓存。
 //
-// HEAD 没有响应体；带 Range 或条件头的请求拿到的是半截或 304，把它们写进缓存
-// 就是把半截当整份。这类请求直接透传给上游，由上游自己回答。
-func cacheableRequest(target *proxy_svc.Target) bool {
+// GET 与 HEAD 都可以：命中路径手上已经有一份完整副本，HEAD 只要把它的元数据答
+// 回去。带 Range 或 If-Range 的请求拿到的可能是半截内容，一律完整透传（out of
+// scope：本地不处理任何形式的 Range）。
+func objectCacheEligible(target *proxy_svc.Target) bool {
 	if target.Git.IsGit() {
 		// git 的任何应答都不进对象缓存（决策 9）：协商结果因客户端而异，不是
 		// 一个内容寻址的对象，存下来就是把一个客户端的协商结果发给另一个客户端。
 		// ref 广播是一个不带 Range 的普通 GET，不在这里挡住就会被当成对象存下。
 		return false
 	}
+	if target.Method != http.MethodGet && target.Method != http.MethodHead {
+		return false
+	}
+	return !rangeRequest(target)
+}
+
+// rangeRequest 这次请求带 Range 或 If-Range：本地不处理范围请求，一律完整透传。
+func rangeRequest(target *proxy_svc.Target) bool {
+	for _, h := range []string{"Range", "If-Range"} {
+		if target.Header.Get(h) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// rangePassthroughMiss 给一次带 Range/If-Range 的透传补上未命中归因。
+//
+// 它不进对象缓存，但和 HEAD/条件请求的透传一样是一次由缓存判定发生的真实回源
+// （本地答不了范围请求）。X-Katch-Cache 是运维验证与客户端判定「这一次有没有回源」
+// 的唯一依据：少了它，客户端只看得到「没有 HIT」，无从区分「回源了」和「被本地
+// 回答但没标」。
+//
+// git 的应答不在这里标：它自己带 X-Katch-Git，一次协商结果不是一个对象（见 web
+// 包的同名说明）。上游带来的缓存状态必须覆盖：这里确实发生了真实回源，本跳只能
+// 归为 MISS，否则上游的 HIT 会冒充成本地回答。
+func rangePassthroughMiss(target *proxy_svc.Target, meta *proxy_svc.Meta) *proxy_svc.Meta {
+	if meta == nil || target.Git.IsGit() || !rangeRequest(target) {
+		return meta
+	}
+	return stampPassthroughMiss(meta, &miss{reason: metrics.MissFirst})
+}
+
+// stampPassthroughMiss 给本跳直接回源的响应写入 MISS 与未命中原因。
+// 上游 katch 自带的缓存状态描述的是上游那一跳，不能冒充本地命中。
+func stampPassthroughMiss(meta *proxy_svc.Meta, m *miss) *proxy_svc.Meta {
+	if meta == nil {
+		return nil
+	}
+	if meta.Header == nil {
+		meta.Header = make(http.Header, 2)
+	}
+	meta.Header.Set(cacheStatusHeader, cacheStatusMiss)
+	return m.stamp(meta)
+}
+
+// writableRequest 未命中时这次请求能不能写缓存。
+//
+// 只有不带条件的 GET 才留下一份完整对象：HEAD 没有响应体，条件请求拿到的可能是
+// 304，或一个由上游判断决定的 200。把这种结果当成对象存下来，下一次普通 GET 就
+// 会拿到半截内容或别人的判断。
+func writableRequest(target *proxy_svc.Target) bool {
 	if target.Method != http.MethodGet {
 		return false
 	}
-	for _, h := range []string{"Range", "If-Range", "If-None-Match", "If-Modified-Since"} {
+	for _, h := range []string{"If-None-Match", "If-Modified-Since"} {
 		if target.Header.Get(h) != "" {
 			return false
 		}
@@ -317,8 +389,8 @@ func cacheKey(target *proxy_svc.Target) string {
 //
 // 第三个返回值为 nil 表示这次是命中；否则它带着这次未命中的归因——判断只能在
 // 这里做，往上一层就只剩「查不到记录」这一个事实了。
-func (c *cacheSvc) serveFromDisk(ctx context.Context, upstream *upstream_entity.Upstream,
-	key string, immutable, protocolMutable bool) (io.ReadCloser, *proxy_svc.Meta, *miss) {
+func (c *cacheSvc) serveFromDisk(ctx context.Context, target *proxy_svc.Target,
+	upstream *upstream_entity.Upstream, key string, immutable, protocolMutable bool) (io.ReadCloser, *proxy_svc.Meta, *miss) {
 	repo := cache_repo.CacheObject()
 	object, err := repo.FindByKey(ctx, upstream.ID, key)
 	if err != nil {
@@ -381,36 +453,80 @@ func (c *cacheSvc) serveFromDisk(ctx context.Context, upstream *upstream_entity.
 		c.dropRecord(ctx, object)
 		return nil, nil, brokenCopyMiss()
 	}
-	if err := repo.Touch(ctx, object.ID, time.Now().Unix()); err != nil {
-		// 命中已经成立了，访问时间没更新上只影响淘汰顺序，不该让这次拉取失败。
-		logger.Ctx(ctx).Warn("更新缓存访问时间失败", zap.Int64("id", object.ID), zap.Error(err))
-	}
-	header := make(http.Header, 5)
+	header := make(http.Header, 7)
 	if object.ContentType != "" {
 		header.Set("Content-Type", object.ContentType)
 	}
 	header.Set("Content-Length", strconv.FormatInt(object.Size, 10))
 	header.Set(cacheStatusHeader, cacheStatusHit)
+	// 上游的 validator 原样回放：未命中时客户端拿到的就是这两串，命中时若缺席，
+	// 同一个 URL 的响应头就随「这次有没有命中」而变，靠它做条件请求的客户端会
+	// 退回整份重传。空值不回放——那是「上游没给」，不是「上游给了空」。（决策 3/5）
+	if object.ETag != "" {
+		header.Set("Etag", object.ETag)
+	}
+	if object.LastModified != "" {
+		header.Set("Last-Modified", object.LastModified)
+	}
 	// registry 的摘要头补在这里：未命中时它们来自上游，命中时若没有人补，同一个
 	// URL 的响应头就随「这次有没有命中」而变，而摘要是 registry 协议里客户端可以
 	// 依赖的字段。
 	//
-	// 值是推导出来的，不是从上游那份拷贝存下来的：上面几行刚刚校验过盘上的字节与
-	// Digest 相符，推导出来的头因此不可能和发出去的字节对不上；存一份副本则会多出
-	// 一个能和字节分叉的事实，而那正是这段校验要防的东西。
-	//
-	// 只给 registry 补。static 那一侧的 Etag 在未命中时是**上游那一串**，命中时换成
-	// katch 自己的摘要，同一份内容就有了两个互不相认的强校验符——客户端拿着后者去做
-	// 条件请求，只会换回一次整份重传。那一侧要一致得把上游的头存下来，是另一条路。
+	// Docker-Content-Digest 的值是推导出来的，不是从上游那份拷贝存下来的：上面几行
+	// 刚刚校验过盘上的字节与 Digest 相符，推导出来的头因此不可能和发出去的字节对
+	// 不上。Etag 则是上游给了就用上游那一串（上面已经原样回放），只有它没给时才退回
+	// 这串推导值——否则未命中发上游、命中换推导，同一份内容就有了两个互不相认的强
+	// 校验符，客户端拿着命中的那个去回源做条件请求，只会换回一次整份重传。
 	if upstream.Protocols.Has(upstream_entity.ProtocolRegistry) && object.Digest != "" {
 		header.Set("Docker-Content-Digest", object.Digest)
-		header.Set("Etag", `"`+object.Digest+`"`)
+		if object.ETag == "" {
+			header.Set("Etag", `"`+object.Digest+`"`)
+		}
+	}
+	// 条件求值要用**发得出去的那一套头**，而不是记录里的原始字段：registry 的
+	// ETag 是可以由摘要推导的（上面刚补过），拿它比较才和客户端手里的一致。
+	//
+	// 求值排在 Touch 之前：只有真的答出一份副本（200/304/HEAD）才算一次命中，
+	// 缺 validator 而透传的那一次不该被记成命中。
+	outcome := evaluateConditional(target.Header, header.Get("Etag"), header.Get("Last-Modified"))
+	if outcome == conditionUnresolved {
+		// 有效条件存在，副本却没有对应 validator：不猜，把判断交回上游。
+		_ = file.Close()
+		return nil, nil, &miss{reason: metrics.MissFirst}
+	}
+	if err := repo.Touch(ctx, object.ID, time.Now().Unix()); err != nil {
+		// 命中已经成立了，访问时间没更新上只影响淘汰顺序，不该让这次拉取失败。
+		logger.Ctx(ctx).Warn("更新缓存访问时间失败", zap.Int64("id", object.ID), zap.Error(err))
+	}
+	if outcome == conditionNotModified {
+		_ = file.Close()
+		return http.NoBody, notModifiedMeta(header), nil
+	}
+	if target.Method == http.MethodHead {
+		// HEAD 与 GET 同一套状态与元数据，只是不发响应体。
+		_ = file.Close()
+		return http.NoBody, &proxy_svc.Meta{
+			StatusCode:    http.StatusOK,
+			Header:        header,
+			ContentLength: object.Size,
+		}, nil
 	}
 	return file, &proxy_svc.Meta{
 		StatusCode:    http.StatusOK,
 		Header:        header,
 		ContentLength: object.Size,
 	}, nil
+}
+
+// notModifiedMeta 一次本地 304 的元数据。
+//
+// 复用 200 那一套头（validator、摘要、命中归因都在里面），但把实体相关的两项摘掉：
+// 304 不带响应体，也就不该声明它有多长、是什么类型（决策 3）。
+func notModifiedMeta(header http.Header) *proxy_svc.Meta {
+	h := header.Clone()
+	h.Del("Content-Length")
+	h.Del("Content-Type")
+	return &proxy_svc.Meta{StatusCode: http.StatusNotModified, Header: h}
 }
 
 // brokenCopyMiss 副本已经坏了、被丢掉了，这次只能回源。
@@ -543,13 +659,15 @@ func (c *cacheSvc) pump(ctx context.Context, flightKey string, current *flight,
 			logger.Ctx(ctx).Error("提交缓存文件失败", zap.String("key", key), zap.Error(err))
 			digest = ""
 		} else if err := c.saveRecord(ctx, &recordInput{
-			UpstreamID:  upstream.ID,
-			Key:         key,
-			Digest:      digest,
-			Size:        size,
-			ContentType: meta.Header.Get("Content-Type"),
-			Immutable:   immutable,
-			TTLSeconds:  int64(upstream.MutableTTLSeconds),
+			UpstreamID:   upstream.ID,
+			Key:          key,
+			Digest:       digest,
+			Size:         size,
+			ContentType:  meta.Header.Get("Content-Type"),
+			ETag:         meta.Header.Get("ETag"),
+			LastModified: meta.Header.Get("Last-Modified"),
+			Immutable:    immutable,
+			TTLSeconds:   int64(upstream.MutableTTLSeconds),
 		}); err != nil {
 			logger.Ctx(ctx).Error("写缓存记录失败", zap.String("key", key), zap.Error(err))
 		}
@@ -591,7 +709,13 @@ type recordInput struct {
 	Digest      string
 	Size        int64
 	ContentType string
-	Immutable   bool
+	// ETag 与 LastModified 是上游成功响应里的 validator，随内容一起原子落库。
+	//
+	// 上游没给时写空：saveRecord 无条件赋值，所以重写内容时上一份的校验值会被
+	// 一起覆盖掉，不会留着给下一次命中回放。
+	ETag         string
+	LastModified string
+	Immutable    bool
 	// TTLSeconds 可变对象的存活时长，0 表示用全局默认值。
 	TTLSeconds int64
 }
@@ -616,6 +740,10 @@ func (c *cacheSvc) saveRecord(ctx context.Context, in *recordInput) error {
 	object.Digest = in.Digest
 	object.Size = in.Size
 	object.ContentType = in.ContentType
+	// 无条件覆盖，不给上一份内容留旧 validator：上游重写同一路径却不再提供
+	// ETag/Last-Modified 时，留着它们会让命中回放一个对不上的校验符。
+	object.ETag = in.ETag
+	object.LastModified = in.LastModified
 	object.Immutable = in.Immutable
 	object.ExpiresAt = 0
 	if !in.Immutable {

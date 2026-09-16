@@ -1,4 +1,4 @@
-import { render, screen, within } from '@testing-library/react'
+import { fireEvent, render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -965,5 +965,166 @@ describe('后台 · 上游的增改与启停', () => {
 
     expect(await screen.findByLabelText('上游主机名')).toHaveValue('docker.io')
     expect(screen.getByLabelText('回源地址')).toHaveValue('https://registry-1.docker.io')
+  })
+
+  it('选一个预设只填普通模式，保存的还是模式本身', async () => {
+    renderAdmin('/admin')
+
+    await userEvent.click(await screen.findByRole('link', { name: '添加上游' }))
+    await userEvent.type(screen.getByLabelText('上游主机名'), 'proxy.golang.org')
+    await userEvent.type(screen.getByLabelText('回源地址'), 'https://proxy.golang.org')
+
+    const policy = screen.getByRole('radiogroup', { name: '缓存策略' })
+    expect(
+      within(policy)
+        .getAllByRole('radio')
+        .map((item) => item.textContent)
+    ).toEqual(['自定义', 'APT 软件包', 'Go Module Proxy', 'Git commit 静态文件', 'PyPI 文件'])
+    expect(within(policy).getByRole('radio', { name: '自定义' })).toHaveAttribute(
+      'aria-checked',
+      'true'
+    )
+    await userEvent.click(within(policy).getByRole('radio', { name: 'Go Module Proxy' }))
+
+    expect(screen.getByLabelText('不可变路径模式')).toHaveValue('/@v/*.info\n/@v/*.mod\n/@v/*.zip')
+    await userEvent.click(screen.getByRole('button', { name: '保存上游' }))
+
+    const call = await vi.waitFor(() => {
+      const found = calls.find(
+        (item) => item.url === '/api/v1/admin/upstreams' && item.method === 'POST'
+      )
+      expect(found).toBeDefined()
+      return found!
+    })
+    expect(call.body.immutable_patterns).toEqual(['/@v/*.info', '/@v/*.mod', '/@v/*.zip'])
+    // 预设名称不进请求体：上游记录始终是唯一真相。
+    expect(call.body).not.toHaveProperty('preset')
+  })
+
+  it('预设填进去之后照常逐行编辑', async () => {
+    renderAdmin('/admin/upstreams/2/edit')
+
+    const policy = await screen.findByRole('radiogroup', { name: '缓存策略' })
+    await userEvent.click(within(policy).getByRole('radio', { name: 'APT 软件包' }))
+    fireEvent.change(screen.getByLabelText('不可变路径模式'), {
+      target: { value: '/pool/\n/pool/main/' },
+    })
+    await userEvent.click(screen.getByRole('button', { name: '保存上游' }))
+
+    const call = await vi.waitFor(() => {
+      const found = calls.find(
+        (item) => item.url === '/api/v1/admin/upstreams/2' && item.method === 'PUT'
+      )
+      expect(found).toBeDefined()
+      return found!
+    })
+    expect(call.body.immutable_patterns).toEqual(['/pool/', '/pool/main/'])
+  })
+
+  it('模式与某个预设逐项相同时显示那个预设', async () => {
+    backend.upstreams[1]!.immutable_patterns = ['/@v/*.info', '/@v/*.mod', '/@v/*.zip']
+    renderAdmin('/admin/upstreams/2/edit')
+
+    const policy = await screen.findByRole('radiogroup', { name: '缓存策略' })
+    expect(within(policy).getByRole('radio', { name: 'Go Module Proxy' })).toHaveAttribute(
+      'aria-checked',
+      'true'
+    )
+  })
+
+  it('模式内容相同但顺序不同时显示自定义，不替使用者猜是哪个预设', async () => {
+    backend.upstreams[1]!.immutable_patterns = ['/@v/*.mod', '/@v/*.info', '/@v/*.zip']
+    renderAdmin('/admin/upstreams/2/edit')
+
+    const policy = await screen.findByRole('radiogroup', { name: '缓存策略' })
+    expect(within(policy).getByRole('radio', { name: '自定义' })).toHaveAttribute(
+      'aria-checked',
+      'true'
+    )
+  })
+
+  it('切回自定义不会清掉已经填好的模式', async () => {
+    renderAdmin('/admin/upstreams/2/edit')
+
+    const pypi = '/packages/??/??/' + '?'.repeat(64) + '/'
+    const policy = await screen.findByRole('radiogroup', { name: '缓存策略' })
+    await userEvent.click(within(policy).getByRole('radio', { name: 'PyPI 文件' }))
+    await userEvent.click(within(policy).getByRole('radio', { name: '自定义' }))
+
+    expect(screen.getByLabelText('不可变路径模式')).toHaveValue(pypi)
+    await userEvent.click(screen.getByRole('button', { name: '保存上游' }))
+    const call = await vi.waitFor(() => {
+      const found = calls.find(
+        (item) => item.url === '/api/v1/admin/upstreams/2' && item.method === 'PUT'
+      )
+      expect(found).toBeDefined()
+      return found!
+    })
+    expect(call.body.immutable_patterns).toEqual([pypi])
+  })
+
+  it('保存前逐行去掉空白与空行，重复项只留第一次出现的位置', async () => {
+    renderAdmin('/admin/upstreams/2/edit')
+
+    const patterns = await screen.findByLabelText('不可变路径模式')
+    fireEvent.change(patterns, {
+      target: { value: '  /pool/  \n\n/pool/\ndists/\n  dists/  \n' },
+    })
+    await userEvent.click(screen.getByRole('button', { name: '保存上游' }))
+
+    const call = await vi.waitFor(() => {
+      const found = calls.find(
+        (item) => item.url === '/api/v1/admin/upstreams/2' && item.method === 'PUT'
+      )
+      expect(found).toBeDefined()
+      return found!
+    })
+    expect(call.body.immutable_patterns).toEqual(['/pool/', 'dists/'])
+  })
+
+  it('可变对象 TTL 是非负整数，0 表示沿用全局默认', async () => {
+    renderAdmin('/admin/upstreams/2/edit')
+
+    const ttl = await screen.findByLabelText('可变对象 TTL（秒）')
+    expect(ttl).toHaveValue('600')
+    await userEvent.clear(ttl)
+    await userEvent.type(ttl, '0')
+    await userEvent.click(screen.getByRole('button', { name: '保存上游' }))
+
+    const call = await vi.waitFor(() => {
+      const found = calls.find(
+        (item) => item.url === '/api/v1/admin/upstreams/2' && item.method === 'PUT'
+      )
+      expect(found).toBeDefined()
+      return found!
+    })
+    expect(call.body.mutable_ttl_seconds).toBe(0)
+  })
+
+  it('TTL 写成负数时不发请求', async () => {
+    renderAdmin('/admin/upstreams/2/edit')
+
+    const ttl = await screen.findByLabelText('可变对象 TTL（秒）')
+    await userEvent.clear(ttl)
+    await userEvent.type(ttl, '-5')
+    await userEvent.click(screen.getByRole('button', { name: '保存上游' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('TTL')
+    expect(calls.some((item) => item.method === 'PUT')).toBe(false)
+  })
+
+  it('不因为主机名叫 deb.debian.org 就替使用者套上 APT 预设', async () => {
+    renderAdmin('/admin')
+
+    await userEvent.click(await screen.findByRole('link', { name: '添加上游' }))
+    await userEvent.type(screen.getByLabelText('上游主机名'), 'deb.debian.org')
+    await userEvent.type(screen.getByLabelText('回源地址'), 'https://deb.debian.org')
+
+    const policy = screen.getByRole('radiogroup', { name: '缓存策略' })
+    expect(within(policy).getByRole('radio', { name: '自定义' })).toHaveAttribute(
+      'aria-checked',
+      'true'
+    )
+    expect(screen.getByLabelText('不可变路径模式')).toHaveValue('')
   })
 })

@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/smartystreets/goconvey/convey"
 	"go.uber.org/mock/gomock"
 
@@ -105,6 +106,169 @@ func withDiskCache(t *testing.T) {
 	}
 	cache_svc.Register(cache_svc.New(store, cache_svc.Options{}))
 	t.Cleanup(func() { cache_svc.Register(cache_svc.New(nil, cache_svc.Options{})) })
+}
+
+// cacheRequest 经**真实的** NoRoute 处理器发一次带方法/请求头的拉取。
+//
+// 不复用 request：它写死了 GET，而 HEAD 与条件请求正是这条用例要看的。真实
+// NoRoute 而非替身，是因为这里的每一条结论都是客户端能观察到的 HTTP 行为，替身
+// 漂了守卫就守了个空。
+func cacheRequest(t *testing.T, method, path string, header http.Header) *httptest.ResponseRecorder {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.NoRoute(newNoRouteHandlerFS(testDist()))
+	req := httptest.NewRequest(method, path, nil)
+	if header != nil {
+		req.Header = header
+	}
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+	return w
+}
+
+// TestProxy_HeadAndConditionalRequestsServedLocally 经真实 NoRoute 验证：持有新鲜
+// 副本时 HEAD 与可本地求值的条件请求由本地回答，且它们都不回源。
+//
+// 服务层测得再绿，只要拉取路径没有把 Method 与条件头交给缓存层，经 HTTP 拉一次
+// 仍然是回源一次——这条用例看的就是客户端的可观察结果。
+func TestProxy_HeadAndConditionalRequestsServedLocally(t *testing.T) {
+	convey.Convey("真实 NoRoute 上 HEAD、If-None-Match、If-Modified-Since 本地命中", t, func() {
+		const payload = "hello world"
+		const lastModified = "Wed, 21 Oct 2015 07:28:00 GMT"
+		srv, hits := countingOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Range") != "" {
+				w.Header().Set("Content-Range", "bytes 0-4/11")
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = io.WriteString(w, "hello")
+				return
+			}
+			w.Header().Set("Content-Type", "text/plain")
+			w.Header().Set("Etag", `"v1"`)
+			w.Header().Set("Last-Modified", lastModified)
+			_, _ = io.WriteString(w, payload)
+		})
+		upstreamTable(t, &upstream_entity.Upstream{
+			ID: 1, Host: "deb.debian.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+			Origin: srv.URL, Enabled: true,
+			ImmutablePatterns: upstream_entity.PatternList{"/pool/"},
+			MutableTTLSeconds: 60,
+		})
+		withDiskCache(t)
+		const path = "/deb.debian.org/pool/n/nginx.deb"
+
+		first := cacheRequest(t, http.MethodGet, path, nil)
+		convey.So(first.Code, convey.ShouldEqual, http.StatusOK)
+		convey.So(first.Body.String(), convey.ShouldEqual, payload)
+		convey.So(first.Header().Get("X-Katch-Cache"), convey.ShouldEqual, "MISS")
+		convey.So(hits.Load(), convey.ShouldEqual, 1)
+
+		hit := cacheRequest(t, http.MethodGet, path, nil)
+		convey.So(hit.Code, convey.ShouldEqual, http.StatusOK)
+		convey.So(hit.Body.String(), convey.ShouldEqual, payload)
+		convey.So(hit.Header().Get("X-Katch-Cache"), convey.ShouldEqual, "HIT")
+
+		// 普通 HEAD：与 GET 同一套状态与元数据，但不发响应体。
+		head := cacheRequest(t, http.MethodHead, path, nil)
+		convey.So(head.Code, convey.ShouldEqual, http.StatusOK)
+		convey.So(head.Body.Len(), convey.ShouldEqual, 0)
+		convey.So(head.Header().Get("X-Katch-Cache"), convey.ShouldEqual, "HIT")
+		convey.So(head.Header().Get("Content-Type"), convey.ShouldEqual, "text/plain")
+		convey.So(head.Header().Get("Content-Length"), convey.ShouldEqual, "11")
+		convey.So(head.Header().Get("Etag"), convey.ShouldEqual, `"v1"`)
+
+		// If-None-Match 命中：本地 304，不带响应体也不声明实体长度。
+		notModified := cacheRequest(t, http.MethodGet, path, http.Header{"If-None-Match": []string{`W/"v1"`}})
+		convey.So(notModified.Code, convey.ShouldEqual, http.StatusNotModified)
+		convey.So(notModified.Body.Len(), convey.ShouldEqual, 0)
+		convey.So(notModified.Header().Get("X-Katch-Cache"), convey.ShouldEqual, "HIT")
+		convey.So(notModified.Header().Get("Content-Length"), convey.ShouldBeEmpty)
+		convey.So(notModified.Header().Get("Content-Type"), convey.ShouldBeEmpty)
+
+		// HEAD 的条件请求同样本地返回 304。
+		headConditional := cacheRequest(t, http.MethodHead, path, http.Header{"If-None-Match": []string{`"v1"`}})
+		convey.So(headConditional.Code, convey.ShouldEqual, http.StatusNotModified)
+		convey.So(headConditional.Body.Len(), convey.ShouldEqual, 0)
+		convey.So(headConditional.Header().Get("X-Katch-Cache"), convey.ShouldEqual, "HIT")
+		convey.So(headConditional.Header().Get("Content-Length"), convey.ShouldBeEmpty)
+
+		// If-None-Match 不匹配：本地缓存的 200。
+		mismatch := cacheRequest(t, http.MethodGet, path, http.Header{"If-None-Match": []string{`"other"`}})
+		convey.So(mismatch.Code, convey.ShouldEqual, http.StatusOK)
+		convey.So(mismatch.Body.String(), convey.ShouldEqual, payload)
+		convey.So(mismatch.Header().Get("X-Katch-Cache"), convey.ShouldEqual, "HIT")
+
+		// If-Modified-Since：资源未晚于请求时间。
+		ims := cacheRequest(t, http.MethodGet, path, http.Header{"If-Modified-Since": []string{lastModified}})
+		convey.So(ims.Code, convey.ShouldEqual, http.StatusNotModified)
+		convey.So(ims.Header().Get("X-Katch-Cache"), convey.ShouldEqual, "HIT")
+
+		// 以上全部由本地答完，一次都没有回源。
+		convey.So(hits.Load(), convey.ShouldEqual, 1)
+
+		// Range 完整透传，也不写对象缓存：它是真实回源，标 MISS，但接下来的普通 GET 仍命中完整内容。
+		ranged := cacheRequest(t, http.MethodGet, path, http.Header{"Range": []string{"bytes=0-4"}})
+		convey.So(ranged.Code, convey.ShouldEqual, http.StatusPartialContent)
+		convey.So(ranged.Body.String(), convey.ShouldEqual, "hello")
+		convey.So(ranged.Header().Get("Content-Range"), convey.ShouldEqual, "bytes 0-4/11")
+		convey.So(ranged.Header().Get("X-Katch-Cache"), convey.ShouldEqual, "MISS")
+		convey.So(hits.Load(), convey.ShouldEqual, 2)
+
+		// If-Range 同样完整透传并标 MISS：本地答不了范围请求，判断交回上游。
+		ifRanged := cacheRequest(t, http.MethodGet, path, http.Header{"If-Range": []string{`"v1"`}})
+		convey.So(ifRanged.Code, convey.ShouldEqual, http.StatusOK)
+		convey.So(ifRanged.Body.String(), convey.ShouldEqual, payload)
+		convey.So(ifRanged.Header().Get("X-Katch-Cache"), convey.ShouldEqual, "MISS")
+		convey.So(hits.Load(), convey.ShouldEqual, 3)
+
+		full := cacheRequest(t, http.MethodGet, path, nil)
+		convey.So(full.Code, convey.ShouldEqual, http.StatusOK)
+		convey.So(full.Body.String(), convey.ShouldEqual, payload)
+		convey.So(full.Header().Get("X-Katch-Cache"), convey.ShouldEqual, "HIT")
+		convey.So(hits.Load(), convey.ShouldEqual, 3)
+	})
+}
+
+// TestProxy_MissPassthroughCarriesMissHeader 由缓存判定而发生的真实回源，即使
+// 不能写缓存，响应头也必须标成 MISS。
+//
+// 规格：缓存未命中、已过期、损坏或 validator 不足而发生的真实回源仍按现有指标与
+// 响应头归为未命中。只靠「没有 HIT」不是「归为 MISS」——运维验证以 X-Katch-Cache
+// 为准，README 也把缺 validator 的那次透传写成 MISS。
+func TestProxy_MissPassthroughCarriesMissHeader(t *testing.T) {
+	convey.Convey("HEAD 无副本与条件请求缺 validator 的透传标 MISS", t, func() {
+		srv, hits := countingOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = io.WriteString(w, "hello world")
+		})
+		upstreamTable(t, &upstream_entity.Upstream{
+			ID: 1, Host: "deb.debian.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+			Origin: srv.URL, Enabled: true,
+			ImmutablePatterns: upstream_entity.PatternList{"/pool/"},
+			MutableTTLSeconds: 60,
+		})
+		withDiskCache(t)
+		const path = "/deb.debian.org/pool/n/nginx.deb"
+
+		// 无副本的 HEAD：真实回源，标 MISS，但不写缓存记录。
+		head := cacheRequest(t, http.MethodHead, path, nil)
+		convey.So(head.Code, convey.ShouldEqual, http.StatusOK)
+		convey.So(head.Header().Get("X-Katch-Cache"), convey.ShouldEqual, "MISS")
+		convey.So(head.Body.Len(), convey.ShouldEqual, 0)
+		convey.So(hits.Load(), convey.ShouldEqual, 1)
+
+		// 先落一份没有 validator 的副本，条件请求就会因缺 validator 而透传。
+		first := cacheRequest(t, http.MethodGet, path, nil)
+		convey.So(first.Code, convey.ShouldEqual, http.StatusOK)
+		convey.So(hits.Load(), convey.ShouldEqual, 2)
+
+		conditional := cacheRequest(t, http.MethodGet, path,
+			http.Header{"If-None-Match": []string{`"v1"`}})
+		convey.So(conditional.Code, convey.ShouldEqual, http.StatusOK)
+		convey.So(conditional.Body.String(), convey.ShouldEqual, "hello world")
+		convey.So(conditional.Header().Get("X-Katch-Cache"), convey.ShouldEqual, "MISS")
+		convey.So(hits.Load(), convey.ShouldEqual, 3)
+	})
 }
 
 // TestProxy_SecondPullIsServedFromDisk

@@ -14,6 +14,15 @@ import {
   type UpstreamProtocol,
 } from '@/lib/api'
 import { cn } from '@/lib/utils'
+import {
+  CUSTOM_PRESET,
+  UPSTREAM_PRESETS,
+  matchPreset,
+  normalizePatterns,
+  parseMutableTTL,
+  presetPatterns,
+  type UpstreamPresetId,
+} from '@/lib/upstream-presets'
 
 const PROTOCOLS: UpstreamProtocol[] = ['registry', 'static', 'git']
 const POLICIES: DefaultPolicy[] = ['allow_all', 'deny_unless_matched']
@@ -56,10 +65,17 @@ export function UpstreamFormScreen({
   const { id } = useParams()
   const editing = upstreams.find((item) => item.id === Number(id))
   const [draft, setDraft] = useState<UpstreamDraft | null>(null)
+  // TTL 单独留一份文本草稿：受控数字框在清空重打时会把中间态（空串、负号）
+  // 立刻变成 0 或 NaN，使用者根本没法把值改掉。
+  const [ttlText, setTtlText] = useState<string | null>(null)
+  const [ttlInvalid, setTtlInvalid] = useState(false)
   const action = useAdminAction(onUnauthorized)
 
   // 编辑时以库里那条为底：表单是这条上游此刻的样子，不是一张空表。
   const current: UpstreamDraft = draft ?? (editing ? toUpstreamDraft(editing) : { ...BLANK })
+  // 菜单显示的是当前模式对应的预设；模式被改过就落回自定义。
+  const preset = matchPreset(current.immutable_patterns)
+  const ttlValue = ttlText ?? String(current.mutable_ttl_seconds)
   if (id && !editing && upstreams.length > 0) {
     return (
       <div className="px-8 py-7">
@@ -70,6 +86,14 @@ export function UpstreamFormScreen({
 
   function change(patch: Partial<UpstreamDraft>) {
     setDraft({ ...current, ...patch })
+  }
+
+  // 选预设只替换模式列表；选「自定义」是回到手动编辑，既不清空也不改动。
+  function choosePreset(id: UpstreamPresetId) {
+    if (id === CUSTOM_PRESET) {
+      return
+    }
+    change({ immutable_patterns: [...presetPatterns(id)] })
   }
 
   // 勾选顺序不进请求体：协议集合按 PROTOCOLS 的固定顺序写回去，否则同一条上游
@@ -93,12 +117,21 @@ export function UpstreamFormScreen({
     ) {
       return
     }
+    const ttl = parseMutableTTL(ttlValue)
+    if (ttl === null) {
+      setTtlInvalid(true)
+      return
+    }
+    setTtlInvalid(false)
     void action.run(
       () =>
         saveUpstream(adminKey, {
           ...current,
           host: current.host.trim(),
           origin: current.origin.trim(),
+          // 请求体里只有最终那份普通模式：修剪、去空、稳定去重。
+          immutable_patterns: normalizePatterns(current.immutable_patterns),
+          mutable_ttl_seconds: ttl,
         }),
       (saved) => {
         onSaved()
@@ -161,6 +194,52 @@ export function UpstreamFormScreen({
             className="w-[360px] rounded-none text-[13px] md:text-[13px]"
           />
         </Field>
+        <Field label={t('admin.upstream.form.cachePolicy')}>
+          <div className="flex flex-col gap-2">
+            <Segmented
+              label={t('admin.upstream.form.cachePolicy')}
+              options={UPSTREAM_PRESETS.map((item) => ({
+                value: item.id,
+                label: t(`admin.upstream.preset.${item.id}`),
+              }))}
+              value={preset}
+              onChange={(value) => choosePreset(value as UpstreamPresetId)}
+            />
+            <p className="text-muted-foreground text-[12px]">
+              {t('admin.upstream.form.cachePolicyHint')}
+            </p>
+          </div>
+        </Field>
+        <Field
+          label={t('admin.upstream.form.immutablePatterns')}
+          htmlFor="upstream-immutable-patterns"
+        >
+          <textarea
+            id="upstream-immutable-patterns"
+            value={current.immutable_patterns.join('\n')}
+            rows={4}
+            spellCheck={false}
+            onChange={(event) => change({ immutable_patterns: event.target.value.split('\n') })}
+            className="border-line-strong w-[420px] resize-y rounded-none border bg-transparent px-2.5 py-1.5 font-mono text-[13px] leading-6 outline-none"
+          />
+        </Field>
+        <Field label={t('admin.upstream.form.mutableTTL')} htmlFor="upstream-mutable-ttl">
+          <div className="flex flex-col gap-2">
+            <Input
+              id="upstream-mutable-ttl"
+              inputMode="numeric"
+              value={ttlValue}
+              onChange={(event) => {
+                setTtlText(event.target.value)
+                setTtlInvalid(false)
+              }}
+              className="w-[120px] rounded-none font-mono text-[13px] md:text-[13px]"
+            />
+            <p className="text-muted-foreground text-[12px]">
+              {t('admin.upstream.form.mutableTTLHint')}
+            </p>
+          </div>
+        </Field>
 
         <div className="mt-6 flex items-center gap-3">
           <button
@@ -180,6 +259,11 @@ export function UpstreamFormScreen({
           {action.errorKey && (
             <span role="alert" className="text-destructive text-[12.5px]">
               {t(action.errorKey)}
+            </span>
+          )}
+          {ttlInvalid && (
+            <span role="alert" className="text-destructive text-[12.5px]">
+              {t('admin.upstream.form.ttlInvalid')}
             </span>
           )}
         </div>

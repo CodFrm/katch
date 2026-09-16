@@ -23,6 +23,13 @@ type CacheObject struct {
 	// ContentType 回源时的内容类型。缓存命中要和回源给出同样的响应，
 	// 少了它客户端会按别的类型解析同一份字节。
 	ContentType string `gorm:"column:content_type" json:"content_type"`
+	// ETag 上游成功响应里的 ETag，原样保存、命中时原样回放；上游没给时为空。
+	//
+	// 不为历史行推导：上游的 ETag 与缓存摘要未必是同一个标识，拿摘要冒充会让
+	// 客户端拿着另一串 validator 去做条件请求，得到错误的结果（决策 5）。
+	ETag string `gorm:"column:etag" json:"etag"`
+	// LastModified 上游成功响应里的 Last-Modified，原样保存、命中时原样回放。
+	LastModified string `gorm:"column:last_modified" json:"last_modified"`
 	// Immutable 内容寻址的对象：内容永不改写，长期缓存，只由 LRU 淘汰（决策 7）。
 	Immutable bool `gorm:"column:immutable" json:"immutable"`
 	// Pinned 人工要求常驻，不参与淘汰。
