@@ -177,6 +177,17 @@ func TestProxy_HeadAndConditionalRequestsServedLocally(t *testing.T) {
 		convey.So(head.Header().Get("Content-Length"), convey.ShouldEqual, "11")
 		convey.So(head.Header().Get("Etag"), convey.ShouldEqual, `"v1"`)
 
+		// HEAD ignores Range and still reports the full representation length.
+		headRange := cacheRequest(t, http.MethodHead, path, http.Header{
+			"Range":    []string{"bytes=0-4"},
+			"If-Range": []string{`"v1"`},
+		})
+		convey.So(headRange.Code, convey.ShouldEqual, http.StatusOK)
+		convey.So(headRange.Body.Len(), convey.ShouldEqual, 0)
+		convey.So(headRange.Header().Get("Content-Length"), convey.ShouldEqual, "11")
+		convey.So(headRange.Header().Get("Content-Range"), convey.ShouldBeEmpty)
+		convey.So(headRange.Header().Get("X-Katch-Cache"), convey.ShouldEqual, "HIT")
+
 		// If-None-Match 命中：本地 304，不带响应体也不声明实体长度。
 		notModified := cacheRequest(t, http.MethodGet, path, http.Header{"If-None-Match": []string{`W/"v1"`}})
 		convey.So(notModified.Code, convey.ShouldEqual, http.StatusNotModified)
@@ -206,26 +217,31 @@ func TestProxy_HeadAndConditionalRequestsServedLocally(t *testing.T) {
 		// 以上全部由本地答完，一次都没有回源。
 		convey.So(hits.Load(), convey.ShouldEqual, 1)
 
-		// Range 完整透传，也不写对象缓存：它是真实回源，标 MISS，但接下来的普通 GET 仍命中完整内容。
+		// Range 从新鲜完整副本本地选择，不再回源。
 		ranged := cacheRequest(t, http.MethodGet, path, http.Header{"Range": []string{"bytes=0-4"}})
 		convey.So(ranged.Code, convey.ShouldEqual, http.StatusPartialContent)
 		convey.So(ranged.Body.String(), convey.ShouldEqual, "hello")
 		convey.So(ranged.Header().Get("Content-Range"), convey.ShouldEqual, "bytes 0-4/11")
-		convey.So(ranged.Header().Get("X-Katch-Cache"), convey.ShouldEqual, "MISS")
-		convey.So(hits.Load(), convey.ShouldEqual, 2)
+		convey.So(ranged.Header().Get("Content-Length"), convey.ShouldEqual, "5")
+		convey.So(ranged.Header().Get("X-Katch-Cache"), convey.ShouldEqual, "HIT")
+		convey.So(hits.Load(), convey.ShouldEqual, 1)
 
-		// If-Range 同样完整透传并标 MISS：本地答不了范围请求，判断交回上游。
-		ifRanged := cacheRequest(t, http.MethodGet, path, http.Header{"If-Range": []string{`"v1"`}})
-		convey.So(ifRanged.Code, convey.ShouldEqual, http.StatusOK)
-		convey.So(ifRanged.Body.String(), convey.ShouldEqual, payload)
-		convey.So(ifRanged.Header().Get("X-Katch-Cache"), convey.ShouldEqual, "MISS")
-		convey.So(hits.Load(), convey.ShouldEqual, 3)
+		// 强 If-Range 匹配时同样由本地返回范围。
+		ifRanged := cacheRequest(t, http.MethodGet, path, http.Header{
+			"Range":    []string{"bytes=6-"},
+			"If-Range": []string{`"v1"`},
+		})
+		convey.So(ifRanged.Code, convey.ShouldEqual, http.StatusPartialContent)
+		convey.So(ifRanged.Body.String(), convey.ShouldEqual, "world")
+		convey.So(ifRanged.Header().Get("Content-Range"), convey.ShouldEqual, "bytes 6-10/11")
+		convey.So(ifRanged.Header().Get("X-Katch-Cache"), convey.ShouldEqual, "HIT")
+		convey.So(hits.Load(), convey.ShouldEqual, 1)
 
 		full := cacheRequest(t, http.MethodGet, path, nil)
 		convey.So(full.Code, convey.ShouldEqual, http.StatusOK)
 		convey.So(full.Body.String(), convey.ShouldEqual, payload)
 		convey.So(full.Header().Get("X-Katch-Cache"), convey.ShouldEqual, "HIT")
-		convey.So(hits.Load(), convey.ShouldEqual, 3)
+		convey.So(hits.Load(), convey.ShouldEqual, 1)
 	})
 }
 

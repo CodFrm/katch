@@ -141,9 +141,9 @@ type CacheSvc interface {
 	// Get 取一个对象：命中由磁盘服务，未命中回源并边转发边写入缓存。
 	// 与 proxy_svc.Fetch 的返回约定一致，上游的 4xx/5xx 是正常返回值。
 	//
-	// HEAD 与条件请求也走这里：它们只在读路径上被本地副本回答（命中 200/304、
-	// HEAD 无响应体），答不了就完整透传，绝不写缓存。返回的响应体始终可以安全
-	// 关闭——无实体时是 http.NoBody。
+	// HEAD、条件与范围请求也走这里：新鲜完整副本可在本地回答 200/206/304/412/416，
+	// 答不了就完整透传，绝不把 partial 或无实体响应写成完整对象。返回的响应体始终可以
+	// 安全关闭——无实体时是 http.NoBody。
 	Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCloser, *proxy_svc.Meta, error)
 	Put(ctx context.Context, req *PutRequest) error
 	Search(ctx context.Context, req *SearchRequest) (*SearchResponse, error)
@@ -259,7 +259,7 @@ func (c *cacheSvc) Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCl
 	if !identityAccepted(target.Header) {
 		return proxy_svc.Proxy().Fetch(ctx, target)
 	}
-	if !c.usable() || rangeRequest(target) {
+	if !c.usable() {
 		body, meta, err := proxy_svc.Proxy().Fetch(ctx, target)
 		if err != nil {
 			return nil, nil, err
@@ -342,25 +342,8 @@ func (c *cacheSvc) usable() bool {
 	return c.store != nil && cache_repo.CacheObject() != nil
 }
 
-// objectCacheEligible 这个请求能不能走对象缓存。
-//
-// GET 与 HEAD 都可以：命中路径手上已经有一份完整副本，HEAD 只要把它的元数据答
-// 回去。带 Range 或 If-Range 的请求拿到的可能是半截内容，一律完整透传（out of
-// scope：本地不处理任何形式的 Range）。
-func objectCacheEligible(target *proxy_svc.Target) bool {
-	if target.Git.IsGit() {
-		// git 的任何应答都不进对象缓存（决策 9）：协商结果因客户端而异，不是
-		// 一个内容寻址的对象，存下来就是把一个客户端的协商结果发给另一个客户端。
-		// ref 广播是一个不带 Range 的普通 GET，不在这里挡住就会被当成对象存下。
-		return false
-	}
-	if target.Method != http.MethodGet && target.Method != http.MethodHead {
-		return false
-	}
-	return !rangeRequest(target)
-}
-
-// rangeRequest 这次请求带 Range 或 If-Range：本地不处理范围请求，一律完整透传。
+// rangeRequest reports whether passthrough attribution should identify a partial request.
+// It is not an eligibility decision: fresh full objects answer ranges locally.
 func rangeRequest(target *proxy_svc.Target) bool {
 	for _, h := range []string{"Range", "If-Range"} {
 		if target.Header.Get(h) != "" {
@@ -370,12 +353,11 @@ func rangeRequest(target *proxy_svc.Target) bool {
 	return false
 }
 
-// rangePassthroughMiss 给一次带 Range/If-Range 的透传补上未命中归因。
+// rangePassthroughMiss 给一次未命中后带 Range/If-Range 的透传补上未命中归因。
 //
-// 它不进对象缓存，但和 HEAD/条件请求的透传一样是一次由缓存判定发生的真实回源
-// （本地答不了范围请求）。X-Katch-Cache 是运维验证与客户端判定「这一次有没有回源」
-// 的唯一依据：少了它，客户端只看得到「没有 HIT」，无从区分「回源了」和「被本地
-// 回答但没标」。
+// 新鲜完整副本会在本地回答范围；走到这里说明缓存不可用或没有可用副本，因而是真实
+// 回源。X-Katch-Cache 是运维验证与客户端判定「这一次有没有回源」的唯一依据：
+// 少了它，客户端只看得到「没有 HIT」，无从区分「回源了」和「被本地回答但没标」。
 //
 // git 的应答不在这里标：它自己带 X-Katch-Git，一次协商结果不是一个对象（见 web
 // 包的同名说明）。上游带来的缓存状态必须覆盖：这里确实发生了真实回源，本跳只能
@@ -402,14 +384,16 @@ func stampPassthroughMiss(meta *proxy_svc.Meta, m *miss) *proxy_svc.Meta {
 
 // writableRequest 未命中时这次请求能不能写缓存。
 //
-// 只有不带条件的 GET 才留下一份完整对象：HEAD 没有响应体，条件请求拿到的可能是
-// 304，或一个由上游判断决定的 200。把这种结果当成对象存下来，下一次普通 GET 就
-// 会拿到半截内容或别人的判断。
+// 只有不带条件或范围的 GET 才留下一份完整对象：HEAD 没有响应体，条件请求拿到的
+// 可能是 304/412，范围请求可能拿到 206。把这种结果当成对象存下来，下一次普通 GET
+// 就会拿到无实体或半截内容。
 func writableRequest(target *proxy_svc.Target) bool {
 	if target.Method != http.MethodGet {
 		return false
 	}
-	for _, h := range []string{"If-None-Match", "If-Modified-Since"} {
+	for _, h := range []string{
+		"Range", "If-Range", "If-Match", "If-Unmodified-Since", "If-None-Match", "If-Modified-Since",
+	} {
 		if target.Header.Get(h) != "" {
 			return false
 		}
@@ -687,14 +671,10 @@ func transformedResponse(target *proxy_svc.Target, payload []byte, meta *proxy_s
 	conditions := target.Header.Clone()
 	conditions.Del("If-Modified-Since")
 	conditions.Del("If-Unmodified-Since")
-	if evaluateConditional(conditions, header.Get("Etag"), "") == conditionNotModified {
-		return http.NoBody, notModifiedMeta(header), nil
-	}
-	out := &proxy_svc.Meta{StatusCode: http.StatusOK, Header: header, ContentLength: int64(len(payload))}
-	if target.Method == http.MethodHead {
-		return http.NoBody, out, nil
-	}
-	return io.NopCloser(bytes.NewReader(payload)), out, nil
+	outcome := evaluateConditional(conditions, header.Get("Etag"), "")
+	reader := bytes.NewReader(payload)
+	body, out := representationResponse(target, io.NopCloser(reader), reader, header, int64(len(payload)), outcome)
+	return body, out, nil
 }
 
 func (c *cacheSvc) urlRewriter(snapshot *proxy_svc.RewriteSnapshot) packageprofile.RewriteURL {
@@ -884,24 +864,8 @@ func (c *cacheSvc) serveFromDisk(ctx context.Context, target *proxy_svc.Target,
 		// 命中已经成立了，访问时间没更新上只影响淘汰顺序，不该让这次拉取失败。
 		logger.Ctx(ctx).Warn("更新缓存访问时间失败", zap.Int64("id", object.ID), zap.Error(err))
 	}
-	if outcome == conditionNotModified {
-		_ = file.Close()
-		return http.NoBody, notModifiedMeta(header), nil
-	}
-	if target.Method == http.MethodHead {
-		// HEAD 与 GET 同一套状态与元数据，只是不发响应体。
-		_ = file.Close()
-		return http.NoBody, &proxy_svc.Meta{
-			StatusCode:    http.StatusOK,
-			Header:        header,
-			ContentLength: object.Size,
-		}, nil
-	}
-	return file, &proxy_svc.Meta{
-		StatusCode:    http.StatusOK,
-		Header:        header,
-		ContentLength: object.Size,
-	}, nil
+	body, meta := representationResponse(target, file, file, header, object.Size, outcome)
+	return body, meta, nil
 }
 
 // notModifiedMeta 一次本地 304 的元数据。

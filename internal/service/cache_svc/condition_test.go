@@ -1,10 +1,15 @@
 package cache_svc
 
 import (
+	"context"
+	"io"
 	"net/http"
 	"testing"
 
 	"github.com/smartystreets/goconvey/convey"
+
+	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
+	"github.com/CodFrm/katch/internal/proxy/packageprofile"
 )
 
 // TestParseETag 单个 entity-tag 的语法判定。
@@ -138,4 +143,168 @@ func TestEvaluateConditional(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestGet_IfMatchAndIfUnmodifiedSincePrecedeCacheRanges(t *testing.T) {
+	const (
+		body         = "0123456789"
+		etag         = `"v1"`
+		lastModified = "Wed, 21 Oct 2015 07:28:00 GMT"
+	)
+	o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("Etag", etag)
+		w.Header().Set("Last-Modified", lastModified)
+		_, _ = io.WriteString(w, body)
+	})
+	const path = "/pool/preconditions.deb"
+	svc, _, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+	pullWith(t, svc, target("deb.debian.org", path))
+
+	cases := []struct {
+		name   string
+		header http.Header
+		status int
+		body   string
+	}{
+		{
+			name: "If-Match mismatch returns 412 before Range",
+			header: http.Header{
+				"If-Match": []string{`"other"`},
+				"Range":    []string{"bytes=0-2"},
+			},
+			status: http.StatusPreconditionFailed,
+		},
+		{
+			name:   "weak If-Match never strongly matches",
+			header: http.Header{"If-Match": []string{`W/"v1"`}},
+			status: http.StatusPreconditionFailed,
+		},
+		{
+			name: "matching If-Match suppresses failing If-Unmodified-Since",
+			header: http.Header{
+				"If-Match":            []string{etag},
+				"If-Unmodified-Since": []string{"Tue, 20 Oct 2015 07:28:00 GMT"},
+			},
+			status: http.StatusOK,
+			body:   body,
+		},
+		{
+			name:   "If-Match wildcard matches an existing representation",
+			header: http.Header{"If-Match": []string{"*"}},
+			status: http.StatusOK,
+			body:   body,
+		},
+		{
+			name:   "If-Unmodified-Since fails when the representation is newer",
+			header: http.Header{"If-Unmodified-Since": []string{"Tue, 20 Oct 2015 07:28:00 GMT"}},
+			status: http.StatusPreconditionFailed,
+		},
+		{
+			name:   "If-Unmodified-Since permits second-precision equality",
+			header: http.Header{"If-Unmodified-Since": []string{lastModified}},
+			status: http.StatusOK,
+			body:   body,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tg := target("deb.debian.org", path)
+			tg.Header = tc.header
+			got, meta := pullWith(t, svc, tg)
+			if meta.StatusCode != tc.status {
+				t.Fatalf("status = %d, want %d", meta.StatusCode, tc.status)
+			}
+			if got != tc.body {
+				t.Fatalf("body = %q, want %q", got, tc.body)
+			}
+			if meta.Header.Get(cacheStatusHeader) != cacheStatusHit {
+				t.Fatalf("cache status = %q", meta.Header.Get(cacheStatusHeader))
+			}
+			if tc.status == http.StatusPreconditionFailed &&
+				(meta.Header.Get("Content-Length") != "" || meta.Header.Get("Content-Range") != "") {
+				t.Fatalf("412 entity headers = %#v", meta.Header)
+			}
+		})
+	}
+	if got := o.hits.Load(); got != 1 {
+		t.Fatalf("origin hits = %d, want 1", got)
+	}
+}
+
+func TestGet_TransformedMetadataEvaluatesLocalConditionsWithoutDates(t *testing.T) {
+	o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+		_, _ = io.WriteString(w, `{"origin":true}`)
+	})
+	profile := testProfile{
+		description: packageprofile.Description{Profile: upstream_entity.PackageProfileNPM, Name: "test"},
+		representation: packageprofile.Representation{
+			Class: packageprofile.ClassMutable, Transform: true, MediaTypes: []string{"application/json"},
+		},
+		transform: func(context.Context, packageprofile.TransformRequest) (*packageprofile.TransformResult, error) {
+			return &packageprofile.TransformResult{Body: []byte(`{"local":true}`), ContentType: "application/json"}, nil
+		},
+	}
+	up := staticUpstream("registry.example.com")
+	up.PackageProfile = upstream_entity.PackageProfileNPM
+	svc, _, _ := setupSvc(t, o, up, transformingOptions(t, profile, 31))
+	const path = "/metadata"
+	_, first := pullWith(t, svc, target(up.Host, path))
+	etag := first.Header.Get("Etag")
+	if etag == "" || first.Header.Get("Last-Modified") != "" {
+		t.Fatalf("transformed validators = %#v", first.Header)
+	}
+
+	cases := []struct {
+		name   string
+		header http.Header
+		status int
+	}{
+		{
+			name:   "matching transformed If-Match wins over ignored date",
+			header: http.Header{"If-Match": []string{etag}, "If-Unmodified-Since": []string{"Tue, 20 Oct 2015 07:28:00 GMT"}},
+			status: http.StatusOK,
+		},
+		{
+			name:   "transformed If-Match mismatch",
+			header: http.Header{"If-Match": []string{`"other"`}},
+			status: http.StatusPreconditionFailed,
+		},
+		{
+			name:   "transformed If-None-Match weak match",
+			header: http.Header{"If-None-Match": []string{"W/" + etag}},
+			status: http.StatusNotModified,
+		},
+		{
+			name:   "transformed If-Modified-Since is ignored",
+			header: http.Header{"If-Modified-Since": []string{"Thu, 22 Oct 2099 07:28:00 GMT"}},
+			status: http.StatusOK,
+		},
+		{
+			name:   "transformed If-Unmodified-Since is ignored",
+			header: http.Header{"If-Unmodified-Since": []string{"Tue, 20 Oct 2015 07:28:00 GMT"}},
+			status: http.StatusOK,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tg := target(up.Host, path)
+			tg.Header = tc.header
+			body, meta := pullWith(t, svc, tg)
+			if meta.StatusCode != tc.status {
+				t.Fatalf("status = %d, want %d", meta.StatusCode, tc.status)
+			}
+			if meta.Header.Get(cacheStatusHeader) != cacheStatusHit {
+				t.Fatalf("cache status = %q", meta.Header.Get(cacheStatusHeader))
+			}
+			if tc.status != http.StatusOK && body != "" {
+				t.Fatalf("status %d body = %q", tc.status, body)
+			}
+		})
+	}
+	if got := o.hits.Load(); got != 1 {
+		t.Fatalf("origin hits = %d, want 1", got)
+	}
 }

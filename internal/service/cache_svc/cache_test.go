@@ -873,17 +873,18 @@ func TestGet_RangeAndIfRangePassThroughMarkMiss(t *testing.T) {
 		convey.So(o.hits.Load(), convey.ShouldEqual, 2)
 	})
 
-	convey.Convey("有新鲜完整副本时 Range 与 If-Range 仍标 MISS 且不动副本", t, func() {
+	convey.Convey("有新鲜完整副本时 Range 本地命中且不动副本", t, func() {
 		o := origin()
 		svc, repo, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
 		const path = "/pool/part.deb"
 
-		// 先落一份新鲜完整副本，作为下面两次透传的对照。
+		// 先落一份新鲜完整副本，后续范围选择只读取这份完整内容。
 		_, first := pullWith(t, svc, target("deb.debian.org", path))
 		convey.So(first.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusMiss)
 		row := repo.byKey(path)
 		convey.So(row, convey.ShouldNotBeNil)
 
+		// 没有 Range 时 If-Range 没有语义，按普通完整缓存命中处理。
 		ifRangeTg := target("deb.debian.org", path)
 		ifRangeTg.Header.Set("If-Range", `"v1"`)
 		body, meta, err := svc.Get(context.Background(), ifRangeTg)
@@ -892,7 +893,7 @@ func TestGet_RangeAndIfRangePassThroughMarkMiss(t *testing.T) {
 		convey.So(body.Close(), convey.ShouldBeNil)
 		convey.So(string(got), convey.ShouldEqual, payload)
 		convey.So(meta.StatusCode, convey.ShouldEqual, http.StatusOK)
-		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusMiss)
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
 
 		rangeTg := target("deb.debian.org", path)
 		rangeTg.Header.Set("Range", "bytes=0-4")
@@ -900,19 +901,16 @@ func TestGet_RangeAndIfRangePassThroughMarkMiss(t *testing.T) {
 		convey.So(err, convey.ShouldBeNil)
 		got, _ = io.ReadAll(body)
 		convey.So(body.Close(), convey.ShouldBeNil)
-		// 上游的 206 与 Range 头原样保留：本地不处理范围请求。
 		convey.So(string(got), convey.ShouldEqual, "hello")
 		convey.So(meta.StatusCode, convey.ShouldEqual, http.StatusPartialContent)
 		convey.So(meta.Header.Get("Content-Range"), convey.ShouldEqual, "bytes 0-4/11")
-		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusMiss)
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
 
-		// 两次透传都没有写入：记录还是 setup 那份完整内容，没有多出第二条。
 		convey.So(len(repo.all()), convey.ShouldEqual, 1)
 		convey.So(repo.byKey(path).Digest, convey.ShouldEqual, row.Digest)
-		// 也没把副本读坏或清掉：紧接着的普通 GET 仍由磁盘命中。
 		_, hit := pullWith(t, svc, target("deb.debian.org", path))
 		convey.So(hit.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
-		convey.So(o.hits.Load(), convey.ShouldEqual, 3)
+		convey.So(o.hits.Load(), convey.ShouldEqual, 1)
 	})
 }
 

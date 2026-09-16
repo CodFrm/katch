@@ -17,18 +17,48 @@ type conditionOutcome int
 const (
 	// conditionNone 没有可求值的条件，或者条件有效且不命中：按缓存的 200 回答。
 	conditionNone conditionOutcome = iota
-	// conditionNotModified 条件命中：返回本地 304。
+	// conditionPreconditionFailed If-Match 或 If-Unmodified-Since 失败：返回本地 412。
+	conditionPreconditionFailed
+	// conditionNotModified If-None-Match 或 If-Modified-Since 命中：返回本地 304。
 	conditionNotModified
-	// conditionUnresolved 有有效条件，但副本缺少能求值的 validator：必须回源。
+	// conditionUnresolved 有效条件存在，但副本缺少能求值的 validator：必须回源。
 	conditionUnresolved
 )
 
 // evaluateConditional 拿请求的条件头与副本的两个 validator 求值。
 //
-// 优先级按 RFC 9110 §13.2.2：有 If-None-Match 时不再看 If-Modified-Since——两个
-// 条件同时给且结论相反时，日期说的是「可能没变」，ETag 说的是「就是这一份」，
-// 后者更硬。语法无效的条件按未提供处理，于是它会正常地落到下一个条件或普通命中。
+// 优先级按 RFC 9110 §13.2.2：If-Match 先于 If-Unmodified-Since，If-None-Match
+// 先于 If-Modified-Since；有效的 entity-tag 条件会压过同组的日期条件。语法无效的
+// 条件按未提供处理，于是它会正常地落到下一个条件或普通命中。
 func evaluateConditional(header http.Header, etag, lastModified string) conditionOutcome {
+	ifMatchPresent := false
+	if values := header.Values("If-Match"); len(values) > 0 {
+		value := strings.TrimSpace(strings.Join(values, ","))
+		if value != "" {
+			matched, ok := evaluateIfMatch(value, etag)
+			if ok {
+				if !matched {
+					return conditionPreconditionFailed
+				}
+				ifMatchPresent = true
+			}
+		}
+	}
+	if !ifMatchPresent {
+		if value := strings.TrimSpace(header.Get("If-Unmodified-Since")); value != "" {
+			requested, err := http.ParseTime(value)
+			if err == nil {
+				modified, modifiedErr := http.ParseTime(lastModified)
+				if modifiedErr != nil {
+					return conditionUnresolved
+				}
+				if modified.After(requested) {
+					return conditionPreconditionFailed
+				}
+			}
+		}
+	}
+
 	if values := header.Values("If-None-Match"); len(values) > 0 {
 		// 多行 If-None-Match 与写成一行逗号列表等价（RFC 9110 §5.3）。
 		value := strings.TrimSpace(strings.Join(values, ","))
@@ -70,6 +100,53 @@ func evaluateConditional(header http.Header, etag, lastModified string) conditio
 		}
 	}
 	return conditionNone
+}
+
+// evaluateIfMatch parses the list and applies the strong comparison function.
+// A wildcard succeeds because this function is only called for a selected local representation.
+func evaluateIfMatch(value, storedValue string) (matched, valid bool) {
+	if strings.TrimSpace(value) == "*" {
+		return true, true
+	}
+	stored, storedStrong := parseStrongETag(storedValue)
+	s := strings.TrimSpace(value)
+	seen := false
+	for {
+		s = strings.TrimLeft(s, " \t")
+		if s == "" {
+			break
+		}
+		if s[0] == ',' {
+			s = s[1:]
+			continue
+		}
+		weak := strings.HasPrefix(s, "W/")
+		tag, rest, ok := scanETag(s)
+		if !ok {
+			return false, false
+		}
+		seen = true
+		if !weak && storedStrong && tag == stored {
+			matched = true
+		}
+		s = strings.TrimLeft(rest, " \t")
+		if s == "" {
+			break
+		}
+		if s[0] != ',' {
+			return false, false
+		}
+		s = s[1:]
+	}
+	return matched, seen
+}
+
+func parseStrongETag(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if strings.HasPrefix(value, "W/") {
+		return "", false
+	}
+	return parseETag(value)
 }
 
 // parseIfNoneMatch 解析 If-None-Match 的取值，返回表里的 opaque tag、是否星号、
