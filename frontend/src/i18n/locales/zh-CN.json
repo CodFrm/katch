@@ -354,7 +354,7 @@
       "deleteConfirm": "确认删除",
       "deleteCancel": "取消",
       "deleteImageQuestion": "删除镜像 {{name}}？将清除其下 {{count}} 个未固定的对象。",
-      "deleteTagQuestion": "删除 tag {{name}}？将清除其下 {{count}} 个对象，已固定的会跳过。",
+      "deleteTagQuestion": "删除 tag {{name}}？将清除其下 {{count}} 个未固定的对象。",
       "columns": {
         "name": "名称",
         "tagCount": "Tag 数",

@@ -58,8 +58,10 @@ type ImageTag struct {
 	Digest string
 	// Variants 不同变体段的个数（含无变体），ObjectCount 是记录条数：
 	// 同一变体在 x 与 library/x 两种写法下各有一条记录。
-	Variants     int
-	ObjectCount  int64
+	Variants    int
+	ObjectCount int64
+	// PinnedCount 其中被 pin 的记录条数：删除 tag 的确认要写明「将清除的对象数（不含 pin）」。
+	PinnedCount  int64
 	Pinned       bool
 	Expired      bool
 	HitCount     int64
@@ -153,7 +155,10 @@ func (a *tagAggregate) add(object *cache_entity.CacheObject, variant string) {
 	a.variants[variant] = true
 	a.tag.ObjectCount++
 	a.tag.HitCount += object.HitCount
-	a.tag.Pinned = a.tag.Pinned || object.Pinned
+	if object.Pinned {
+		a.tag.PinnedCount++
+		a.tag.Pinned = true
+	}
 	if a.latest == nil || object.LastAccessAt > a.latest.LastAccessAt ||
 		(object.LastAccessAt == a.latest.LastAccessAt && object.ID > a.latest.ID) {
 		a.latest = object

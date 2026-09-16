@@ -227,7 +227,7 @@ func TestImageTags(t *testing.T) {
 			// 三条记录两种写法、三个变体段（含无变体）合成一行：摘要取最近访问的那份，
 			// 过期看的也是它；任意一份被 pin 就算 pin。
 			convey.So(*resp.List[1], convey.ShouldResemble, ImageTag{
-				Reference: "7", Digest: "sha256:2", Variants: 3, ObjectCount: 3,
+				Reference: "7", Digest: "sha256:2", Variants: 3, ObjectCount: 3, PinnedCount: 1,
 				Pinned: true, Expired: true, HitCount: 6, LastAccessAt: 200})
 			convey.So(*resp.List[2], convey.ShouldResemble, ImageTag{
 				Reference: "8", Digest: "sha256:5", Variants: 1, ObjectCount: 1, LastAccessAt: 50})

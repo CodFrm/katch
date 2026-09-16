@@ -201,6 +201,7 @@ type CacheImageTag struct {
 	Digest       string `json:"digest"`
 	Variants     int    `json:"variants"`
 	ObjectCount  int64  `json:"object_count"`
+	PinnedCount  int64  `json:"pinned_count"`
 	Pinned       bool   `json:"pinned"`
 	Expired      bool   `json:"expired"`
 	HitCount     int64  `json:"hit_count"`

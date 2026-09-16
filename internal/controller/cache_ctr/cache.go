@@ -203,6 +203,7 @@ func toImageTags(tags []*cache_svc.ImageTag) []*admin.CacheImageTag {
 			Digest:       tag.Digest,
 			Variants:     tag.Variants,
 			ObjectCount:  tag.ObjectCount,
+			PinnedCount:  tag.PinnedCount,
 			Pinned:       tag.Pinned,
 			Expired:      tag.Expired,
 			HitCount:     tag.HitCount,

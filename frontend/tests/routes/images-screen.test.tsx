@@ -130,7 +130,8 @@ function redisTags() {
       digest: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
       variants: 2,
       object_count: 3,
-      pinned: false,
+      pinned_count: 1,
+      pinned: true,
       expired: false,
       hit_count: 20,
       last_access_at: TO - 60,
@@ -141,6 +142,7 @@ function redisTags() {
       digest: 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
       variants: 1,
       object_count: 1,
+      pinned_count: 1,
       pinned: true,
       expired: false,
       hit_count: 5,
@@ -152,6 +154,7 @@ function redisTags() {
       digest: 'sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
       variants: 1,
       object_count: 1,
+      pinned_count: 0,
       pinned: false,
       expired: true,
       hit_count: 1,
@@ -168,6 +171,7 @@ function prometheusTags() {
       digest: 'sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
       variants: 1,
       object_count: 5,
+      pinned_count: 0,
       pinned: false,
       expired: false,
       hit_count: 9,
@@ -258,8 +262,8 @@ function stubFetch() {
         if (reference) {
           const tags = backend.tags[key] ?? []
           const tag = tags.find((item) => item.reference === reference)
-          const removed = tag && !tag.pinned ? tag.object_count : 0
-          const skipped = tag && tag.pinned ? tag.object_count : 0
+          const removed = tag ? tag.object_count - tag.pinned_count : 0
+          const skipped = tag ? tag.pinned_count : 0
           backend.tags[key] = tags.filter((item) => item.reference !== reference)
           const image = backend.images.find(
             (item) => item.upstream_id === upstreamID && item.repository === repository
@@ -454,15 +458,30 @@ describe('后台 · 容器镜像', () => {
 
     await userEvent.click(within(sevenRow).getByRole('button', { name: '删除' }))
     const confirm = await screen.findByRole('alertdialog')
+    // 决策 11 与决策 6 同一套语义：确认处写明将清除的对象数，不含已固定的那条。
+    expect(confirm).toHaveTextContent('删除 tag 7？将清除其下 2 个未固定的对象。')
     await userEvent.click(within(confirm).getByRole('button', { name: '确认删除' }))
 
-    expect(await screen.findByRole('status')).toBeInTheDocument()
+    expect(await screen.findByRole('status')).toHaveTextContent('清除 2 个，跳过 1 个已固定')
     const call = calls.find((item) => item.url === '/api/v1/admin/cache/images/purge')
     expect(call?.body).toEqual({ upstream_id: 1, repository: 'library/redis', reference: '7' })
     await waitFor(() => {
       expect(within(table).queryByRole('row', { name: /^7@/ })).not.toBeInTheDocument()
     })
     expect(within(table).getByRole('row', { name: /latest/ })).toBeInTheDocument()
+  })
+
+  it('没有跳过任何对象时完成提示也报出跳过条数', async () => {
+    await renderImages()
+    const table = screen.getByRole('table', { name: '容器镜像' })
+    const nginxRow = await within(table).findByRole('row', { name: /docker\.io\/library\/nginx/ })
+
+    await userEvent.click(within(nginxRow).getByRole('button', { name: '删除' }))
+    await userEvent.click(
+      within(await screen.findByRole('alertdialog')).getByRole('button', { name: '确认删除' })
+    )
+
+    expect(await screen.findByRole('status')).toHaveTextContent('清除 4 个，跳过 0 个已固定')
   })
 
   it('后端拒绝删除时显示对应错误码的翻译文案', async () => {

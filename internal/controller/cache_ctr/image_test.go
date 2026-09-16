@@ -67,7 +67,7 @@ func TestCacheImages(t *testing.T) {
 			"size": float64(100), "hit_count": float64(3), "last_access_at": float64(100),
 			"tags": []any{map[string]any{
 				"reference": "7-alpine", "by_digest": false, "digest": "sha256:m", "variants": float64(1),
-				"object_count": float64(1), "pinned": true, "expired": true,
+				"object_count": float64(1), "pinned_count": float64(1), "pinned": true, "expired": true,
 				"hit_count": float64(2), "last_access_at": float64(100),
 			}},
 		})
@@ -92,7 +92,7 @@ func TestCacheImageTags(t *testing.T) {
 		data := serveJSON(t, engine, httpReq)
 		convey.So(data["list"], convey.ShouldResemble, []any{map[string]any{
 			"reference": "sha256:abc", "by_digest": true, "digest": "sha256:abc", "variants": float64(1),
-			"object_count": float64(1), "pinned": false, "expired": false,
+			"object_count": float64(1), "pinned_count": float64(0), "pinned": false, "expired": false,
 			"hit_count": float64(0), "last_access_at": float64(9),
 		}})
 	})

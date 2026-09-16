@@ -204,7 +204,7 @@ export function ImagesScreen({
       repository: item.repository,
       reference: tag.reference,
       name: tag.reference,
-      count: tag.object_count,
+      count: tag.object_count - tag.pinned_count,
     })
   }
 
@@ -304,12 +304,7 @@ export function ImagesScreen({
 
         {purged && (
           <p role="status" className="text-muted-foreground text-[12.5px]">
-            {purged.skipped > 0
-              ? t('admin.cache.purgedWithSkipped', {
-                  removed: purged.removed,
-                  skipped: purged.skipped,
-                })
-              : t('admin.cache.purged', { removed: purged.removed })}
+            {t('admin.cache.tree.purged', { removed: purged.removed, skipped: purged.skipped })}
           </p>
         )}
 

@@ -473,6 +473,8 @@ export interface CacheImageTag {
   digest: string
   variants: number
   object_count: number
+  /** 其中已固定的记录条数：删除 tag 的确认写明将清除的对象数时要扣掉它们。 */
+  pinned_count: number
   pinned: boolean
   expired: boolean
   hit_count: number

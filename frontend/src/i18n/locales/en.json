@@ -354,7 +354,7 @@
       "deleteConfirm": "Confirm delete",
       "deleteCancel": "Cancel",
       "deleteImageQuestion": "Delete image {{name}}? This purges {{count}} unpinned object(s) under it.",
-      "deleteTagQuestion": "Delete tag {{name}}? This purges {{count}} object(s) under it; pinned ones are skipped.",
+      "deleteTagQuestion": "Delete tag {{name}}? This purges {{count}} unpinned object(s) under it.",
       "columns": {
         "name": "Name",
         "tagCount": "Tags",
