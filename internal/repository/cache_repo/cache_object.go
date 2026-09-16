@@ -73,6 +73,10 @@ type CacheObjectRepo interface {
 	StatTreeMatch(ctx context.Context, opt *cache_entity.TreeMatchOption) (*cache_entity.TreeMatchStat, error)
 	// ListByPrefix 前缀下（递归到底，不排除子目录）全部对象，供按目录清除用。
 	ListByPrefix(ctx context.Context, upstreamID int64, prefix string) ([]*cache_entity.CacheObject, error)
+
+	// ScanByUpstream 管理界面的容器镜像视图（实现见 cache_image.go）：按 id 升序取
+	// 一个上游里 id 大于 afterID 的至多 limit 条记录，只含镜像聚合用得上的列。
+	ScanByUpstream(ctx context.Context, upstreamID, afterID int64, limit int) ([]*cache_entity.CacheObject, error)
 }
 
 var defaultCacheObject CacheObjectRepo

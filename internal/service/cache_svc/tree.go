@@ -8,7 +8,6 @@ import (
 
 	"github.com/cago-frame/cago/pkg/i18n"
 
-	"github.com/CodFrm/katch/internal/metrics"
 	"github.com/CodFrm/katch/internal/model/entity/cache_entity"
 	"github.com/CodFrm/katch/internal/pkg/code"
 	"github.com/CodFrm/katch/internal/repository/cache_repo"
@@ -302,7 +301,7 @@ func (c *cacheSvc) TreeSearch(ctx context.Context, req *TreeSearchRequest) (*Tre
 }
 
 // TreePurge 清除一个目录路径下（递归到底）全部未 pin 的对象，复用 Purge 的删除
-// 循环（Delete → forgot.remember → removeIfUnreferenced → metrics.RecordEviction）：
+// 循环（deleteObjects：Delete → forgot.remember → removeIfUnreferenced → metrics.RecordEviction）：
 // 按目录清除和按上游清除是同一套「跳过 pin、内容无引用才删文件」的语义。
 func (c *cacheSvc) TreePurge(ctx context.Context, req *TreePurgeRequest) (*TreePurgeResponse, error) {
 	segments, err := parseTreePath(ctx, req.Path)
@@ -324,22 +323,10 @@ func (c *cacheSvc) TreePurge(ctx context.Context, req *TreePurgeRequest) (*TreeP
 	if err != nil {
 		return nil, err
 	}
-	removed, skipped := int64(0), int64(0)
-	for _, object := range objects {
-		if object.Pinned {
-			skipped++
-			continue
-		}
-		if err := cache_repo.CacheObject().Delete(ctx, object.ID); err != nil {
-			return nil, err
-		}
-		c.forgot.remember(object.UpstreamID, object.Key, metrics.MissFirst)
-		if c.store != nil {
-			c.removeIfUnreferenced(ctx, object.Digest)
-		}
-		removed++
+	removed, skipped, err := c.purgeUnpinned(ctx, objects)
+	if err != nil {
+		return nil, err
 	}
-	metrics.RecordEviction(metrics.EvictionManual, removed)
 	return &TreePurgeResponse{Removed: removed, Skipped: skipped}, nil
 }
 

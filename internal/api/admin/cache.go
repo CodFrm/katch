@@ -177,3 +177,85 @@ type CacheTreePurgeResponse struct {
 	// 看不出还有几条留在那里。
 	Skipped int64 `json:"skipped"`
 }
+
+// ListCacheImagesRequest 按仓库列出协议含 registry 的上游里缓存过的镜像。
+//
+// 仓库名按最后一个动词段切出，开了 library_completion 的上游把 x 归并到 library/x；
+// 按最后访问倒序，每页默认 50 个。Keyword 按仓库名或 tag 做不区分大小写的子串匹配。
+type ListCacheImagesRequest struct {
+	mux.Meta `path:"/admin/cache/images" method:"GET"`
+	// UpstreamID 留空表示全部 registry 上游。
+	UpstreamID int64  `form:"upstream_id" binding:"omitempty,gte=0" label:"上游"`
+	Keyword    string `form:"keyword" binding:"omitempty,max=256" label:"关键字"`
+	Offset     int    `form:"offset" binding:"omitempty,gte=0" label:"偏移"`
+	Size       int    `form:"size" binding:"omitempty,gte=1,lte=200" label:"每页条数"`
+}
+
+// CacheImageTag 一个 manifest 引用（tag 或摘要）合并全部 Accept 变体之后的一行。
+//
+// Digest 取最近访问的那个变体；Expired 表示那个变体是已过过期时刻的可变 manifest，
+// 下次拉取会回源；任意一个变体被 pin 时 Pinned 为真。
+type CacheImageTag struct {
+	Reference    string `json:"reference"`
+	ByDigest     bool   `json:"by_digest"`
+	Digest       string `json:"digest"`
+	Variants     int    `json:"variants"`
+	ObjectCount  int64  `json:"object_count"`
+	Pinned       bool   `json:"pinned"`
+	Expired      bool   `json:"expired"`
+	HitCount     int64  `json:"hit_count"`
+	LastAccessAt int64  `json:"last_access_at"`
+}
+
+// CacheImageItem 一个镜像：体积、命中、对象数是仓库下全部缓存对象的合计，
+// 共用层在各自镜像里各算一次。Tags 仅在关键字命中 tag 时给出命中的那些，否则为空数组。
+type CacheImageItem struct {
+	UpstreamID   int64            `json:"upstream_id"`
+	Host         string           `json:"host"`
+	Repository   string           `json:"repository"`
+	TagCount     int              `json:"tag_count"`
+	ObjectCount  int64            `json:"object_count"`
+	PinnedCount  int64            `json:"pinned_count"`
+	Size         int64            `json:"size"`
+	HitCount     int64            `json:"hit_count"`
+	LastAccessAt int64            `json:"last_access_at"`
+	Tags         []*CacheImageTag `json:"tags"`
+}
+
+// ListCacheImagesResponse 一页镜像。
+type ListCacheImagesResponse struct {
+	Total      int64             `json:"total"`
+	HasMore    bool              `json:"has_more"`
+	NextOffset int               `json:"next_offset"`
+	List       []*CacheImageItem `json:"list"`
+}
+
+// ListCacheImageTagsRequest 列出一个镜像的 tag，按最后访问倒序。
+type ListCacheImageTagsRequest struct {
+	mux.Meta   `path:"/admin/cache/images/tags" method:"GET"`
+	UpstreamID int64  `form:"upstream_id" binding:"required,gte=1" label:"上游"`
+	Repository string `form:"repository" binding:"required,max=500" label:"仓库"`
+	Keyword    string `form:"keyword" binding:"omitempty,max=256" label:"关键字"`
+}
+
+// ListCacheImageTagsResponse 一个镜像的 tag 行。
+type ListCacheImageTagsResponse struct {
+	List []*CacheImageTag `json:"list"`
+}
+
+// PurgeCacheImageRequest 删除镜像（不给 Reference）或删除一个 tag。
+//
+// 删除镜像清掉仓库下（含 x 与 library/x 两种写法）全部未 pin 对象；删除 tag 只清
+// 该引用的全部变体记录，不连带层。`..`、空段、超长按参数错误拒绝。
+type PurgeCacheImageRequest struct {
+	mux.Meta   `path:"/admin/cache/images/purge" method:"POST"`
+	UpstreamID int64  `json:"upstream_id" binding:"required,gte=1" label:"上游"`
+	Repository string `json:"repository" binding:"required,max=500" label:"仓库"`
+	Reference  string `json:"reference" binding:"omitempty,max=256" label:"tag"`
+}
+
+// PurgeCacheImageResponse 清掉了几条、跳过了几条已固定的对象。
+type PurgeCacheImageResponse struct {
+	Removed int64 `json:"removed"`
+	Skipped int64 `json:"skipped"`
+}

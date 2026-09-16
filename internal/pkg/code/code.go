@@ -36,6 +36,10 @@ const (
 	CacheTreePathInvalid
 	// CacheTreeKeywordInvalid 目录树搜索词为空或过长。
 	CacheTreeKeywordInvalid
+	// CacheImageRepositoryInvalid 镜像仓库名不合法：为空、以 / 开头或结尾、含空段或 ..、过长。
+	CacheImageRepositoryInvalid
+	// CacheImageReferenceInvalid 镜像 tag 或摘要不合法：含 /、为 ..、过长。
+	CacheImageReferenceInvalid
 )
 
 func init() {
@@ -43,16 +47,18 @@ func init() {
 }
 
 var zhCN = map[int]string{
-	AdminKeyInvalid:         "管理密钥无效",
-	UpstreamNotFound:        "上游不存在",
-	UpstreamHostExists:      "该上游主机名已存在",
-	AdminKeyNotInitialized:  "尚未设置管理密钥，请在 configs/config.yaml 的 admin.initialKey 中给出初始密钥",
-	RuleNotFound:            "访问规则不存在",
-	CacheObjectNotFound:     "缓存对象不存在",
-	PurgeTargetRequired:     "请指定要清理的缓存对象或上游",
-	SettingKeyUnknown:       "没有 %s 这个设置项",
-	SettingValueInvalid:     "设置项 %s 的值不合法：%s",
-	StorageUnavailable:      "数据库暂时不可用，管理功能稍后恢复；镜像拉取不受影响",
-	CacheTreePathInvalid:    "目录路径不合法",
-	CacheTreeKeywordInvalid: "请输入不超过 256 个字符的搜索词",
+	AdminKeyInvalid:             "管理密钥无效",
+	UpstreamNotFound:            "上游不存在",
+	UpstreamHostExists:          "该上游主机名已存在",
+	AdminKeyNotInitialized:      "尚未设置管理密钥，请在 configs/config.yaml 的 admin.initialKey 中给出初始密钥",
+	RuleNotFound:                "访问规则不存在",
+	CacheObjectNotFound:         "缓存对象不存在",
+	PurgeTargetRequired:         "请指定要清理的缓存对象或上游",
+	SettingKeyUnknown:           "没有 %s 这个设置项",
+	SettingValueInvalid:         "设置项 %s 的值不合法：%s",
+	StorageUnavailable:          "数据库暂时不可用，管理功能稍后恢复；镜像拉取不受影响",
+	CacheTreePathInvalid:        "目录路径不合法",
+	CacheTreeKeywordInvalid:     "请输入不超过 256 个字符的搜索词",
+	CacheImageRepositoryInvalid: "镜像仓库名不合法",
+	CacheImageReferenceInvalid:  "镜像 tag 或摘要不合法",
 }

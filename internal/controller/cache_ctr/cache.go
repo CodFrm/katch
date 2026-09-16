@@ -144,6 +144,74 @@ func (c *Cache) TreePurge(ctx context.Context, req *admin.CacheTreePurgeRequest)
 	return &admin.CacheTreePurgeResponse{Removed: result.Removed, Skipped: result.Skipped}, nil
 }
 
+// Images 按仓库列出 registry 上游里缓存过的镜像。
+func (c *Cache) Images(ctx context.Context, req *admin.ListCacheImagesRequest) (*admin.ListCacheImagesResponse, error) {
+	result, err := cache_svc.Cache().Images(ctx, &cache_svc.ImagesRequest{
+		UpstreamID: req.UpstreamID, Keyword: req.Keyword, Offset: req.Offset, Size: req.Size})
+	if err != nil {
+		return nil, err
+	}
+	resp := &admin.ListCacheImagesResponse{
+		Total:      result.Total,
+		HasMore:    result.HasMore,
+		NextOffset: result.NextOffset,
+		List:       make([]*admin.CacheImageItem, 0, len(result.List)),
+	}
+	for _, image := range result.List {
+		resp.List = append(resp.List, &admin.CacheImageItem{
+			UpstreamID:   image.UpstreamID,
+			Host:         image.Host,
+			Repository:   image.Repository,
+			TagCount:     image.TagCount,
+			ObjectCount:  image.ObjectCount,
+			PinnedCount:  image.PinnedCount,
+			Size:         image.Size,
+			HitCount:     image.HitCount,
+			LastAccessAt: image.LastAccessAt,
+			Tags:         toImageTags(image.Tags),
+		})
+	}
+	return resp, nil
+}
+
+// ImageTags 列出一个镜像的 tag。
+func (c *Cache) ImageTags(ctx context.Context, req *admin.ListCacheImageTagsRequest) (*admin.ListCacheImageTagsResponse, error) {
+	result, err := cache_svc.Cache().ImageTags(ctx, &cache_svc.ImageTagsRequest{
+		UpstreamID: req.UpstreamID, Repository: req.Repository, Keyword: req.Keyword})
+	if err != nil {
+		return nil, err
+	}
+	return &admin.ListCacheImageTagsResponse{List: toImageTags(result.List)}, nil
+}
+
+// ImagePurge 删除镜像或删除一个 tag：跳过被 pin 的对象并报出跳过条数。
+func (c *Cache) ImagePurge(ctx context.Context, req *admin.PurgeCacheImageRequest) (*admin.PurgeCacheImageResponse, error) {
+	result, err := cache_svc.Cache().ImagePurge(ctx, &cache_svc.ImagePurgeRequest{
+		UpstreamID: req.UpstreamID, Repository: req.Repository, Reference: req.Reference})
+	if err != nil {
+		return nil, err
+	}
+	return &admin.PurgeCacheImageResponse{Removed: result.Removed, Skipped: result.Skipped}, nil
+}
+
+func toImageTags(tags []*cache_svc.ImageTag) []*admin.CacheImageTag {
+	ret := make([]*admin.CacheImageTag, 0, len(tags))
+	for _, tag := range tags {
+		ret = append(ret, &admin.CacheImageTag{
+			Reference:    tag.Reference,
+			ByDigest:     tag.ByDigest,
+			Digest:       tag.Digest,
+			Variants:     tag.Variants,
+			ObjectCount:  tag.ObjectCount,
+			Pinned:       tag.Pinned,
+			Expired:      tag.Expired,
+			HitCount:     tag.HitCount,
+			LastAccessAt: tag.LastAccessAt,
+		})
+	}
+	return ret
+}
+
 func toTreeItem(object *cache_entity.CacheObject, host string) *admin.CacheTreeObjectItem {
 	return &admin.CacheTreeObjectItem{CacheObjectItem: *toItem(object), Host: host}
 }

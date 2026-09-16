@@ -248,6 +248,21 @@ func (mr *MockCacheObjectRepoMockRecorder) Save(ctx, object any) *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Save", reflect.TypeOf((*MockCacheObjectRepo)(nil).Save), ctx, object)
 }
 
+// ScanByUpstream mocks base method.
+func (m *MockCacheObjectRepo) ScanByUpstream(ctx context.Context, upstreamID, afterID int64, limit int) ([]*cache_entity.CacheObject, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ScanByUpstream", ctx, upstreamID, afterID, limit)
+	ret0, _ := ret[0].([]*cache_entity.CacheObject)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ScanByUpstream indicates an expected call of ScanByUpstream.
+func (mr *MockCacheObjectRepoMockRecorder) ScanByUpstream(ctx, upstreamID, afterID, limit any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ScanByUpstream", reflect.TypeOf((*MockCacheObjectRepo)(nil).ScanByUpstream), ctx, upstreamID, afterID, limit)
+}
+
 // Search mocks base method.
 func (m *MockCacheObjectRepo) Search(ctx context.Context, opt *cache_entity.SearchOption) ([]*cache_entity.CacheObject, int64, error) {
 	m.ctrl.T.Helper()

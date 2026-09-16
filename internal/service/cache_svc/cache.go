@@ -133,6 +133,12 @@ type CacheSvc interface {
 	TreeSearch(ctx context.Context, req *TreeSearchRequest) (*TreeSearchResponse, error)
 	// TreePurge 按目录路径清除缓存对象，见 tree.go。
 	TreePurge(ctx context.Context, req *TreePurgeRequest) (*TreePurgeResponse, error)
+	// Images 按仓库列出 registry 上游的镜像，见 image.go。
+	Images(ctx context.Context, req *ImagesRequest) (*ImagesResponse, error)
+	// ImageTags 列出一个镜像的 tag，见 image.go。
+	ImageTags(ctx context.Context, req *ImageTagsRequest) (*ImageTagsResponse, error)
+	// ImagePurge 删除镜像或删除一个 tag，见 image.go。
+	ImagePurge(ctx context.Context, req *ImagePurgeRequest) (*ImagePurgeResponse, error)
 	// Sweep 收走已经过期的可变对象，返回收走了几条，然后按当下的配额回收一次。
 	//
 	// 「可变对象由 TTL 自行过期」（缓存一节）在读路径上只做到了「过期的不再命中」；
@@ -875,10 +881,20 @@ func (c *cacheSvc) Purge(ctx context.Context, req *PurgeRequest) (*PurgeResponse
 		// 不给「清空一切」留一个不写参数就能触发的形态。
 		return nil, i18n.NewError(ctx, code.PurgeTargetRequired)
 	}
+	removed, err := c.deleteObjects(ctx, objects)
+	if err != nil {
+		return nil, err
+	}
+	return &PurgeResponse{Removed: removed, Skipped: skipped}, nil
+}
+
+// deleteObjects 人手清除的删除循环：删记录、记下「再拉就是首次拉取」、内容无引用才删文件。
+// 按 ID、按上游、按目录、按镜像清除共用这一份。
+func (c *cacheSvc) deleteObjects(ctx context.Context, objects []*cache_entity.CacheObject) (int64, error) {
 	removed := int64(0)
 	for _, object := range objects {
-		if err := repo.Delete(ctx, object.ID); err != nil {
-			return nil, err
+		if err := cache_repo.CacheObject().Delete(ctx, object.ID); err != nil {
+			return 0, err
 		}
 		// 人手清掉的对象，再被拉回来就是一次首次拉取。这一笔还顺带盖掉它更早
 		// 之前留下的那条淘汰记录，否则清完缓存的第一次拉取会报成「被淘汰」。
@@ -889,7 +905,23 @@ func (c *cacheSvc) Purge(ctx context.Context, req *PurgeRequest) (*PurgeResponse
 		removed++
 	}
 	metrics.RecordEviction(metrics.EvictionManual, removed)
-	return &PurgeResponse{Removed: removed, Skipped: skipped}, nil
+	return removed, nil
+}
+
+// purgeUnpinned 批量清除：pin 过的跳过并计数，其余走 deleteObjects。
+func (c *cacheSvc) purgeUnpinned(ctx context.Context, objects []*cache_entity.CacheObject) (int64, int64, error) {
+	targets := make([]*cache_entity.CacheObject, 0, len(objects))
+	skipped := int64(0)
+	for _, object := range objects {
+		// pin 表达的是「这份内容要常驻」，挡住 LRU 淘汰，也挡住批量清除。
+		if object.Pinned {
+			skipped++
+			continue
+		}
+		targets = append(targets, object)
+	}
+	removed, err := c.deleteObjects(ctx, targets)
+	return removed, skipped, err
 }
 
 func (c *cacheSvc) Pin(ctx context.Context, req *PinRequest) error {
