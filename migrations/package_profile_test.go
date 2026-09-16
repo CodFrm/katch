@@ -52,8 +52,19 @@ func TestPackageProfileMigration(t *testing.T) {
 		convey.So(got.Updatetime, convey.ShouldEqual, 12)
 	})
 
-	convey.Convey("迁移只追加在列表末尾", t, func() {
+	convey.Convey("package profile 紧邻 cache response metadata 之前", t, func() {
 		list := migrationList()
-		convey.So(list[len(list)-1].ID, convey.ShouldEqual, packageProfile().ID)
+		packageProfileIndex := -1
+		cacheResponseMetadataIndex := -1
+		for i, migration := range list {
+			switch migration.ID {
+			case packageProfile().ID:
+				packageProfileIndex = i
+			case cacheResponseMetadata().ID:
+				cacheResponseMetadataIndex = i
+			}
+		}
+		convey.So(packageProfileIndex, convey.ShouldNotEqual, -1)
+		convey.So(cacheResponseMetadataIndex, convey.ShouldEqual, packageProfileIndex+1)
 	})
 }
