@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"github.com/CodFrm/katch/internal/model/entity/cache_entity"
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
 	"github.com/CodFrm/katch/internal/proxy/dispatch"
+	"github.com/CodFrm/katch/internal/proxy/packageprofile"
 	"github.com/CodFrm/katch/internal/repository/cache_repo"
 	mock_cache_repo "github.com/CodFrm/katch/internal/repository/cache_repo/mock"
 	"github.com/CodFrm/katch/internal/repository/upstream_repo"
@@ -30,6 +32,46 @@ import (
 )
 
 var errPromote = errors.New("promote failed")
+
+type testProfile struct {
+	description    packageprofile.Description
+	representation packageprofile.Representation
+	transform      func(context.Context, packageprofile.TransformRequest) (*packageprofile.TransformResult, error)
+}
+
+func (p testProfile) Describe() packageprofile.Description { return p.description }
+func (p testProfile) Classify(packageprofile.Request) packageprofile.Representation {
+	return p.representation
+}
+func (p testProfile) Transform(ctx context.Context, in packageprofile.TransformRequest) (*packageprofile.TransformResult, error) {
+	return p.transform(ctx, in)
+}
+func (testProfile) Companions() []packageprofile.Companion { return nil }
+func (testProfile) Guidance() packageprofile.Guidance      { return packageprofile.Guidance{} }
+
+type fixedRewriteSource struct {
+	snapshot *proxy_svc.RewriteSnapshot
+}
+
+func (s fixedRewriteSource) Snapshot(context.Context) (*proxy_svc.RewriteSnapshot, error) {
+	return s.snapshot, nil
+}
+
+func transformingOptions(t *testing.T, profile testProfile, generation int64) Options {
+	t.Helper()
+	profiles := packageprofile.NewRegistry()
+	if err := profiles.Register(profile); err != nil {
+		t.Fatal(err)
+	}
+	return Options{
+		Profiles: profiles,
+		RewriteConfig: fixedRewriteSource{snapshot: &proxy_svc.RewriteSnapshot{
+			SiteBaseURL: "https://katch.example.com",
+			Generation:  generation,
+			Upstreams:   map[string]proxy_svc.RewriteUpstream{},
+		}},
+	}
+}
 
 // fakeRuntime 用例侧的运行时设置。
 //
@@ -357,6 +399,26 @@ type originStub struct {
 	hits atomic.Int64
 }
 
+type localOriginProxy struct {
+	baseURL string
+}
+
+func (p localOriginProxy) Fetch(ctx context.Context, target *proxy_svc.Target) (io.ReadCloser, *proxy_svc.Meta, error) {
+	request, err := http.NewRequestWithContext(ctx, target.Method, p.baseURL+target.Path, target.Body)
+	if err != nil {
+		return nil, nil, err
+	}
+	request.URL.RawQuery = target.RawQuery
+	request.Header = target.Header.Clone()
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return nil, nil, err
+	}
+	return response.Body, &proxy_svc.Meta{
+		StatusCode: response.StatusCode, Header: response.Header.Clone(), ContentLength: response.ContentLength,
+	}, nil
+}
+
 func newOrigin(t *testing.T, handler http.HandlerFunc) *originStub {
 	t.Helper()
 	o := &originStub{}
@@ -381,6 +443,11 @@ func setupSvc(t *testing.T, o *originStub, up *upstream_entity.Upstream, opt Opt
 	upstream_repo.RegisterUpstream(proxy_svc.NewCachedUpstreamRepo(upRepo))
 	t.Cleanup(func() { upstream_repo.RegisterUpstream(prevUpstream) })
 	upRepo.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{up}, nil).AnyTimes()
+	if opt.Profiles != nil {
+		previousProxy := proxy_svc.Proxy()
+		proxy_svc.Register(localOriginProxy{baseURL: o.srv.URL})
+		t.Cleanup(func() { proxy_svc.Register(previousProxy) })
+	}
 
 	store, err := cache.NewStore(t.TempDir())
 	if err != nil {

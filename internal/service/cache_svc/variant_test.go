@@ -13,6 +13,7 @@ import (
 
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
 	"github.com/CodFrm/katch/internal/proxy/dispatch"
+	"github.com/CodFrm/katch/internal/proxy/packageprofile"
 	"github.com/CodFrm/katch/internal/service/proxy_svc"
 )
 
@@ -56,6 +57,39 @@ func manifestOrigin(t *testing.T) *originStub {
 		w.Header().Set("Content-Type", mediaType)
 		_, _ = io.WriteString(w, body)
 	})
+}
+
+func TestCacheKey_TransformedProfileIncludesGenerationAndDeclaredVariants(t *testing.T) {
+	convey.Convey("transformed metadata identity is generation-aware and normalized", t, func() {
+		tg := target("registry.example.com", "/pkg")
+		tg.RawQuery = "view=full"
+		tg.Header.Add("Accept", " Application/JSON ; q=1.0, text/html;q=0.50")
+		tg.Header.Set("User-Agent", "ignored")
+		representation := packageprofile.Representation{
+			Class: packageprofile.ClassMutable, Transform: true, Variants: []string{"Accept"},
+		}
+
+		first := cacheKeyForRepresentation(tg, representation, 41)
+		equivalent := target("registry.example.com", "/pkg")
+		equivalent.RawQuery = "view=full"
+		equivalent.Header.Add("Accept", "text/html;q=0.5,application/json")
+		convey.So(cacheKeyForRepresentation(equivalent, representation, 41), convey.ShouldEqual, first)
+		convey.So(cacheKeyForRepresentation(equivalent, representation, 42), convey.ShouldNotEqual, first)
+		convey.So(first, convey.ShouldContainSubstring, variantMarker+"generation=41")
+
+		undeclared := target("registry.example.com", "/pkg")
+		undeclared.RawQuery = "view=full"
+		undeclared.Header.Set("User-Agent", "different")
+		convey.So(cacheKeyForRepresentation(undeclared, representation, 41), convey.ShouldNotEqual, first)
+	})
+}
+
+func TestCacheKey_TransparentRepresentationKeepsLegacyIdentity(t *testing.T) {
+	tg := target("files.example.com", "/artifact.tgz")
+	representation := packageprofile.Representation{Class: packageprofile.ClassImmutable}
+	if got := cacheKeyForRepresentation(tg, representation, 99); got != "/artifact.tgz" {
+		t.Fatalf("transparent cache key = %q", got)
+	}
 }
 
 // TestGet_RegistryDigestObjectsAreImmutableWithoutPatterns 回归线上集群的真实配置：

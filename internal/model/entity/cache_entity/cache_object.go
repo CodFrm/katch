@@ -30,6 +30,17 @@ type CacheObject struct {
 	ETag string `gorm:"column:etag" json:"etag"`
 	// LastModified 上游成功响应里的 Last-Modified，原样保存、命中时原样回放。
 	LastModified string `gorm:"column:last_modified" json:"last_modified"`
+	// Safe response metadata is persisted explicitly; arbitrary origin headers never reach disk.
+	CacheControl         string `gorm:"column:cache_control" json:"cache_control"`
+	OriginDate           string `gorm:"column:origin_date" json:"origin_date"`
+	OriginAge            int64  `gorm:"column:origin_age" json:"origin_age"`
+	OriginExpires        string `gorm:"column:origin_expires" json:"origin_expires"`
+	Vary                 string `gorm:"column:vary" json:"vary"`
+	AcceptRanges         string `gorm:"column:accept_ranges" json:"accept_ranges"`
+	ContentDisposition   string `gorm:"column:content_disposition" json:"content_disposition"`
+	DockerContentDigest  string `gorm:"column:docker_content_digest" json:"docker_content_digest"`
+	StoredAt             int64  `gorm:"column:stored_at" json:"stored_at"`
+	RequiresRevalidation bool   `gorm:"column:requires_revalidation" json:"requires_revalidation"`
 	// Immutable 内容寻址的对象：内容永不改写，长期缓存，只由 LRU 淘汰（决策 7）。
 	Immutable bool `gorm:"column:immutable" json:"immutable"`
 	// Pinned 人工要求常驻，不参与淘汰。
@@ -47,7 +58,7 @@ type CacheObject struct {
 // 不可变对象永不过期（决策 7）：它的内容按摘要寻址，改不了，也就没有「过期」
 // 这回事；可变对象到点即失效，宁可多回一次源，也不能发出过期的 tag 或 InRelease。
 func (c *CacheObject) Expired(now int64) bool {
-	if c.Immutable || c.ExpiresAt == 0 {
+	if c.ExpiresAt == 0 || (c.Immutable && c.StoredAt == 0) {
 		return false
 	}
 	return now >= c.ExpiresAt

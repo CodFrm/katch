@@ -1,8 +1,13 @@
 package cache_svc
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -15,6 +20,8 @@ import (
 
 	"github.com/CodFrm/katch/internal/metrics"
 	"github.com/CodFrm/katch/internal/model/entity/cache_entity"
+	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
+	"github.com/CodFrm/katch/internal/proxy/packageprofile"
 )
 
 // TestGet_SecondPullIsServedFromDisk 目标的第一条：两次相同拉取只回源一次，
@@ -973,6 +980,307 @@ func TestGet_ConditionalOnAbsentStaleOrBrokenCopyPassesThrough(t *testing.T) {
 			convey.So(len(repo.all()), convey.ShouldEqual, 0)
 		})
 	})
+}
+
+func TestGet_ConcurrentTransformedFillsShareGenerationKey(t *testing.T) {
+	release := make(chan struct{})
+	o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{}`)
+	})
+	profile := testProfile{
+		description:    packageprofile.Description{Profile: upstream_entity.PackageProfileNPM, Name: "test"},
+		representation: packageprofile.Representation{Class: packageprofile.ClassMutable, Transform: true, MediaTypes: []string{"application/json"}},
+		transform: func(_ context.Context, in packageprofile.TransformRequest) (*packageprofile.TransformResult, error) {
+			return &packageprofile.TransformResult{Body: in.Body, ContentType: "application/json"}, nil
+		},
+	}
+	up := staticUpstream("registry.example.com")
+	up.PackageProfile = upstream_entity.PackageProfileNPM
+	svc, _, _ := setupSvc(t, o, up, transformingOptions(t, profile, 23))
+
+	const clients = 8
+	var started sync.WaitGroup
+	started.Add(clients)
+	errs := make(chan error, clients)
+	for range clients {
+		go func() {
+			started.Done()
+			body, _, err := svc.Get(context.Background(), target(up.Host, "/metadata"))
+			if err == nil {
+				_, err = io.ReadAll(body)
+				_ = body.Close()
+			}
+			errs <- err
+		}()
+	}
+	started.Wait()
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+	for range clients {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := o.hits.Load(); got != 1 {
+		t.Fatalf("canonical origin fills = %d, want 1", got)
+	}
+}
+
+func TestGet_TransformedMetadataUsesCanonicalIdentityAndKatchHeaders(t *testing.T) {
+	convey.Convey("transformable metadata uses one canonical identity representation", t, func() {
+		var gotMethod string
+		var gotHeader http.Header
+		o := newOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+			gotMethod = r.Method
+			gotHeader = r.Header.Clone()
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.Header().Set("Etag", `"origin"`)
+			w.Header().Set("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+			_, _ = io.WriteString(w, `{"url":"origin"}`)
+		})
+		profile := testProfile{
+			description: packageprofile.Description{Profile: upstream_entity.PackageProfileNPM, Name: "test"},
+			representation: packageprofile.Representation{Class: packageprofile.ClassMutable, Transform: true,
+				MediaTypes: []string{"application/json"}},
+			transform: func(_ context.Context, in packageprofile.TransformRequest) (*packageprofile.TransformResult, error) {
+				return &packageprofile.TransformResult{Body: bytes.ToUpper(in.Body), ContentType: "application/json"}, nil
+			},
+		}
+		up := staticUpstream("registry.example.com")
+		up.PackageProfile = upstream_entity.PackageProfileNPM
+		svc, repo, _ := setupSvc(t, o, up, transformingOptions(t, profile, 17))
+
+		tg := target(up.Host, "/metadata")
+		tg.Method = http.MethodHead
+		tg.Header.Set("Range", "bytes=0-3")
+		tg.Header.Set("If-None-Match", `"client-copy"`)
+		tg.Header.Set("Accept-Encoding", "gzip")
+		body, meta, err := svc.Get(context.Background(), tg)
+		convey.So(err, convey.ShouldBeNil)
+		payload, err := io.ReadAll(body)
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(body.Close(), convey.ShouldBeNil)
+		convey.So(string(payload), convey.ShouldBeEmpty)
+		convey.So(meta.StatusCode, convey.ShouldEqual, http.StatusOK)
+		convey.So(gotMethod, convey.ShouldEqual, http.MethodGet)
+		convey.So(gotHeader.Get("Accept-Encoding"), convey.ShouldEqual, "identity")
+		convey.So(gotHeader.Get("Range"), convey.ShouldBeEmpty)
+		convey.So(gotHeader.Get("If-None-Match"), convey.ShouldBeEmpty)
+
+		transformed := `{"URL":"ORIGIN"}`
+		sum := sha256.Sum256([]byte(transformed))
+		wantETag := `"sha256:` + hex.EncodeToString(sum[:]) + `"`
+		convey.So(meta.Header.Get("Etag"), convey.ShouldEqual, wantETag)
+		convey.So(meta.Header.Get("Last-Modified"), convey.ShouldBeEmpty)
+		convey.So(meta.Header.Get("Content-Encoding"), convey.ShouldBeEmpty)
+		convey.So(meta.Header.Get("Content-Length"), convey.ShouldEqual, strconv.Itoa(len(transformed)))
+		convey.So(meta.Header.Get("Content-Type"), convey.ShouldEqual, "application/json")
+		convey.So(len(repo.all()), convey.ShouldEqual, 1)
+		convey.So(repo.all()[0].Key, convey.ShouldContainSubstring, "generation=17")
+
+		got, hit := pullWith(t, svc, target(up.Host, "/metadata"))
+		convey.So(got, convey.ShouldEqual, transformed)
+		convey.So(hit.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
+		convey.So(o.hits.Load(), convey.ShouldEqual, int64(1))
+	})
+}
+
+func TestGet_TransformedMetadataRejectsInvalidOriginRepresentations(t *testing.T) {
+	cases := []struct {
+		name         string
+		contentType  string
+		encoding     string
+		body         []byte
+		transformErr error
+	}{
+		{name: "oversized", contentType: "application/json", body: bytes.Repeat([]byte("x"), maxTransformBytes+1)},
+		{name: "wrong media", contentType: "text/plain", body: []byte(`{}`)},
+		{name: "encoded", contentType: "application/json", encoding: "gzip", body: []byte(`{}`)},
+		{name: "malformed", contentType: "application/json", body: []byte(`{`), transformErr: packageprofile.ErrInvalidMetadata},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var transforms atomic.Int64
+			o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", tc.contentType)
+				if tc.encoding != "" {
+					w.Header().Set("Content-Encoding", tc.encoding)
+				}
+				_, _ = w.Write(tc.body)
+			})
+			profile := testProfile{
+				description: packageprofile.Description{Profile: upstream_entity.PackageProfileNPM, Name: "test"},
+				representation: packageprofile.Representation{Class: packageprofile.ClassMutable, Transform: true,
+					MediaTypes: []string{"application/json"}},
+				transform: func(_ context.Context, in packageprofile.TransformRequest) (*packageprofile.TransformResult, error) {
+					transforms.Add(1)
+					if tc.transformErr != nil {
+						return nil, tc.transformErr
+					}
+					return &packageprofile.TransformResult{Body: in.Body, ContentType: "application/json"}, nil
+				},
+			}
+			up := staticUpstream("registry.example.com")
+			up.PackageProfile = upstream_entity.PackageProfileNPM
+			svc, repo, _ := setupSvc(t, o, up, transformingOptions(t, profile, 1))
+			body, meta, err := svc.Get(context.Background(), target(up.Host, "/metadata"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer body.Close()
+			if meta.StatusCode != http.StatusBadGateway {
+				t.Fatalf("status = %d", meta.StatusCode)
+			}
+			if len(repo.all()) != 0 {
+				t.Fatal("invalid metadata was cached")
+			}
+			if tc.name != "malformed" && transforms.Load() != 0 {
+				t.Fatal("transform ran before admission")
+			}
+		})
+	}
+}
+
+func TestGet_VaryAdmissionAndCanonicalization(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		vary       string
+		wantCached bool
+		wantVary   string
+	}{
+		{name: "declared plus encoding", vary: "Accept-Encoding, Accept", wantCached: true, wantVary: "Accept"},
+		{name: "undeclared", vary: "User-Agent"},
+		{name: "wildcard", vary: "*"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/octet-stream")
+				w.Header().Set("Vary", tc.vary)
+				_, _ = io.WriteString(w, "artifact")
+			})
+			profile := testProfile{
+				description:    packageprofile.Description{Profile: upstream_entity.PackageProfileNPM, Name: "test"},
+				representation: packageprofile.Representation{Class: packageprofile.ClassImmutable, Variants: []string{"Accept"}},
+				transform: func(context.Context, packageprofile.TransformRequest) (*packageprofile.TransformResult, error) {
+					return nil, errors.New("unexpected")
+				},
+			}
+			up := staticUpstream("files.example.com")
+			up.PackageProfile = upstream_entity.PackageProfileNPM
+			svc, repo, _ := setupSvc(t, o, up, transformingOptions(t, profile, 1))
+			tg := target(up.Host, "/artifact")
+			tg.Header.Set("Accept", "application/octet-stream")
+			_, first := pullWith(t, svc, tg)
+			_, second := pullWith(t, svc, tg)
+			if tc.wantCached {
+				if o.hits.Load() != 1 || len(repo.all()) != 1 {
+					t.Fatalf("hits=%d rows=%d", o.hits.Load(), len(repo.all()))
+				}
+				if second.Header.Get("Vary") != tc.wantVary {
+					t.Fatalf("Vary = %q", second.Header.Get("Vary"))
+				}
+				if first.Header.Get("Vary") != tc.wantVary {
+					t.Fatalf("miss Vary = %q", first.Header.Get("Vary"))
+				}
+			} else if o.hits.Load() != 2 || len(repo.all()) != 0 {
+				t.Fatalf("uncacheable response: hits=%d rows=%d", o.hits.Load(), len(repo.all()))
+			}
+		})
+	}
+}
+
+func TestGet_FreshnessAgeAndSafeHeaderReplay(t *testing.T) {
+	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	clock := now
+	o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Cache-Control", "public, max-age=30")
+		w.Header().Set("Date", now.Add(-10*time.Second).Format(http.TimeFormat))
+		w.Header().Set("Age", "5")
+		w.Header().Set("Expires", now.Add(20*time.Second).Format(http.TimeFormat))
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Disposition", `attachment; filename="pkg.tgz"`)
+		w.Header().Set("Docker-Content-Digest", "sha256:origin")
+		w.Header().Set("X-Origin-Secret", "do-not-store")
+		w.Header().Set("Set-Cookie", "session=secret")
+		w.Header().Set("Ratelimit-Remaining", "1")
+		_, _ = io.WriteString(w, "artifact")
+	})
+	profile := testProfile{
+		description:    packageprofile.Description{Profile: upstream_entity.PackageProfileNPM, Name: "test"},
+		representation: packageprofile.Representation{Class: packageprofile.ClassMutable},
+		transform: func(context.Context, packageprofile.TransformRequest) (*packageprofile.TransformResult, error) {
+			return nil, errors.New("unexpected")
+		},
+	}
+	up := staticUpstream("files.example.com")
+	up.PackageProfile = upstream_entity.PackageProfileNPM
+	up.MutableTTLSeconds = 60
+	opt := transformingOptions(t, profile, 1)
+	opt.Now = func() time.Time { return clock }
+	svc, repo, _ := setupSvc(t, o, up, opt)
+	pullWith(t, svc, target(up.Host, "/artifact"))
+	row := repo.byKey("/artifact")
+	if row == nil {
+		t.Fatal("cache row missing")
+	}
+	if row.ExpiresAt != now.Unix()+20 {
+		t.Fatalf("expires_at = %d", row.ExpiresAt)
+	}
+
+	clock = clock.Add(5 * time.Second)
+	_, hit := pullWith(t, svc, target(up.Host, "/artifact"))
+	if hit.Header.Get("Age") != "15" {
+		t.Fatalf("Age = %q", hit.Header.Get("Age"))
+	}
+	for name, want := range map[string]string{
+		"Cache-Control": "public, max-age=30", "Date": now.Add(-10 * time.Second).Format(http.TimeFormat),
+		"Expires": now.Add(20 * time.Second).Format(http.TimeFormat), "Accept-Ranges": "bytes",
+		"Content-Disposition": `attachment; filename="pkg.tgz"`, "Docker-Content-Digest": "sha256:origin",
+	} {
+		if got := hit.Header.Get(name); got != want {
+			t.Fatalf("%s = %q, want %q", name, got, want)
+		}
+	}
+	for _, name := range []string{"X-Origin-Secret", "Set-Cookie", "Ratelimit-Remaining", "Content-Encoding"} {
+		if got := hit.Header.Get(name); got != "" {
+			t.Fatalf("unsafe %s replayed as %q", name, got)
+		}
+	}
+}
+
+func TestGet_CacheControlStoragePolicyAndAgeOverflow(t *testing.T) {
+	for _, directive := range []string{"no-store", "private"} {
+		t.Run(directive, func(t *testing.T) {
+			o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Cache-Control", directive)
+				_, _ = io.WriteString(w, "body")
+			})
+			svc, repo, _ := setupSvc(t, o, staticUpstream("files.example.com"), Options{})
+			pullWith(t, svc, target("files.example.com", "/x"))
+			pullWith(t, svc, target("files.example.com", "/x"))
+			if len(repo.all()) != 0 || o.hits.Load() != 2 {
+				t.Fatalf("rows=%d hits=%d", len(repo.all()), o.hits.Load())
+			}
+		})
+	}
+	for _, directive := range []string{"no-cache", "must-revalidate"} {
+		t.Run(directive, func(t *testing.T) {
+			o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Cache-Control", directive)
+				w.Header().Set("Age", strconv.FormatInt(math.MaxInt64, 10))
+				_, _ = io.WriteString(w, "body")
+			})
+			svc, repo, _ := setupSvc(t, o, staticUpstream("files.example.com"), Options{})
+			pullWith(t, svc, target("files.example.com", "/x"))
+			pullWith(t, svc, target("files.example.com", "/x"))
+			if len(repo.all()) != 1 || o.hits.Load() != 2 {
+				t.Fatalf("rows=%d hits=%d", len(repo.all()), o.hits.Load())
+			}
+		})
+	}
 }
 
 func waitForKey(repo *fakeRepo, key string, timeout time.Duration) *cache_entity.CacheObject {

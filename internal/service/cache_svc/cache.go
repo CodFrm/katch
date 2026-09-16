@@ -6,10 +6,17 @@
 package cache_svc
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
+	"math"
+	"mime"
 	"net/http"
+	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +32,9 @@ import (
 	"github.com/CodFrm/katch/internal/model/entity/event_entity"
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
 	"github.com/CodFrm/katch/internal/pkg/code"
+	"github.com/CodFrm/katch/internal/proxy/destination"
+	"github.com/CodFrm/katch/internal/proxy/dispatch"
+	"github.com/CodFrm/katch/internal/proxy/packageprofile"
 	"github.com/CodFrm/katch/internal/repository/cache_repo"
 	"github.com/CodFrm/katch/internal/service/event_svc"
 	"github.com/CodFrm/katch/internal/service/proxy_svc"
@@ -52,7 +62,8 @@ const (
 	evictBatch = 64
 	// copyBufferSize 回源转发的缓冲区。镜像层动辄几百 MB，缓冲太小会把一次拷贝
 	// 变成几百万次系统调用。
-	copyBufferSize = 64 << 10
+	copyBufferSize    = 64 << 10
+	maxTransformBytes = 16 << 20
 )
 
 // Options 缓存层的构造参数。
@@ -66,6 +77,13 @@ type Options struct {
 	// Runtime 运行时设置的来源，nil 表示进程级的那一个（setting_svc）。
 	// 用例注入一个假的，就能在不写库的情况下把配额压到几十字节。
 	Runtime setting_svc.RuntimeSource
+	// Profiles selects independently registered package adapters. nil uses the process registry.
+	Profiles *packageprofile.Registry
+	// RewriteConfig and DestinationResolver provide one rewrite generation and safe URL validation.
+	RewriteConfig       proxy_svc.RewriteConfigSource
+	DestinationResolver destination.DestinationResolver
+	// Now is injectable for freshness and Age tests.
+	Now func() time.Time
 }
 
 // PutRequest 直接写入一个缓存对象。
@@ -155,10 +173,15 @@ type CacheSvc interface {
 type cacheSvc struct {
 	store *cache.Store
 	// runtime 配额、回收水位与可变对象 TTL 的来源，每次用到时现读。
-	runtime setting_svc.RuntimeSource
+	runtime       setting_svc.RuntimeSource
+	profiles      *packageprofile.Registry
+	rewriteConfig proxy_svc.RewriteConfigSource
+	resolver      destination.DestinationResolver
+	now           func() time.Time
 	// mu 只护 inflight 这张表。
-	mu       sync.Mutex
-	inflight map[string]*flight
+	mu           sync.Mutex
+	inflight     map[string]*flight
+	transforming map[string]chan struct{}
 	// evictMu 把淘汰串起来：几个下载同时收尾时各淘汰各的，会把缓存削过头。
 	evictMu sync.Mutex
 	// forgot 被我们自己收走的键，供下一次未命中归因，见 miss.go。
@@ -178,8 +201,19 @@ func New(store *cache.Store, opt Options) CacheSvc {
 	if opt.Runtime == nil {
 		opt.Runtime = setting_svc.Setting()
 	}
-	return &cacheSvc{store: store, runtime: opt.Runtime,
-		inflight: map[string]*flight{}, forgot: newForgotten()}
+	if opt.RewriteConfig == nil {
+		opt.RewriteConfig = proxy_svc.NewRewriteConfigSource()
+	}
+	if opt.DestinationResolver == nil {
+		opt.DestinationResolver = destination.New(destination.Options{})
+	}
+	if opt.Now == nil {
+		opt.Now = time.Now
+	}
+	return &cacheSvc{store: store, runtime: opt.Runtime, profiles: opt.Profiles,
+		rewriteConfig: opt.RewriteConfig, resolver: opt.DestinationResolver, now: opt.Now,
+		inflight: map[string]*flight{}, transforming: map[string]chan struct{}{},
+		forgot: newForgotten()}
 }
 
 // limits 读一次运行时设置。
@@ -208,46 +242,83 @@ func Register(svc CacheSvc) {
 }
 
 func (c *cacheSvc) Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCloser, *proxy_svc.Meta, error) {
-	if !c.usable() || !objectCacheEligible(target) {
+	if target.Git.IsGit() || (target.Method != http.MethodGet && target.Method != http.MethodHead) {
+		return proxy_svc.Proxy().Fetch(ctx, target)
+	}
+	upstream, err := upstream_svc.Upstream().FindByHost(ctx, target.Host)
+	if err != nil || upstream == nil {
+		return proxy_svc.Proxy().Fetch(ctx, target)
+	}
+	representation, profile := c.classify(upstream, target)
+	if representation.Recognized() && representation.Transform {
+		if !identityAccepted(target.Header) {
+			return statusOnly(http.StatusNotAcceptable)
+		}
+		return c.getTransformed(ctx, target, upstream, profile, representation)
+	}
+	if !identityAccepted(target.Header) {
+		return proxy_svc.Proxy().Fetch(ctx, target)
+	}
+	if !c.usable() || rangeRequest(target) {
 		body, meta, err := proxy_svc.Proxy().Fetch(ctx, target)
 		if err != nil {
 			return nil, nil, err
 		}
 		return body, rangePassthroughMiss(target, meta), nil
 	}
-	upstream, err := upstream_svc.Upstream().FindByHost(ctx, target.Host)
-	if err != nil || upstream == nil {
-		// 查不到上游、或者库不可用，都交回代理层：白名单这道闸和它给出的统一
-		// 404 只能有一个出处，在这里复述一遍迟早会和那边走偏。
-		return proxy_svc.Proxy().Fetch(ctx, target)
-	}
-	key := cacheKey(target)
+	key := cacheKeyForRepresentation(target, representation, 0)
 	immutable, protocolDefined := registryRequestImmutability(target)
-	if !protocolDefined {
+	if representation.Recognized() {
+		immutable = representation.Class == packageprofile.ClassImmutable
+		protocolDefined = true
+	} else if !protocolDefined {
 		immutable = cache.IsImmutable(upstream.ImmutablePatterns, key)
 	}
-	body, meta, m := c.serveFromDisk(ctx, target, upstream, key, immutable, protocolDefined && !immutable)
+	body, meta, m := c.serveFromDisk(ctx, target, upstream, key, immutable,
+		protocolDefined && !immutable, false)
 	if m == nil {
 		return body, meta, nil
 	}
 	if !writableRequest(target) {
-		// HEAD 与条件请求未命中（无副本、已过期、副本损坏，或缺少对应 validator）：
-		// 判断交回上游，这一次不留记录。它仍是一次由缓存判定发生的真实回源，
-		// 按现有归因标成未命中——只写 X-Katch-Miss 而不写 X-Katch-Cache 的话，
-		// 客户端只看得到「没有 HIT」，无法据此判定这一次回了源。
 		body, meta, err = proxy_svc.Proxy().Fetch(ctx, target)
 		if err != nil {
 			return nil, nil, err
 		}
 		return body, stampPassthroughMiss(meta, m), nil
 	}
-	body, meta, err = c.fetchAndCache(ctx, target, upstream, key, immutable)
+	body, meta, err = c.fetchAndCache(ctx, target, upstream, key, immutable,
+		declaredVariants(target, representation))
 	if err != nil {
 		return nil, nil, err
 	}
-	// 归因收口在这一处：它必须在第一个字节发出去之前定下来，而「上游那份还是
-	// 不是我们手上那份」要等回源的响应头到手才知道（见 miss.stamp）。
 	return body, m.stamp(meta), nil
+}
+
+func (c *cacheSvc) classify(upstream *upstream_entity.Upstream,
+	target *proxy_svc.Target,
+) (packageprofile.Representation, packageprofile.Profile) {
+	name := upstream_entity.NormalizePackageProfile(upstream.PackageProfile)
+	if target.Kind != dispatch.KindStatic || name == upstream_entity.PackageProfileNone {
+		return packageprofile.Representation{}, nil
+	}
+	var profile packageprofile.Profile
+	var ok bool
+	if c.profiles != nil {
+		profile, ok = c.profiles.Lookup(name)
+	} else {
+		profile, ok = packageprofile.Lookup(name)
+	}
+	if !ok {
+		return packageprofile.Representation{}, nil
+	}
+	representation := profile.Classify(packageprofile.Request{
+		Host: target.Host, Path: target.Path, RawQuery: target.RawQuery, Header: target.Header.Clone(),
+	})
+	return representation, profile
+}
+
+func statusOnly(status int) (io.ReadCloser, *proxy_svc.Meta, error) {
+	return http.NoBody, &proxy_svc.Meta{StatusCode: status, Header: make(http.Header)}, nil
 }
 
 // Quiesce 等存量的后台下载收尾，见接口上的说明。
@@ -347,7 +418,7 @@ func writableRequest(target *proxy_svc.Target) bool {
 }
 
 // cacheableResponse 哪些响应可以留下来。
-func cacheableResponse(meta *proxy_svc.Meta) bool {
+func cacheableResponse(meta *proxy_svc.Meta, variants []string) bool {
 	// 只缓存 200：4xx/5xx 原样透传但不缓存，否则上游的一次抖动会被固化下来；
 	// 206 是半截内容；304 没有响应体。
 	if meta.StatusCode != http.StatusOK {
@@ -361,8 +432,314 @@ func cacheableResponse(meta *proxy_svc.Meta) bool {
 	if enc := meta.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
 		return false
 	}
-	cc := strings.ToLower(meta.Header.Get("Cache-Control"))
-	return !strings.Contains(cc, "no-store") && !strings.Contains(cc, "private")
+	cc := parseCacheControl(meta.Header.Get("Cache-Control"))
+	if _, denied := cc["no-store"]; denied {
+		return false
+	}
+	if _, denied := cc["private"]; denied {
+		return false
+	}
+	return canonicalizeVary(meta.Header, variants)
+}
+
+func declaredVariants(target *proxy_svc.Target, representation packageprofile.Representation) []string {
+	variants := append([]string(nil), representation.Variants...)
+	if acceptVaries(target) {
+		variants = append(variants, "Accept")
+	}
+	return variants
+}
+
+func canonicalTarget(target *proxy_svc.Target) *proxy_svc.Target {
+	cloned := *target
+	cloned.Header = target.Header.Clone()
+	cloned.Header.Set("Accept-Encoding", "identity")
+	return &cloned
+}
+
+func canonicalMetadataTarget(target *proxy_svc.Target) *proxy_svc.Target {
+	cloned := canonicalTarget(target)
+	cloned.Method = http.MethodGet
+	for _, name := range []string{"Range", "If-Range", "If-Match", "If-Unmodified-Since", "If-None-Match", "If-Modified-Since"} {
+		cloned.Header.Del(name)
+	}
+	return cloned
+}
+
+func identityAccepted(header http.Header) bool {
+	lines := header.Values("Accept-Encoding")
+	if len(lines) == 0 {
+		return true
+	}
+	identity, wildcard := -1.0, -1.0
+	for _, line := range lines {
+		for _, item := range strings.Split(line, ",") {
+			fields := strings.Split(strings.TrimSpace(item), ";")
+			name := strings.ToLower(strings.TrimSpace(fields[0]))
+			q := 1.0
+			for _, field := range fields[1:] {
+				key, value, ok := strings.Cut(strings.TrimSpace(field), "=")
+				if ok && strings.EqualFold(key, "q") {
+					parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+					if err == nil {
+						q = parsed
+					}
+				}
+			}
+			switch name {
+			case "identity":
+				identity = q
+			case "*":
+				wildcard = q
+			}
+		}
+	}
+	if identity >= 0 {
+		return identity > 0
+	}
+	return wildcard != 0
+}
+
+func canonicalizeVary(header http.Header, variants []string) bool {
+	allowed := make(map[string]struct{}, len(variants))
+	for _, variant := range variants {
+		name := http.CanonicalHeaderKey(strings.TrimSpace(variant))
+		if name != "" && !strings.EqualFold(name, "Accept-Encoding") {
+			allowed[strings.ToLower(name)] = struct{}{}
+		}
+	}
+	kept := make([]string, 0, len(allowed))
+	seen := map[string]struct{}{}
+	for _, line := range header.Values("Vary") {
+		for _, item := range strings.Split(line, ",") {
+			name := http.CanonicalHeaderKey(strings.TrimSpace(item))
+			if name == "" || strings.EqualFold(name, "Accept-Encoding") {
+				continue
+			}
+			if name == "*" {
+				return false
+			}
+			lower := strings.ToLower(name)
+			if _, ok := allowed[lower]; !ok {
+				return false
+			}
+			if _, ok := seen[lower]; !ok {
+				seen[lower] = struct{}{}
+				kept = append(kept, name)
+			}
+		}
+	}
+	slices.Sort(kept)
+	if len(kept) == 0 {
+		header.Del("Vary")
+	} else {
+		header.Set("Vary", strings.Join(kept, ", "))
+	}
+	return true
+}
+
+func parseCacheControl(value string) map[string]string {
+	out := make(map[string]string)
+	for _, part := range strings.Split(value, ",") {
+		name, argument, _ := strings.Cut(strings.TrimSpace(part), "=")
+		name = strings.ToLower(strings.TrimSpace(name))
+		if name != "" {
+			out[name] = strings.Trim(strings.TrimSpace(argument), `"`)
+		}
+	}
+	return out
+}
+
+func (c *cacheSvc) getTransformed(ctx context.Context, target *proxy_svc.Target,
+	upstream *upstream_entity.Upstream, profile packageprofile.Profile,
+	representation packageprofile.Representation,
+) (io.ReadCloser, *proxy_svc.Meta, error) {
+	snapshot, err := c.rewriteConfig.Snapshot(ctx)
+	if err != nil || snapshot == nil || snapshot.SiteBaseURL == "" {
+		return statusOnly(http.StatusServiceUnavailable)
+	}
+	key := cacheKeyForRepresentation(target, representation, snapshot.Generation)
+	immutable := representation.Class == packageprofile.ClassImmutable
+	if c.usable() {
+		if body, meta, miss := c.serveFromDisk(ctx, target, upstream, key, immutable,
+			representation.Class == packageprofile.ClassMutable, true); miss == nil {
+			return body, meta, nil
+		}
+		if wait, leader := c.beginTransform(key); !leader {
+			select {
+			case <-wait:
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			}
+			if body, meta, miss := c.serveFromDisk(ctx, target, upstream, key, immutable,
+				representation.Class == packageprofile.ClassMutable, true); miss == nil {
+				return body, meta, nil
+			}
+			return c.getTransformed(ctx, target, upstream, profile, representation)
+		}
+		defer c.finishTransform(key)
+	}
+
+	fillCtx := context.WithoutCancel(ctx)
+	body, meta, err := proxy_svc.Proxy().Fetch(fillCtx, canonicalMetadataTarget(target))
+	if err != nil {
+		return nil, nil, err
+	}
+	if meta.StatusCode == http.StatusNotFound || meta.StatusCode == http.StatusGone || meta.StatusCode >= 400 {
+		return body, meta, nil
+	}
+	if meta.StatusCode != http.StatusOK {
+		_ = body.Close()
+		return statusOnly(http.StatusBadGateway)
+	}
+	if encoding := strings.TrimSpace(meta.Header.Get("Content-Encoding")); encoding != "" && !strings.EqualFold(encoding, "identity") {
+		_ = body.Close()
+		return statusOnly(http.StatusBadGateway)
+	}
+	if meta.ContentLength > maxTransformBytes {
+		_ = body.Close()
+		return statusOnly(http.StatusBadGateway)
+	}
+	mediaType, _, mediaErr := mime.ParseMediaType(meta.Header.Get("Content-Type"))
+	if mediaErr != nil || !acceptedMediaType(mediaType, representation.MediaTypes) {
+		_ = body.Close()
+		return statusOnly(http.StatusBadGateway)
+	}
+	limited := io.LimitReader(body, maxTransformBytes+1)
+	originBody, readErr := io.ReadAll(limited)
+	closeErr := body.Close()
+	if readErr != nil || closeErr != nil || len(originBody) > maxTransformBytes {
+		return statusOnly(http.StatusBadGateway)
+	}
+	source, err := url.Parse("https://" + target.Host + target.Path)
+	if err != nil {
+		return statusOnly(http.StatusBadGateway)
+	}
+	source.RawQuery = target.RawQuery
+	result, err := profile.Transform(fillCtx, packageprofile.TransformRequest{
+		Body: originBody, ContentType: mediaType, Source: source, SiteBaseURL: snapshot.SiteBaseURL,
+		RewriteURL: c.urlRewriter(snapshot),
+	})
+	if err != nil || result == nil || len(result.Body) > maxTransformBytes {
+		if errors.Is(err, packageprofile.ErrUnavailable) {
+			return statusOnly(http.StatusServiceUnavailable)
+		}
+		return statusOnly(http.StatusBadGateway)
+	}
+
+	header := safeResponseHeaders(meta.Header)
+	header.Del("Content-Encoding")
+	header.Del("Last-Modified")
+	header.Del("Etag")
+	header.Del("Docker-Content-Digest")
+	cacheable := canonicalizeVary(header, representation.Variants)
+	sum := sha256.Sum256(result.Body)
+	header.Set("Etag", `"sha256:`+hex.EncodeToString(sum[:])+`"`)
+	header.Set("Content-Length", strconv.Itoa(len(result.Body)))
+	if result.ContentType != "" {
+		header.Set("Content-Type", result.ContentType)
+	}
+	outMeta := &proxy_svc.Meta{StatusCode: http.StatusOK, Header: header, ContentLength: int64(len(result.Body))}
+	if cacheable && cacheableResponse(outMeta, representation.Variants) && c.usable() {
+		if err := c.storeBuffered(fillCtx, upstream, key, result.Body, outMeta, immutable); err != nil {
+			logger.Ctx(ctx).Warn("写转换后缓存失败", zap.String("key", key), zap.Error(err))
+		}
+	}
+	return transformedResponse(target, result.Body, outMeta, cacheStatusMiss)
+}
+
+func (c *cacheSvc) beginTransform(key string) (<-chan struct{}, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if running, ok := c.transforming[key]; ok {
+		return running, false
+	}
+	done := make(chan struct{})
+	c.transforming[key] = done
+	return done, true
+}
+
+func (c *cacheSvc) finishTransform(key string) {
+	c.mu.Lock()
+	done := c.transforming[key]
+	delete(c.transforming, key)
+	close(done)
+	c.mu.Unlock()
+}
+
+func acceptedMediaType(got string, accepted []string) bool {
+	if len(accepted) == 0 {
+		return got != ""
+	}
+	for _, candidate := range accepted {
+		if strings.EqualFold(got, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func transformedResponse(target *proxy_svc.Target, payload []byte, meta *proxy_svc.Meta,
+	cacheStatus string,
+) (io.ReadCloser, *proxy_svc.Meta, error) {
+	header := meta.Header.Clone()
+	header.Set(cacheStatusHeader, cacheStatus)
+	conditions := target.Header.Clone()
+	conditions.Del("If-Modified-Since")
+	conditions.Del("If-Unmodified-Since")
+	if evaluateConditional(conditions, header.Get("Etag"), "") == conditionNotModified {
+		return http.NoBody, notModifiedMeta(header), nil
+	}
+	out := &proxy_svc.Meta{StatusCode: http.StatusOK, Header: header, ContentLength: int64(len(payload))}
+	if target.Method == http.MethodHead {
+		return http.NoBody, out, nil
+	}
+	return io.NopCloser(bytes.NewReader(payload)), out, nil
+}
+
+func (c *cacheSvc) urlRewriter(snapshot *proxy_svc.RewriteSnapshot) packageprofile.RewriteURL {
+	return func(ctx context.Context, target *url.URL, companion packageprofile.Companion) (*url.URL, error) {
+		host := strings.ToLower(strings.TrimSuffix(target.Hostname(), "."))
+		if companion.Host != "" && host != strings.ToLower(strings.TrimSuffix(companion.Host, ".")) {
+			return nil, packageprofile.ErrInvalidMetadata
+		}
+		configured, ok := snapshot.Upstreams[host]
+		if !ok || (companion.Transport != "" && !configured.Transports.Has(companion.Transport)) ||
+			(companion.Profile != "" && upstream_entity.NormalizePackageProfile(configured.Profile) != companion.Profile) {
+			return nil, packageprofile.ErrUnavailable
+		}
+		if _, err := c.resolver.Resolve(ctx, target, destination.DestinationRequirement{
+			AddressPolicy: destination.PublicAddressesOnly,
+		}); err != nil {
+			return nil, packageprofile.ErrInvalidMetadata
+		}
+		mapped, err := url.Parse(strings.TrimSuffix(snapshot.SiteBaseURL, "/") + "/" + host + target.EscapedPath())
+		if err != nil {
+			return nil, packageprofile.ErrUnavailable
+		}
+		mapped.RawQuery = target.RawQuery
+		mapped.Fragment = target.Fragment
+		return mapped, nil
+	}
+}
+
+func (c *cacheSvc) storeBuffered(ctx context.Context, upstream *upstream_entity.Upstream,
+	key string, payload []byte, meta *proxy_svc.Meta, immutable bool,
+) error {
+	writer, err := c.store.Create()
+	if err != nil {
+		return err
+	}
+	defer writer.Close()
+	if _, err := writer.Write(payload); err != nil {
+		return err
+	}
+	digest, size, err := writer.Commit()
+	if err != nil {
+		return err
+	}
+	return c.saveRecord(ctx, responseRecordInput(upstream.ID, key, digest, size, meta,
+		immutable, int64(upstream.MutableTTLSeconds), c.now()))
 }
 
 // cacheKey 缓存键：上游内路径加查询串，末尾按需缀上这次请求的变体。
@@ -390,7 +767,8 @@ func cacheKey(target *proxy_svc.Target) string {
 // 第三个返回值为 nil 表示这次是命中；否则它带着这次未命中的归因——判断只能在
 // 这里做，往上一层就只剩「查不到记录」这一个事实了。
 func (c *cacheSvc) serveFromDisk(ctx context.Context, target *proxy_svc.Target,
-	upstream *upstream_entity.Upstream, key string, immutable, protocolMutable bool) (io.ReadCloser, *proxy_svc.Meta, *miss) {
+	upstream *upstream_entity.Upstream, key string, immutable, protocolMutable, transformed bool,
+) (io.ReadCloser, *proxy_svc.Meta, *miss) {
 	repo := cache_repo.CacheObject()
 	object, err := repo.FindByKey(ctx, upstream.ID, key)
 	if err != nil {
@@ -421,7 +799,7 @@ func (c *cacheSvc) serveFromDisk(ctx context.Context, target *proxy_svc.Target,
 				zap.Int64("id", object.ID), zap.String("key", key), zap.Error(err))
 		}
 	}
-	if object.Expired(time.Now().Unix()) {
+	if object.RequiresRevalidation || object.Expired(c.now().Unix()) {
 		// 记录还在，只是过期了——可变对象由 TTL 自行过期（缓存一节）。
 		// 带上手上这份的摘要：回源的响应头会说清上游那份是不是同一个。
 		return nil, nil, &miss{reason: metrics.MissTTL, heldDigest: object.Digest}
@@ -453,7 +831,7 @@ func (c *cacheSvc) serveFromDisk(ctx context.Context, target *proxy_svc.Target,
 		c.dropRecord(ctx, object)
 		return nil, nil, brokenCopyMiss()
 	}
-	header := make(http.Header, 7)
+	header := replayStoredHeaders(object, c.now())
 	if object.ContentType != "" {
 		header.Set("Content-Type", object.ContentType)
 	}
@@ -478,7 +856,9 @@ func (c *cacheSvc) serveFromDisk(ctx context.Context, target *proxy_svc.Target,
 	// 这串推导值——否则未命中发上游、命中换推导，同一份内容就有了两个互不相认的强
 	// 校验符，客户端拿着命中的那个去回源做条件请求，只会换回一次整份重传。
 	if upstream.Protocols.Has(upstream_entity.ProtocolRegistry) && object.Digest != "" {
-		header.Set("Docker-Content-Digest", object.Digest)
+		if object.DockerContentDigest == "" {
+			header.Set("Docker-Content-Digest", object.Digest)
+		}
 		if object.ETag == "" {
 			header.Set("Etag", `"`+object.Digest+`"`)
 		}
@@ -488,13 +868,19 @@ func (c *cacheSvc) serveFromDisk(ctx context.Context, target *proxy_svc.Target,
 	//
 	// 求值排在 Touch 之前：只有真的答出一份副本（200/304/HEAD）才算一次命中，
 	// 缺 validator 而透传的那一次不该被记成命中。
-	outcome := evaluateConditional(target.Header, header.Get("Etag"), header.Get("Last-Modified"))
+	conditionHeader := target.Header
+	if transformed {
+		conditionHeader = target.Header.Clone()
+		conditionHeader.Del("If-Modified-Since")
+		conditionHeader.Del("If-Unmodified-Since")
+	}
+	outcome := evaluateConditional(conditionHeader, header.Get("Etag"), header.Get("Last-Modified"))
 	if outcome == conditionUnresolved {
 		// 有效条件存在，副本却没有对应 validator：不猜，把判断交回上游。
 		_ = file.Close()
 		return nil, nil, &miss{reason: metrics.MissFirst}
 	}
-	if err := repo.Touch(ctx, object.ID, time.Now().Unix()); err != nil {
+	if err := repo.Touch(ctx, object.ID, c.now().Unix()); err != nil {
 		// 命中已经成立了，访问时间没更新上只影响淘汰顺序，不该让这次拉取失败。
 		logger.Ctx(ctx).Warn("更新缓存访问时间失败", zap.Int64("id", object.ID), zap.Error(err))
 	}
@@ -571,7 +957,9 @@ func (c *cacheSvc) removeIfUnreferenced(ctx context.Context, digest string) {
 
 // fetchAndCache 未命中：回源，同一对象的并发请求合并成一次（决策 9）。
 func (c *cacheSvc) fetchAndCache(ctx context.Context, target *proxy_svc.Target,
-	upstream *upstream_entity.Upstream, key string, immutable bool) (io.ReadCloser, *proxy_svc.Meta, error) {
+	upstream *upstream_entity.Upstream, key string, immutable bool,
+	variants []string,
+) (io.ReadCloser, *proxy_svc.Meta, error) {
 	flightKey := objectKey(upstream.ID, key)
 
 	c.mu.Lock()
@@ -586,13 +974,14 @@ func (c *cacheSvc) fetchAndCache(ctx context.Context, target *proxy_svc.Target,
 	// 回源用脱离客户端取消的 context：客户端断开时下载要继续跑完，已下载的部分
 	// 仍要写完缓存——下一个请求就能命中，否则一次断线就白白浪费整趟回源。
 	fetchCtx := context.WithoutCancel(ctx)
-	body, meta, err := proxy_svc.Proxy().Fetch(fetchCtx, target)
+	fetchTarget := canonicalTarget(target)
+	body, meta, err := proxy_svc.Proxy().Fetch(fetchCtx, fetchTarget)
 	if err != nil {
 		c.forget(flightKey)
 		current.startFailed(err)
 		return nil, nil, err
 	}
-	if !cacheableResponse(meta) {
+	if !cacheableResponse(meta, variants) {
 		c.forget(flightKey)
 		current.startUncacheable()
 		return body, meta, nil
@@ -658,17 +1047,8 @@ func (c *cacheSvc) pump(ctx context.Context, flightKey string, current *flight,
 		if err != nil {
 			logger.Ctx(ctx).Error("提交缓存文件失败", zap.String("key", key), zap.Error(err))
 			digest = ""
-		} else if err := c.saveRecord(ctx, &recordInput{
-			UpstreamID:   upstream.ID,
-			Key:          key,
-			Digest:       digest,
-			Size:         size,
-			ContentType:  meta.Header.Get("Content-Type"),
-			ETag:         meta.Header.Get("ETag"),
-			LastModified: meta.Header.Get("Last-Modified"),
-			Immutable:    immutable,
-			TTLSeconds:   int64(upstream.MutableTTLSeconds),
-		}); err != nil {
+		} else if err := c.saveRecord(ctx, responseRecordInput(upstream.ID, key, digest, size,
+			meta, immutable, int64(upstream.MutableTTLSeconds), c.now())); err != nil {
 			logger.Ctx(ctx).Error("写缓存记录失败", zap.String("key", key), zap.Error(err))
 		}
 	} else {
@@ -716,8 +1096,141 @@ type recordInput struct {
 	ETag         string
 	LastModified string
 	Immutable    bool
-	// TTLSeconds 可变对象的存活时长，0 表示用全局默认值。
-	TTLSeconds int64
+	TTLSeconds   int64
+	Header       http.Header
+	StoredAt     time.Time
+}
+
+func responseRecordInput(upstreamID int64, key, digest string, size int64,
+	meta *proxy_svc.Meta, immutable bool, ttl int64, storedAt time.Time,
+) *recordInput {
+	header := safeResponseHeaders(meta.Header)
+	return &recordInput{
+		UpstreamID: upstreamID, Key: key, Digest: digest, Size: size,
+		ContentType: header.Get("Content-Type"), ETag: header.Get("Etag"),
+		LastModified: header.Get("Last-Modified"), Immutable: immutable,
+		TTLSeconds: ttl, Header: header, StoredAt: storedAt,
+	}
+}
+
+var persistedResponseHeaders = []string{
+	"Content-Type", "Etag", "Last-Modified", "Cache-Control", "Date", "Age", "Expires",
+	"Vary", "Accept-Ranges", "Content-Disposition", "Docker-Content-Digest",
+}
+
+func safeResponseHeaders(source http.Header) http.Header {
+	out := make(http.Header, len(persistedResponseHeaders))
+	for _, name := range persistedResponseHeaders {
+		for _, value := range source.Values(name) {
+			if safe := safeHeaderValue(value); safe != "" {
+				out.Add(name, safe)
+			}
+		}
+	}
+	return out
+}
+
+func safeHeaderValue(value string) string {
+	if strings.ContainsAny(value, "\r\n") {
+		return ""
+	}
+	return strings.TrimSpace(value)
+}
+
+func correctedInitialAge(header http.Header, now time.Time) int64 {
+	age := parseNonnegativeSeconds(header.Get("Age"))
+	if date, err := http.ParseTime(header.Get("Date")); err == nil && now.After(date) {
+		apparent := durationSeconds(now.Sub(date))
+		if apparent > age {
+			age = apparent
+		}
+	}
+	return age
+}
+
+func parseNonnegativeSeconds(value string) int64 {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.HasPrefix(value, "-") {
+		return 0
+	}
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	if err != nil || parsed > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(parsed)
+}
+
+func durationSeconds(duration time.Duration) int64 {
+	if duration <= 0 {
+		return 0
+	}
+	return int64(duration / time.Second)
+}
+
+func effectiveExpiration(now time.Time, ttl int64, immutable bool,
+	object *cache_entity.CacheObject,
+) int64 {
+	lifetime := int64(math.MaxInt64)
+	if !immutable && ttl > 0 {
+		lifetime = ttl
+	}
+	directives := parseCacheControl(object.CacheControl)
+	for _, name := range []string{"s-maxage", "max-age"} {
+		if value, ok := directives[name]; ok {
+			seconds := parseNonnegativeSeconds(value)
+			if seconds < lifetime {
+				lifetime = seconds
+			}
+			break
+		}
+	}
+	if expires, err := http.ParseTime(object.OriginExpires); err == nil {
+		base := now
+		if date, dateErr := http.ParseTime(object.OriginDate); dateErr == nil {
+			base = date
+		}
+		seconds := durationSeconds(expires.Sub(base))
+		if seconds < lifetime {
+			lifetime = seconds
+		}
+	}
+	if lifetime == math.MaxInt64 {
+		return 0
+	}
+	remaining := lifetime - min(lifetime, object.OriginAge)
+	return saturatingAdd(now.Unix(), remaining)
+}
+
+func saturatingAdd(left, right int64) int64 {
+	if right > 0 && left > math.MaxInt64-right {
+		return math.MaxInt64
+	}
+	if right < 0 && left < math.MinInt64-right {
+		return math.MinInt64
+	}
+	return left + right
+}
+
+func replayStoredHeaders(object *cache_entity.CacheObject, now time.Time) http.Header {
+	header := make(http.Header, 12)
+	for name, value := range map[string]string{
+		"Cache-Control": object.CacheControl, "Date": object.OriginDate,
+		"Expires": object.OriginExpires, "Vary": object.Vary,
+		"Accept-Ranges": object.AcceptRanges, "Content-Disposition": object.ContentDisposition,
+		"Docker-Content-Digest": object.DockerContentDigest,
+	} {
+		if safe := safeHeaderValue(value); safe != "" {
+			header.Set(name, safe)
+		}
+	}
+	if object.StoredAt > 0 {
+		residence := now.Unix() - object.StoredAt
+		if residence < 0 {
+			residence = 0
+		}
+		header.Set("Age", strconv.FormatInt(saturatingAdd(object.OriginAge, residence), 10))
+	}
+	return header
 }
 
 // saveRecord 写入或更新一条缓存记录。
@@ -726,7 +1239,11 @@ type recordInput struct {
 // 否则表里会为同一个 key 越堆越多，而唯一索引会在第二次写入时直接报错。
 func (c *cacheSvc) saveRecord(ctx context.Context, in *recordInput) error {
 	repo := cache_repo.CacheObject()
-	now := time.Now().Unix()
+	nowTime := in.StoredAt
+	if nowTime.IsZero() {
+		nowTime = c.now()
+	}
+	now := nowTime.Unix()
 	object, err := repo.FindByKey(ctx, in.UpstreamID, in.Key)
 	if err != nil {
 		return err
@@ -745,16 +1262,40 @@ func (c *cacheSvc) saveRecord(ctx context.Context, in *recordInput) error {
 	object.ETag = in.ETag
 	object.LastModified = in.LastModified
 	object.Immutable = in.Immutable
+	object.CacheControl = ""
+	object.OriginDate = ""
+	object.OriginAge = 0
+	object.OriginExpires = ""
+	object.Vary = ""
+	object.AcceptRanges = ""
+	object.ContentDisposition = ""
+	object.DockerContentDigest = ""
+	object.StoredAt = 0
+	object.RequiresRevalidation = false
 	object.ExpiresAt = 0
-	if !in.Immutable {
-		ttl := in.TTLSeconds
-		if ttl <= 0 {
-			// 上游没单独配 TTL 时用设置里的默认值，现读现用：站长把默认 TTL
-			// 改短之后，下一个写进来的可变对象就按新值过期。
-			ttl = c.limits(ctx).MutableTTLSeconds
-		}
-		object.ExpiresAt = now + ttl
+	if in.Header != nil {
+		object.ContentType = safeHeaderValue(in.Header.Get("Content-Type"))
+		object.ETag = safeHeaderValue(in.Header.Get("Etag"))
+		object.LastModified = safeHeaderValue(in.Header.Get("Last-Modified"))
+		object.CacheControl = safeHeaderValue(in.Header.Get("Cache-Control"))
+		object.OriginDate = safeHeaderValue(in.Header.Get("Date"))
+		object.OriginExpires = safeHeaderValue(in.Header.Get("Expires"))
+		object.Vary = safeHeaderValue(in.Header.Get("Vary"))
+		object.AcceptRanges = safeHeaderValue(in.Header.Get("Accept-Ranges"))
+		object.ContentDisposition = safeHeaderValue(in.Header.Get("Content-Disposition"))
+		object.DockerContentDigest = safeHeaderValue(in.Header.Get("Docker-Content-Digest"))
+		object.StoredAt = now
+		object.OriginAge = correctedInitialAge(in.Header, nowTime)
+		directives := parseCacheControl(object.CacheControl)
+		_, noCache := directives["no-cache"]
+		_, mustRevalidate := directives["must-revalidate"]
+		object.RequiresRevalidation = noCache || mustRevalidate
 	}
+	ttl := in.TTLSeconds
+	if !in.Immutable && ttl <= 0 {
+		ttl = c.limits(ctx).MutableTTLSeconds
+	}
+	object.ExpiresAt = effectiveExpiration(nowTime, ttl, in.Immutable, object)
 	object.LastAccessAt = now
 	object.Updatetime = now
 	if err := repo.Save(ctx, object); err != nil {

@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/CodFrm/katch/internal/proxy/dispatch"
+	"github.com/CodFrm/katch/internal/proxy/packageprofile"
 	"github.com/CodFrm/katch/internal/service/proxy_svc"
 )
 
@@ -45,6 +46,50 @@ func cacheVariant(target *proxy_svc.Target) string {
 	}
 	sum := sha256.Sum256([]byte(accept))
 	return "accept=" + hex.EncodeToString(sum[:8])
+}
+
+// cacheKeyForRepresentation extends the legacy key only where a package profile owns identity.
+func cacheKeyForRepresentation(target *proxy_svc.Target, representation packageprofile.Representation,
+	generation int64,
+) string {
+	key := cacheKey(target)
+	if !representation.Recognized() {
+		return key
+	}
+	parts := make([]string, 0, len(representation.Variants)+1)
+	if representation.Transform {
+		parts = append(parts, "generation="+strconv.FormatInt(generation, 10))
+	}
+	names := append([]string(nil), representation.Variants...)
+	for i := range names {
+		names[i] = http.CanonicalHeaderKey(strings.TrimSpace(names[i]))
+	}
+	slices.Sort(names)
+	names = slices.Compact(names)
+	for _, name := range names {
+		if name == "" || strings.EqualFold(name, "Accept-Encoding") {
+			continue
+		}
+		value := normalizeDeclaredVariant(target.Header, name)
+		sum := sha256.Sum256([]byte(value))
+		parts = append(parts, strings.ToLower(name)+"="+hex.EncodeToString(sum[:8]))
+	}
+	if len(parts) == 0 {
+		return key
+	}
+	return key + variantMarker + strings.Join(parts, ";")
+}
+
+func normalizeDeclaredVariant(header http.Header, name string) string {
+	if strings.EqualFold(name, "Accept") {
+		return normalizeAccept(header)
+	}
+	values := append([]string(nil), header.Values(name)...)
+	for i := range values {
+		values[i] = strings.TrimSpace(values[i])
+	}
+	slices.Sort(values)
+	return strings.Join(values, ",")
 }
 
 // acceptVaries 这次请求的 Accept 会不会真的改变上游给出的内容。

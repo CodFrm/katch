@@ -28,6 +28,7 @@ func migrationList() []*gormigrate.Migration {
 		gitMirror(),
 		cacheValidator(),
 		packageProfile(),
+		cacheResponseMetadata(),
 	}
 }
 
