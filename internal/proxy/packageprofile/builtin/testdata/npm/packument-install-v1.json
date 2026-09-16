@@ -1,0 +1,16 @@
+{
+  "name": "@scope/pkg",
+  "dist-tags": {"latest": "2.0.0"},
+  "installVersion": 1,
+  "versions": {
+    "2.0.0": {
+      "name": "@scope/pkg",
+      "version": "2.0.0",
+      "dist": {
+        "integrity": "sha512-install-two",
+        "shasum": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tarball": "https://registry.npmjs.org/@scope%2fpkg/-/pkg-2.0.0.tgz"
+      }
+    }
+  }
+}

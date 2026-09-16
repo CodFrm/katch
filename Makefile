@@ -1,5 +1,5 @@
 .PHONY: install-deps dev build test test-backend test-frontend lint lint-backend lint-frontend \
-        fmt prepare-web-dist mock docker smoke
+        fmt prepare-web-dist mock docker smoke package-mirror-image test-package-mirror-harness
 
 # 版本号显式给定，不从 git describe 反推：没打 tag 的分支上 describe 会退成 "dev"，
 # 带 tag 时又多一个 "v" 前缀，两种情况对不上号。排障要的 commit 维度由 COMMIT 单独注入。
@@ -87,3 +87,12 @@ docker:
 	docker build -f deploy/Dockerfile -t $(IMAGE):$(VERSION) \
 	  --build-arg VERSION=$(VERSION) \
 	  --build-arg COMMIT=$(COMMIT) .
+
+PACKAGE_MIRROR_CLIENT_IMAGE ?= katch/package-client-tools:2026-09-16
+
+package-mirror-image:
+	docker build -f e2e/package-mirrors/images/client-tools.Dockerfile \
+	  -t $(PACKAGE_MIRROR_CLIENT_IMAGE) .
+
+test-package-mirror-harness:
+	./e2e/package-mirrors/tests/harness_test.sh

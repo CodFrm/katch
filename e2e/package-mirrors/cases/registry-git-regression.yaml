@@ -1,0 +1,8 @@
+{
+  "name": "registry-git-regression",
+  "image": "katch/package-client-tools:2026-09-16",
+  "setup": "set -eu\nmkdir results",
+  "run": "set -eu\ngit clone --depth=1 \"${KATCH_URL%/}/github.com/octocat/Hello-World.git\" repository\ngit -C repository fsck --no-dangling\nfor client in docker podman; do\n  if command -v \"$client\" >/dev/null 2>&1; then\n    \"$client\" version > \"results/$client.txt\" 2>&1 || { echo \"blocked: $client is installed without an isolated daemon\" > \"results/$client.txt\"; }\n  else\n    echo \"blocked: $client is unavailable in the pinned client image\" > \"results/$client.txt\"\n  fi\ndone\ncat results/docker.txt results/podman.txt",
+  "assert": "set -eu\ntest -f repository/.git/HEAD\ngit -C repository rev-parse --verify HEAD >/dev/null\ngrep -Eq 'blocked:|Client:|Version:' results/docker.txt\ngrep -Eq 'blocked:|Client:|Version:' results/podman.txt",
+  "required_upstreams": ["github.com"]
+}
