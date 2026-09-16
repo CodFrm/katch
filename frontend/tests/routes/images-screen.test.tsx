@@ -387,6 +387,16 @@ describe('后台 · 容器镜像', () => {
     expect(within(redisRow).getByRole('button', { name: '删除' })).toBeInTheDocument()
   })
 
+  it('页头写一次镜像总数，数字不重复出现', async () => {
+    await renderImages()
+
+    const header = screen.getByRole('heading', { name: '容器镜像', level: 1 }).closest('header')
+    await vi.waitFor(() => {
+      expect(header).toHaveTextContent(/^容器镜像3\s*个镜像·/)
+    })
+    expect(header?.textContent?.match(/\d+/g)).toEqual(['3'])
+  })
+
   it('上游筛选只列协议含 registry 的上游，默认全部；切换后带 upstream_id 重新请求', async () => {
     await renderImages()
 

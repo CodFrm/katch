@@ -306,6 +306,8 @@
         "variant": "Variant",
         "loadMore": "Load more",
         "emptyDir": "No cached objects under this directory.",
+        "loadFailed": "This level could not be loaded. Refresh and try again later.",
+        "searchFailed": "The search did not complete. Try again later.",
         "matched": "{{count}} matched",
         "truncated": "Showing only the first {{shown}} matches. Type a more specific path or open a directory first.",
         "purgeDir": "Purge this directory",
@@ -338,7 +340,7 @@
     },
     "images": {
       "title": "Container images",
-      "count": "{{count}} image(s) total",
+      "countUnit": "images",
       "sizeNote": "Size sums the cached objects under that repository; shared layers count once per image.",
       "search": "Search container images",
       "searchPlaceholder": "Search by repository or tag",

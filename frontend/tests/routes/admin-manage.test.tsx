@@ -427,6 +427,11 @@ function rejected(code: number, msg: string) {
   return { ok: false, status: 400, json: async () => ({ code, msg, data: null }) }
 }
 
+/** 后端内部出错（比如 SQL 执行失败）时的回应：500 加上泛泛的「系统错误」。 */
+function systemError() {
+  return { ok: false, status: 500, json: async () => ({ code: -1, msg: '系统错误', data: null }) }
+}
+
 const unauthorized = {
   ok: false,
   status: 401,
@@ -444,6 +449,10 @@ interface Backend {
   searchLimit: number
   /** 让按目录清除被后端按参数错误拒绝。 */
   failTreePurge: boolean
+  /** 让根以下的目录层读取出内部错误（根那一层照常给）。 */
+  failTree: boolean
+  /** 让目录搜索出内部错误。 */
+  failTreeSearch: boolean
 }
 
 let backend: Backend
@@ -541,9 +550,15 @@ function stubFetch() {
         return envelope(ruleTest(String(body.host ?? ''), String(body.path ?? '')))
       }
       if (path === '/api/v1/admin/cache/tree') {
+        if (backend.failTree && (query.get('path') ?? '') !== '') {
+          return systemError()
+        }
         return envelope(cacheTree(query.get('path') ?? '', Number(query.get('offset') ?? '0')))
       }
       if (path === '/api/v1/admin/cache/tree/search') {
+        if (backend.failTreeSearch) {
+          return systemError()
+        }
         return envelope(cacheTreeSearch(query.get('path') ?? '', query.get('keyword') ?? ''))
       }
       if (path === '/api/v1/admin/cache/tree/purge') {
@@ -625,6 +640,8 @@ beforeEach(async () => {
     treeLimit: 200,
     searchLimit: 200,
     failTreePurge: false,
+    failTree: false,
+    failTreeSearch: false,
   }
   await i18n.changeLanguage('zh-CN')
   stubFetch()
@@ -944,6 +961,37 @@ describe('后台 · 缓存对象', () => {
     expect(await within(table).findByText('pool/')).toBeInTheDocument()
   })
 
+  it('一层读不出来时给错误提示，不当成空目录，也不报出 0 个对象', async () => {
+    backend.failTree = true
+    renderCache('/admin/cache?path=docker.io')
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('这一层没有读出来，稍后刷新再试。')
+    expect(screen.queryByText('这个目录下没有缓存对象。')).not.toBeInTheDocument()
+    expect(screen.queryByText(/个对象 · /)).not.toBeInTheDocument()
+    // 路径导航仍能点回上层，回到读得出来的那一层后错误提示收起。
+    const crumbs = screen.getByRole('navigation', { name: '目录路径' })
+    await userEvent.click(within(crumbs).getByRole('button', { name: '全部上游' }))
+    const table = screen.getByRole('table', { name: '缓存对象' })
+    expect(await within(table).findByText('docker.io/')).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('就地展开的那一层读不出来时同样给错误提示', async () => {
+    backend.failTree = true
+    renderCache()
+
+    const table = await screen.findByRole('table', { name: '缓存对象' })
+    await within(table).findByText('deb.debian.org/')
+    const deb = treeRow(table, /deb\.debian\.org\//)
+    await userEvent.click(within(deb).getByRole('button', { name: '展开 deb.debian.org' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('这一层没有读出来，稍后刷新再试。')
+    await userEvent.click(within(deb).getByRole('button', { name: '收起 deb.debian.org' }))
+    await vi.waitFor(() => {
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    })
+  })
+
   it('清除一个对象走单条清除，不要确认', async () => {
     renderCache('/admin/cache?path=docker.io/library/redis/manifests')
 
@@ -1057,6 +1105,18 @@ describe('后台 · 缓存对象', () => {
     await userEvent.type(screen.getByLabelText('搜索缓存对象'), 'nothing-here')
 
     expect(await screen.findByText('没有匹配的对象。')).toBeInTheDocument()
+  })
+
+  it('搜索出错时给错误提示，不当成搜不到', async () => {
+    backend.failTreeSearch = true
+    renderCache()
+
+    await screen.findByRole('table', { name: '缓存对象' })
+    await userEvent.type(screen.getByLabelText('搜索缓存对象'), 'redis')
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('搜索没有完成，稍后再试。')
+    expect(screen.queryByText('没有匹配的对象。')).not.toBeInTheDocument()
+    expect(screen.queryByText(/^命中 /)).not.toBeInTheDocument()
   })
 
   it('按目录清除要先确认，确认处写明路径与未固定的对象数，完成后报出清除与跳过的条数', async () => {

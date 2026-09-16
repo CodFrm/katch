@@ -4,7 +4,6 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/cago-frame/cago/pkg/utils/testutils"
 	"github.com/smartystreets/goconvey/convey"
 
 	"github.com/CodFrm/katch/internal/model/entity/cache_entity"
@@ -15,11 +14,11 @@ import (
 
 func TestCacheObjectRepo_FindByKey(t *testing.T) {
 	convey.Convey("按上游与 key 查缓存记录", t, func() {
-		ctx, _, mock := testutils.Database(t)
+		ctx, _, mock := database(t)
 		repo := NewCacheObject()
 
 		convey.Convey("查到时带回摘要与大小", func() {
-			mock.ExpectQuery("SELECT \\* FROM `cache_objects` WHERE upstream_id=\\? AND `key`=\\?").
+			mock.ExpectQuery("SELECT \\* FROM `katch_cache_object` WHERE upstream_id=\\? AND `key`=\\?").
 				WithArgs(int64(7), "/dists/stable/InRelease", 1).
 				WillReturnRows(sqlmock.NewRows([]string{"id", "upstream_id", "key", "digest", "size"}).
 					AddRow(3, 7, "/dists/stable/InRelease", "sha256:aa", 15))
@@ -33,7 +32,7 @@ func TestCacheObjectRepo_FindByKey(t *testing.T) {
 
 		convey.Convey("没缓存过不是错误", func() {
 			// 未命中是拉取路径上的常态，当成错误会让每一次冷拉取都留下一条 error。
-			mock.ExpectQuery("SELECT \\* FROM `cache_objects`").
+			mock.ExpectQuery("SELECT \\* FROM `katch_cache_object`").
 				WillReturnRows(sqlmock.NewRows([]string{"id"}))
 
 			got, err := repo.FindByKey(ctx, 7, "/x")
@@ -49,9 +48,9 @@ func TestCacheObjectRepo_FindByKey(t *testing.T) {
 // 又会把一个只读请求变成一次全列更新。
 func TestCacheObjectRepo_Touch(t *testing.T) {
 	convey.Convey("命中时只更新 last_access_at 与 hit_count", t, func() {
-		ctx, _, mock := testutils.Database(t)
+		ctx, _, mock := database(t)
 		mock.ExpectBegin()
-		mock.ExpectExec("UPDATE `cache_objects` SET .*hit_count.*WHERE id=\\?").
+		mock.ExpectExec("UPDATE `katch_cache_object` SET .*hit_count.*WHERE id=\\?").
 			WithArgs(int64(1700000000), int64(3)).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 		mock.ExpectCommit()
@@ -67,8 +66,8 @@ func TestCacheObjectRepo_Touch(t *testing.T) {
 // 表现就是「刚 pin 的基础镜像层过两天又没了」。
 func TestCacheObjectRepo_EvictCandidates(t *testing.T) {
 	convey.Convey("淘汰候选按最久未访问排序，且排除 pin 与可变对象", t, func() {
-		ctx, _, mock := testutils.Database(t)
-		mock.ExpectQuery("SELECT \\* FROM `cache_objects` WHERE immutable=\\? AND pinned=\\? ORDER BY last_access_at asc LIMIT \\?").
+		ctx, _, mock := database(t)
+		mock.ExpectQuery("SELECT \\* FROM `katch_cache_object` WHERE immutable=\\? AND pinned=\\? ORDER BY last_access_at asc LIMIT \\?").
 			WithArgs(true, false, 2).
 			WillReturnRows(sqlmock.NewRows([]string{"id", "size", "last_access_at"}).
 				AddRow(5, 100, 1).AddRow(6, 200, 2))
@@ -83,11 +82,11 @@ func TestCacheObjectRepo_EvictCandidates(t *testing.T) {
 
 func TestCacheObjectRepo_TotalSize(t *testing.T) {
 	convey.Convey("统计缓存占用", t, func() {
-		ctx, _, mock := testutils.Database(t)
+		ctx, _, mock := database(t)
 
 		convey.Convey("一条记录都没有时是 0 而不是错误", func() {
 			// SUM 在空表上给的是 NULL，扫进 int64 会报错——空缓存是正常状态。
-			mock.ExpectQuery("SELECT COALESCE\\(SUM\\(size\\), 0\\) FROM `cache_objects`").
+			mock.ExpectQuery("SELECT COALESCE\\(SUM\\(size\\), 0\\) FROM `katch_cache_object`").
 				WillReturnRows(sqlmock.NewRows([]string{"total"}).AddRow(0))
 
 			got, err := NewCacheObject().TotalSize(ctx)
@@ -102,8 +101,8 @@ func TestCacheObjectRepo_TotalSize(t *testing.T) {
 // 「还有没有别的记录指着同一份内容」，否则删掉文件会把另一条记录变成坏缓存。
 func TestCacheObjectRepo_CountByDigest(t *testing.T) {
 	convey.Convey("按摘要数还有多少条记录引用同一份内容", t, func() {
-		ctx, _, mock := testutils.Database(t)
-		mock.ExpectQuery("SELECT count\\(\\*\\) FROM `cache_objects` WHERE digest=\\?").
+		ctx, _, mock := database(t)
+		mock.ExpectQuery("SELECT count\\(\\*\\) FROM `katch_cache_object` WHERE digest=\\?").
 			WithArgs("sha256:aa").
 			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(2))
 
@@ -116,11 +115,11 @@ func TestCacheObjectRepo_CountByDigest(t *testing.T) {
 
 func TestCacheObjectRepo_Search(t *testing.T) {
 	convey.Convey("按上游与关键字搜索缓存对象", t, func() {
-		ctx, _, mock := testutils.Database(t)
-		mock.ExpectQuery("SELECT count\\(\\*\\) FROM `cache_objects` WHERE upstream_id=\\? AND `key` LIKE \\?").
+		ctx, _, mock := database(t)
+		mock.ExpectQuery("SELECT count\\(\\*\\) FROM `katch_cache_object` WHERE upstream_id=\\? AND `key` LIKE \\?").
 			WithArgs(int64(7), "%redis%").
 			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
-		mock.ExpectQuery("SELECT \\* FROM `cache_objects` WHERE upstream_id=\\? AND `key` LIKE \\? ORDER BY last_access_at desc LIMIT \\? OFFSET \\?").
+		mock.ExpectQuery("SELECT \\* FROM `katch_cache_object` WHERE upstream_id=\\? AND `key` LIKE \\? ORDER BY last_access_at desc LIMIT \\? OFFSET \\?").
 			WithArgs(int64(7), "%redis%", 10, 10).
 			WillReturnRows(sqlmock.NewRows([]string{"id", "key"}).AddRow(9, "/redis/x"))
 
@@ -137,8 +136,8 @@ func TestCacheObjectRepo_Search(t *testing.T) {
 
 func TestCacheObjectRepo_ListByUpstream(t *testing.T) {
 	convey.Convey("按上游列出全部缓存对象，供按上游清缓存用", t, func() {
-		ctx, _, mock := testutils.Database(t)
-		mock.ExpectQuery("SELECT \\* FROM `cache_objects` WHERE upstream_id=\\?").
+		ctx, _, mock := database(t)
+		mock.ExpectQuery("SELECT \\* FROM `katch_cache_object` WHERE upstream_id=\\?").
 			WithArgs(int64(7)).
 			WillReturnRows(sqlmock.NewRows([]string{"id", "digest"}).AddRow(1, "sha256:aa"))
 
@@ -151,9 +150,9 @@ func TestCacheObjectRepo_ListByUpstream(t *testing.T) {
 
 func TestCacheObjectRepo_SetPinned(t *testing.T) {
 	convey.Convey("pin 只改 pinned 一列", t, func() {
-		ctx, _, mock := testutils.Database(t)
+		ctx, _, mock := database(t)
 		mock.ExpectBegin()
-		mock.ExpectExec("UPDATE `cache_objects` SET `pinned`=\\?,`updatetime`=\\? WHERE id=\\?").
+		mock.ExpectExec("UPDATE `katch_cache_object` SET `pinned`=\\?,`updatetime`=\\? WHERE id=\\?").
 			WillReturnResult(sqlmock.NewResult(0, 1))
 		mock.ExpectCommit()
 
@@ -164,9 +163,9 @@ func TestCacheObjectRepo_SetPinned(t *testing.T) {
 
 func TestCacheObjectRepo_PromoteImmutable(t *testing.T) {
 	convey.Convey("旧记录提升时只清 TTL 并标成不可变", t, func() {
-		ctx, _, mock := testutils.Database(t)
+		ctx, _, mock := database(t)
 		mock.ExpectBegin()
-		mock.ExpectExec("UPDATE `cache_objects` SET `expires_at`=\\?,`immutable`=\\?,`updatetime`=\\? WHERE id=\\?").
+		mock.ExpectExec("UPDATE `katch_cache_object` SET `expires_at`=\\?,`immutable`=\\?,`updatetime`=\\? WHERE id=\\?").
 			WithArgs(int64(0), true, sqlmock.AnyArg(), int64(3)).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 		mock.ExpectCommit()
@@ -178,9 +177,9 @@ func TestCacheObjectRepo_PromoteImmutable(t *testing.T) {
 
 func TestCacheObjectRepo_DeleteExpired(t *testing.T) {
 	convey.Convey("删除前原子复核记录仍是过期可变对象", t, func() {
-		ctx, _, mock := testutils.Database(t)
+		ctx, _, mock := database(t)
 		mock.ExpectBegin()
-		mock.ExpectExec("DELETE FROM `cache_objects` WHERE id=\\? AND immutable=\\? AND expires_at>0 AND expires_at<=\\? AND pinned=\\?").
+		mock.ExpectExec("DELETE FROM `katch_cache_object` WHERE id=\\? AND immutable=\\? AND expires_at>0 AND expires_at<=\\? AND pinned=\\?").
 			WithArgs(int64(3), false, int64(1000), false).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 		mock.ExpectCommit()
@@ -194,11 +193,11 @@ func TestCacheObjectRepo_DeleteExpired(t *testing.T) {
 
 func TestCacheObjectRepo_DeleteUnchanged(t *testing.T) {
 	convey.Convey("人手清除只删列出时看到的那一份", t, func() {
-		ctx, _, mock := testutils.Database(t)
+		ctx, _, mock := database(t)
 
 		convey.Convey("批量清除还要求它仍未被 pin", func() {
 			mock.ExpectBegin()
-			mock.ExpectExec("DELETE FROM `cache_objects` WHERE id=\\? AND digest=\\? AND pinned=\\?$").
+			mock.ExpectExec("DELETE FROM `katch_cache_object` WHERE id=\\? AND digest=\\? AND pinned=\\?$").
 				WithArgs(int64(3), "sha256:a", false).
 				WillReturnResult(sqlmock.NewResult(0, 0))
 			mock.ExpectCommit()
@@ -211,7 +210,7 @@ func TestCacheObjectRepo_DeleteUnchanged(t *testing.T) {
 
 		convey.Convey("指名清一条时不看 pin", func() {
 			mock.ExpectBegin()
-			mock.ExpectExec("DELETE FROM `cache_objects` WHERE id=\\? AND digest=\\?$").
+			mock.ExpectExec("DELETE FROM `katch_cache_object` WHERE id=\\? AND digest=\\?$").
 				WithArgs(int64(3), "sha256:a").
 				WillReturnResult(sqlmock.NewResult(0, 1))
 			mock.ExpectCommit()
@@ -226,9 +225,9 @@ func TestCacheObjectRepo_DeleteUnchanged(t *testing.T) {
 
 func TestCacheObjectRepo_Delete(t *testing.T) {
 	convey.Convey("删除一条缓存记录", t, func() {
-		ctx, _, mock := testutils.Database(t)
+		ctx, _, mock := database(t)
 		mock.ExpectBegin()
-		mock.ExpectExec("DELETE FROM `cache_objects` WHERE id=\\?").
+		mock.ExpectExec("DELETE FROM `katch_cache_object` WHERE id=\\?").
 			WithArgs(int64(3)).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 		mock.ExpectCommit()
@@ -240,12 +239,12 @@ func TestCacheObjectRepo_Delete(t *testing.T) {
 
 func TestCacheObjectRepo_SizeByUpstream(t *testing.T) {
 	convey.Convey("按上游统计缓存占用", t, func() {
-		ctx, _, mock := testutils.Database(t)
+		ctx, _, mock := database(t)
 		repo := NewCacheObject()
 
 		convey.Convey("每个有缓存的上游一行", func() {
 			mock.ExpectQuery("SELECT upstream_id,COALESCE\\(SUM\\(size\\), 0\\) AS size " +
-				"FROM `cache_objects` GROUP BY `upstream_id`").
+				"FROM `katch_cache_object` GROUP BY `upstream_id`").
 				WillReturnRows(sqlmock.NewRows([]string{"upstream_id", "size"}).
 					AddRow(7, 4096).
 					AddRow(8, 1024))
@@ -272,10 +271,10 @@ func TestCacheObjectRepo_SizeByUpstream(t *testing.T) {
 
 func TestCacheObjectRepo_ExpiredBefore(t *testing.T) {
 	convey.Convey("过期清理只挑真的过期了的可变对象", t, func() {
-		ctx, _, mock := testutils.Database(t)
+		ctx, _, mock := database(t)
 		// expires_at>0 与 immutable=false 都不能少：正常不可变对象的 expires_at 是 0，
 		// 但升级遗留或人工修复可能留下 immutable=true 且旧 TTL 仍为正的组合。
-		mock.ExpectQuery("SELECT \\* FROM `cache_objects` WHERE expires_at>0 AND expires_at<=\\? AND immutable=\\? AND pinned=\\? ORDER BY expires_at asc LIMIT \\?").
+		mock.ExpectQuery("SELECT \\* FROM `katch_cache_object` WHERE expires_at>0 AND expires_at<=\\? AND immutable=\\? AND pinned=\\? ORDER BY expires_at asc LIMIT \\?").
 			WithArgs(int64(1000), false, false, 2).
 			WillReturnRows(sqlmock.NewRows([]string{"id", "size", "expires_at"}).
 				AddRow(9, 300, 500).AddRow(10, 400, 900))
@@ -290,8 +289,8 @@ func TestCacheObjectRepo_ExpiredBefore(t *testing.T) {
 
 func TestCacheObjectRepo_CountByUpstream(t *testing.T) {
 	convey.Convey("按上游统计缓存对象数", t, func() {
-		ctx, _, mock := testutils.Database(t)
-		mock.ExpectQuery("SELECT upstream_id,COUNT\\(\\*\\) AS count FROM `cache_objects` GROUP BY `upstream_id`").
+		ctx, _, mock := database(t)
+		mock.ExpectQuery("SELECT upstream_id,COUNT\\(\\*\\) AS count FROM `katch_cache_object` GROUP BY `upstream_id`").
 			WillReturnRows(sqlmock.NewRows([]string{"upstream_id", "count"}).
 				AddRow(1, 3).AddRow(2, 7))
 

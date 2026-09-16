@@ -169,6 +169,15 @@ export function CacheScreen({
   const watermark = readIntSetting(settings.data, 'cache_reclaim_percent')
   const used = sizes.data.reduce((sum, item) => sum + item.cacheBytes, 0)
   const segments = path === '' ? [] : path.split('/')
+  // 读不出来的那一层或那次搜索用管理操作的错误提示说出来；写操作的错误更具体，先说它。
+  const loadErrorKey = searching
+    ? search.failed
+      ? 'admin.cache.tree.searchFailed'
+      : null
+    : tree.failed
+      ? 'admin.cache.tree.loadFailed'
+      : null
+  const errorKey = action.errorKey ?? loadErrorKey
 
   // 选中的全是已固定的对象时，这枚按钮换成放开——只给 pin 不给 unpin 的界面
   // 会让一个钉住的对象再也清不掉。
@@ -554,9 +563,9 @@ export function CacheScreen({
           </p>
         )}
 
-        {action.errorKey && (
+        {errorKey && (
           <p role="alert" className="text-destructive text-[12.5px]">
-            {t(action.errorKey)}
+            {t(errorKey)}
           </p>
         )}
 
@@ -594,6 +603,7 @@ export function CacheScreen({
               <p className="text-muted-foreground text-[13px]">{t('admin.cache.empty')}</p>
             )
           : current &&
+            !tree.failed &&
             current.children.length === 0 && (
               <p className="text-muted-foreground text-[13px]">{t('admin.cache.tree.emptyDir')}</p>
             )}

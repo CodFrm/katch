@@ -319,12 +319,18 @@ export interface CacheTreeLayer {
 }
 
 export interface CacheTreeView {
-  /** 当前目录那一层，还没问到时是 null。读不到（目录不合法、够不到后端）按空层给。 */
+  /** 当前目录那一层，还没问到或者第一次就没读出来时是 null。 */
   current: CacheTreeLayer | null
   /** 就地展开的目录各自的那一层，按目录路径取；还在取的不在表里。 */
   layers: Record<string, CacheTreeLayer>
   /** 就地展开着的目录路径。 */
   expanded: string[]
+  /**
+   * 当前目录或展开着的某一层最近一次没读出来（目录不合法、够不到后端、后端出错）。
+   * 读不出来不等于空目录：当成空层给，界面就会说「这个目录下没有缓存对象」，把一次
+   * 故障说成了事实。
+   */
+  failed: boolean
   /** 展开或收起一个目录。 */
   toggle: (path: string) => void
   /** 把某一层的下一批接在后面。 */
@@ -333,20 +339,13 @@ export interface CacheTreeView {
   reload: () => void
 }
 
-const EMPTY_LAYER: CacheTreeLayer = {
-  totalCount: 0,
-  totalPinned: 0,
-  totalSize: 0,
-  children: [],
-  hasMore: false,
-  nextOffset: 0,
-}
-
 interface TreeState {
   /** 这份状态属于哪个当前目录：换了目录，手里展开的那些就属于别人了。 */
   root: string
   layers: Record<string, CacheTreeLayer>
   expanded: string[]
+  /** 最近一次没读出来的那些层，按目录路径记；重新读出来或收起时划掉。 */
+  failed: string[]
 }
 
 /**
@@ -357,7 +356,12 @@ interface TreeState {
  */
 export function useCacheTree(key: string, path: string, onUnauthorized: () => void): CacheTreeView {
   const reject = useRejectOnUnauthorized(onUnauthorized)
-  const [state, setState] = useState<TreeState>({ root: path, layers: {}, expanded: [] })
+  const [state, setState] = useState<TreeState>({
+    root: path,
+    layers: {},
+    expanded: [],
+    failed: [],
+  })
   const [token, reload] = useReloadToken()
   const latest = useRef(state)
   useEffect(() => {
@@ -382,18 +386,17 @@ export function useCacheTree(key: string, path: string, onUnauthorized: () => vo
         }
         const data = unwrap(result, () => reject.current())
         setState((current) => {
-          const base =
-            current.root === root ? current : { root, layers: {}, expanded: [] as string[] }
+          const base: TreeState =
+            current.root === root ? current : { root, layers: {}, expanded: [], failed: [] }
           const previous = base.layers[dir]
           if (offset > 0 && previous?.nextOffset !== offset) {
             // 同一批被连点了两次，或者这一层在此期间从头重取过：这一批已经不接在末尾了。
             return current
           }
+          const failed = base.failed.filter((item) => item !== dir)
           if (!data) {
-            // 翻下一批失败时留着已经接上的那些；第一批就读不到，这一层按空的给。
-            return offset > 0 && previous
-              ? base
-              : { ...base, layers: { ...base.layers, [dir]: EMPTY_LAYER } }
+            // 记下这一层没读出来，已经接上的那些（翻下一批、写操作之后重取）留着。
+            return { ...base, failed: [...failed, dir] }
           }
           const children = data.children ?? []
           const layer: CacheTreeLayer = {
@@ -404,7 +407,7 @@ export function useCacheTree(key: string, path: string, onUnauthorized: () => vo
             hasMore: data.has_more,
             nextOffset: data.next_offset,
           }
-          return { ...base, layers: { ...base.layers, [dir]: layer } }
+          return { ...base, failed, layers: { ...base.layers, [dir]: layer } }
         })
       })
     },
@@ -426,12 +429,18 @@ export function useCacheTree(key: string, path: string, onUnauthorized: () => vo
       const snapshot = latest.current
       const open = snapshot.root === path && snapshot.expanded.includes(dir)
       setState((current) => {
-        const base = current.root === path ? current : { root: path, layers: {}, expanded: [] }
+        const base: TreeState =
+          current.root === path ? current : { root: path, layers: {}, expanded: [], failed: [] }
         if (open) {
           // 收起时把这一层扔掉：再展开时重新问一遍，不拿一份可能已经过时的给人看。
           const layers = { ...base.layers }
           delete layers[dir]
-          return { ...base, layers, expanded: base.expanded.filter((item) => item !== dir) }
+          return {
+            ...base,
+            layers,
+            expanded: base.expanded.filter((item) => item !== dir),
+            failed: base.failed.filter((item) => item !== dir),
+          }
         }
         return { ...base, expanded: [...base.expanded, dir] }
       })
@@ -460,6 +469,7 @@ export function useCacheTree(key: string, path: string, onUnauthorized: () => vo
     current: own ? (state.layers[path] ?? null) : null,
     layers: own ? state.layers : {},
     expanded: own ? state.expanded : [],
+    failed: own && state.failed.length > 0,
     toggle,
     loadMore,
     reload,
@@ -477,12 +487,13 @@ export function useCacheTreeSearch(
   path: string,
   keyword: string,
   onUnauthorized: () => void
-): Reloadable<CacheTreeSearchResult | null> {
+): Reloadable<CacheTreeSearchResult | null> & { failed: boolean } {
   const reject = useRejectOnUnauthorized(onUnauthorized)
   const [loaded, setLoaded] = useState<{
     path: string
     keyword: string
-    result: CacheTreeSearchResult
+    /** 没读出来时是 null。 */
+    result: CacheTreeSearchResult | null
   } | null>(null)
   const [token, reload] = useReloadToken()
 
@@ -495,19 +506,18 @@ export function useCacheTreeSearch(
       if (controller.signal.aborted) {
         return
       }
-      const data = unwrap(response, () => reject.current())
-      // 读不到（比如词过长被拒）按没有匹配给，而不是停在「还没问到」。
-      setLoaded({
-        path,
-        keyword,
-        result: data ?? { path, matched: 0, truncated: false, objects: [], dirs: [] },
-      })
+      // 读不出来单独记着，而不是按没有匹配给：那会把一次故障说成「没有匹配的对象」。
+      setLoaded({ path, keyword, result: unwrap(response, () => reject.current()) })
     })
     return () => controller.abort()
   }, [key, path, keyword, token, reject])
 
   const own = keyword !== '' && loaded?.path === path && loaded.keyword === keyword
-  return { data: own ? loaded.result : null, reload }
+  return {
+    data: own ? loaded.result : null,
+    failed: own && loaded.result === null,
+    reload,
+  }
 }
 
 /** 按上游分的缓存占用（主机名 → 字节数），容量条按它分段。清缓存之后要跟着刷新。 */

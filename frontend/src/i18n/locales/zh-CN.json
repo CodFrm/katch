@@ -306,6 +306,8 @@
         "variant": "变体",
         "loadMore": "加载更多",
         "emptyDir": "这个目录下没有缓存对象。",
+        "loadFailed": "这一层没有读出来，稍后刷新再试。",
+        "searchFailed": "搜索没有完成，稍后再试。",
         "matched": "匹配 {{count}}",
         "truncated": "只显示了前 {{shown}} 个匹配，输入更具体的路径或先进入目录。",
         "purgeDir": "清除本目录",
@@ -338,7 +340,7 @@
     },
     "images": {
       "title": "容器镜像",
-      "count": "共 {{count}} 个镜像",
+      "countUnit": "个镜像",
       "sizeNote": "体积按该仓库下已缓存对象合计，共用层会在各自镜像里各算一次。",
       "search": "搜索容器镜像",
       "searchPlaceholder": "按仓库名或 tag 搜索",

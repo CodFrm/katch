@@ -206,9 +206,7 @@ export function ImagesScreen({
         subtitle={
           <>
             <span className="text-muted-foreground font-mono">{formatCount(images.total)}</span>
-            <span className="text-muted-foreground">
-              {t('admin.images.count', { count: images.total })}
-            </span>
+            <span className="text-muted-foreground">{t('admin.images.countUnit')}</span>
             <span className="text-ink-3">·</span>
             <span className="text-muted-foreground">{t('admin.images.sizeNote')}</span>
           </>

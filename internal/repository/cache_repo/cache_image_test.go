@@ -4,15 +4,14 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/cago-frame/cago/pkg/utils/testutils"
 	"github.com/smartystreets/goconvey/convey"
 )
 
 func TestCacheObjectRepo_ScanByUpstream(t *testing.T) {
 	convey.Convey("按 id 分批扫一个上游的记录，只取镜像视图用得上的列", t, func() {
-		ctx, _, mock := testutils.Database(t)
+		ctx, _, mock := database(t)
 		mock.ExpectQuery("SELECT id,upstream_id,`key`,digest,size,immutable,pinned,expires_at,last_access_at,hit_count "+
-			"FROM `cache_objects` WHERE upstream_id=\\? AND id>\\? ORDER BY id LIMIT \\?$").
+			"FROM `katch_cache_object` WHERE upstream_id=\\? AND id>\\? ORDER BY id LIMIT \\?$").
 			WithArgs(int64(7), int64(100), 2).
 			WillReturnRows(sqlmock.NewRows([]string{"id", "upstream_id", "key", "size"}).
 				AddRow(101, 7, "/redis/manifests/7", 10).AddRow(105, 7, "/redis/blobs/sha256:a", 20))

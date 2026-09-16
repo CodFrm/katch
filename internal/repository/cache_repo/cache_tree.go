@@ -8,6 +8,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/cago-frame/cago/database/db"
+	"gorm.io/gorm"
 
 	"github.com/CodFrm/katch/internal/model/entity/cache_entity"
 )
@@ -81,6 +82,17 @@ const treeAggregate = "COUNT(*) AS count," +
 	"COALESCE(SUM(CASE WHEN pinned THEN 1 ELSE 0 END),0) AS pinned," +
 	"COALESCE(SUM(size),0) AS size,COALESCE(MAX(last_access_at),0) AS last_access_at"
 
+// objectTable 缓存对象表在库里的名字。手写的 SQL 不经过 gorm 的命名策略，表名不能照着
+// 实体名写死：运行时 db 组件配了 TablePrefix 与 SingularTable，真表叫 katch_cache_object
+// 而不是 cache_objects。这里向 gorm 要同一个名字，前缀改了也跟着走。
+func objectTable(tx *gorm.DB) (string, error) {
+	stmt := &gorm.Statement{DB: tx}
+	if err := stmt.Parse(&cache_entity.CacheObject{}); err != nil {
+		return "", err
+	}
+	return "`" + stmt.Schema.Table + "`", nil
+}
+
 func (c *cacheObjectRepo) StatByUpstream(ctx context.Context) ([]*cache_entity.UpstreamTreeStat, error) {
 	list := make([]*cache_entity.UpstreamTreeStat, 0)
 	if err := db.Ctx(ctx).Model(&cache_entity.CacheObject{}).
@@ -97,18 +109,23 @@ func (c *cacheObjectRepo) StatByPrefix(ctx context.Context, upstreamID int64, pr
 	if err != nil {
 		return nil, err
 	}
+	tx := db.Ctx(ctx)
+	table, err := objectTable(tx)
+	if err != nil {
+		return nil, err
+	}
 	rest := treeRest(prefix)
 	dir, dirArgs := treeDirCond(rest)
 	sql := "SELECT " + treeAggregate + "," +
 		"COALESCE(SUM(CASE WHEN " + dir + " THEN 0 ELSE 1 END),0) AS objects," +
 		"COUNT(DISTINCT CASE WHEN " + dir + " THEN " + treeDirName(rest) + " END) AS dirs " +
-		"FROM `cache_objects` WHERE " + where
+		"FROM " + table + " WHERE " + where
 	args := make([]any, 0, 2*len(dirArgs)+len(whereArgs))
 	args = append(args, dirArgs...)
 	args = append(args, dirArgs...)
 	args = append(args, whereArgs...)
 	ret := &cache_entity.PrefixTreeStat{}
-	if err := db.Ctx(ctx).Raw(sql, args...).Scan(ret).Error; err != nil {
+	if err := tx.Raw(sql, args...).Scan(ret).Error; err != nil {
 		return nil, err
 	}
 	return ret, nil
@@ -119,18 +136,23 @@ func (c *cacheObjectRepo) ListTreeDirs(ctx context.Context, opt *cache_entity.Tr
 	if err != nil {
 		return nil, err
 	}
+	tx := db.Ctx(ctx)
+	table, err := objectTable(tx)
+	if err != nil {
+		return nil, err
+	}
 	rest := treeRest(opt.Prefix)
 	dir, dirArgs := treeDirCond(rest)
 	name := treeDirName(rest)
 	sql := "SELECT " + name + " AS name," + treeAggregate +
-		" FROM `cache_objects` WHERE " + where + " AND " + dir +
+		" FROM " + table + " WHERE " + where + " AND " + dir +
 		" GROUP BY " + name + " ORDER BY name LIMIT ? OFFSET ?"
 	args := make([]any, 0, len(whereArgs)+len(dirArgs)+2)
 	args = append(args, whereArgs...)
 	args = append(args, dirArgs...)
 	args = append(args, opt.Limit, opt.Offset)
 	list := make([]*cache_entity.TreeDir, 0)
-	if err := db.Ctx(ctx).Raw(sql, args...).Scan(&list).Error; err != nil {
+	if err := tx.Raw(sql, args...).Scan(&list).Error; err != nil {
 		return nil, err
 	}
 	return list, nil
@@ -203,6 +225,11 @@ func (c *cacheObjectRepo) StatTreeMatch(ctx context.Context, opt *cache_entity.T
 	if err != nil {
 		return nil, err
 	}
+	tx := db.Ctx(ctx)
+	table, err := objectTable(tx)
+	if err != nil {
+		return nil, err
+	}
 	match, matchArgs := "1=1", []any(nil)
 	if !opt.AllMatched {
 		cond, args := treeMatch(treeRest(opt.SearchPrefix), opt.Keyword)
@@ -212,13 +239,13 @@ func (c *cacheObjectRepo) StatTreeMatch(ctx context.Context, opt *cache_entity.T
 		"COALESCE(MAX(last_access_at),0) AS last_access_at," +
 		"COALESCE(SUM(CASE WHEN " + match + " THEN 1 ELSE 0 END),0) AS matched_count," +
 		"COALESCE(SUM(CASE WHEN " + match + " THEN size ELSE 0 END),0) AS matched_size " +
-		"FROM `cache_objects` WHERE " + where
+		"FROM " + table + " WHERE " + where
 	args := make([]any, 0, 2*len(matchArgs)+len(whereArgs))
 	args = append(args, matchArgs...)
 	args = append(args, matchArgs...)
 	args = append(args, whereArgs...)
 	ret := &cache_entity.TreeMatchStat{}
-	if err := db.Ctx(ctx).Raw(sql, args...).Scan(ret).Error; err != nil {
+	if err := tx.Raw(sql, args...).Scan(ret).Error; err != nil {
 		return nil, err
 	}
 	return ret, nil
