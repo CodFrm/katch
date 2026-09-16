@@ -167,7 +167,9 @@ func TestDo_UnreachableOriginIsError(t *testing.T) {
 //
 // 决策 10：穿透 git 的协商请求要把请求体原样送到上游，而 Content-Type 与
 // Git-Protocol 必须跟着走——前者是 upload-pack 请求的载体，缺了后者协议会退回
-// v0。白名单仍然是白名单：这里只多了这两项，客户端的 Authorization 照旧不外传。
+// v0。Content-Encoding 同理：它描述的是**请求体自己**的形态，头与字节对不上时
+// 上游会按错的形态去解这份数据（git 对超过 1KB 的协商请求体就是这么压的）。
+// 白名单仍然是白名单：这里只多了这几项，客户端的 Authorization 照旧不外传。
 func TestDo_ForwardsRequestBodyAndGitHeaders(t *testing.T) {
 	convey.Convey("请求体与 git 的两个头原样送达上游", t, func() {
 		payload := "0032want d9a1b0c2c3d4e5f60718293a4b5c6d7e8f901234\n0000"
@@ -189,6 +191,7 @@ func TestDo_ForwardsRequestBodyAndGitHeaders(t *testing.T) {
 		clientHeader := http.Header{}
 		clientHeader.Set("Content-Type", "application/x-git-upload-pack-request")
 		clientHeader.Set("Git-Protocol", "version=2")
+		clientHeader.Set("Content-Encoding", "gzip")
 		clientHeader.Set("Authorization", "Basic c2VjcmV0")
 
 		resp, err := New().Do(context.Background(), &Request{
@@ -201,6 +204,9 @@ func TestDo_ForwardsRequestBodyAndGitHeaders(t *testing.T) {
 		convey.So(gotBody, convey.ShouldEqual, payload)
 		convey.So(gotHeader.Get("Content-Type"), convey.ShouldEqual, "application/x-git-upload-pack-request")
 		convey.So(gotHeader.Get("Git-Protocol"), convey.ShouldEqual, "version=2")
+		// 请求体带着编码，这个头就必须跟着走；把它丢掉等于给上游一份声明为明文、
+		// 内容是 gzip 的请求。
+		convey.So(gotHeader.Get("Content-Encoding"), convey.ShouldEqual, "gzip")
 		// 白名单里多两项不等于把凭据也放进来了。
 		convey.So(gotHeader.Get("Authorization"), convey.ShouldBeEmpty)
 		convey.So(resp.Header.Get("Content-Type"), convey.ShouldEqual, "application/x-git-upload-pack-result")

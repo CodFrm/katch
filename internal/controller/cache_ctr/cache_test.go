@@ -116,7 +116,7 @@ func TestCacheSearchAndPurge(t *testing.T) {
 
 		convey.Convey("搜到的那一条能按 id 清掉", func() {
 			cacheRepo.EXPECT().Find(gomock.Any(), int64(42)).Return(object, nil)
-			cacheRepo.EXPECT().Delete(gomock.Any(), int64(42)).Return(nil)
+			cacheRepo.EXPECT().DeleteUnchanged(gomock.Any(), int64(42), "sha256:abc", false).Return(true, nil)
 
 			purgeResp := &admin.PurgeCacheResponse{}
 			convey.So(testMux.Do(context.Background(), &admin.PurgeCacheRequest{ID: 42},
@@ -128,8 +128,8 @@ func TestCacheSearchAndPurge(t *testing.T) {
 
 // TestCachePurgeSkipsPinned 覆盖任务目标「pin 过的对象在清除批次里被跳过」。
 //
-// 断言落在「pin 的那条的 Delete 没被调用过」上：mock 对没 EXPECT 过的调用会当场
-// 失败，所以过滤一旦被拿掉，这个用例红的是「多打了一次 Delete」，而不是只有计数对不上。
+// 断言落在「pin 的那条的删除没被调用过」上：mock 对没 EXPECT 过的调用会当场
+// 失败，所以过滤一旦被拿掉，这个用例红的是「多打了一次删除」，而不是只有计数对不上。
 func TestCachePurgeSkipsPinned(t *testing.T) {
 	cacheRepo, testMux, _ := setupCacheTest(t)
 	convey.Convey("按上游清缓存时跳过 pin 过的对象", t, func() {
@@ -138,8 +138,8 @@ func TestCachePurgeSkipsPinned(t *testing.T) {
 				{ID: 1, UpstreamID: 7, Key: "/pool/keep.deb", Digest: "sha256:keep", Pinned: true},
 				{ID: 2, UpstreamID: 7, Key: "/pool/drop.deb", Digest: "sha256:drop"},
 			}, nil)
-		// 只有未 pin 的那条会被删；Delete(1) 会让用例当场失败。
-		cacheRepo.EXPECT().Delete(gomock.Any(), int64(2)).Return(nil)
+		// 只有未 pin 的那条会被删；删 1 会让用例当场失败。
+		cacheRepo.EXPECT().DeleteUnchanged(gomock.Any(), int64(2), "sha256:drop", true).Return(true, nil)
 
 		resp := &admin.PurgeCacheResponse{}
 		convey.So(testMux.Do(context.Background(), &admin.PurgeCacheRequest{UpstreamID: 7},

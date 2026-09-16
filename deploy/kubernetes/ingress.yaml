@@ -18,6 +18,9 @@ metadata:
     nginx.ingress.kubernetes.io/proxy-send-timeout: "900"
     # 0 = 不限。
     nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    # github.com 的响应头有 5KB（一堆 Set-Cookie），超过 nginx 默认的 4k 缓冲后
+    # ingress 直接 502（"upstream sent too big header"），看起来像回源挂了。
+    nginx.ingress.kubernetes.io/proxy-buffer-size: "16k"
 spec:
   ingressClassName: nginx
   rules:

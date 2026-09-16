@@ -1,6 +1,8 @@
 package web
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"io"
 	"net/http"
@@ -439,5 +441,111 @@ func TestGit_LocalAnswerIsNotOfferedForPush(t *testing.T) {
 		w := gitRequest(t, http.MethodPost, "/"+gitHost+gitRepo+"/git-receive-pack", "0000", nil)
 		convey.So(w.Code, convey.ShouldEqual, http.StatusForbidden)
 		convey.So(mirror.lastRequest().Host, convey.ShouldBeEmpty)
+	})
+}
+
+// gzipBody 把一段请求体压成 gzip：git 对超过 1KB 的协商请求就是这么发的。
+func gzipBody(t *testing.T, plain string) string {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write([]byte(plain)); err != nil {
+		t.Fatalf("压不了请求体：%v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("收不了 gzip 流：%v", err)
+	}
+	return buf.String()
+}
+
+// TestGit_GzippedNegotiationRequest git 会把超过 1KB 的协商请求压成 gzip 再发
+// （Content-Encoding: gzip），而 ref 多的仓库正好落在这条线上。
+//
+// 不解开的话两头都坏：
+//   - 回源头是白名单，Content-Encoding 不在里面，上游收到的是「声明明文、实为
+//     gzip」的字节，按 pkt-line 解出一堆乱码，回一个 400。现象是 226 个 ref 的
+//     仓库 clone 失败，而小仓库照常。
+//   - 本地镜像也读不懂它，于是最该命中镜像的那一类请求（ref 多到要压缩）全是穿透。
+//
+// 契约是在入口解开：镜像拿到明文，穿透时上游拿到的也是明文与对应的 Content-Length，
+// 而且不再带 Content-Encoding——声明与字节必须一致，带这个头去送明文，上游会去解
+// 一份根本没压过的数据。
+func TestGit_GzippedNegotiationRequest(t *testing.T) {
+	convey.Convey("gzip 的协商请求在入口解开", t, func() {
+		convey.Convey("穿透时上游收到的是明文", func() {
+			var gotBody, gotEncoding string
+			var gotLength int64
+			origin := fakeOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+				b, _ := io.ReadAll(r.Body)
+				gotBody = string(b)
+				gotLength = r.ContentLength
+				gotEncoding = r.Header.Get("Content-Encoding")
+				w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
+				_, _ = io.WriteString(w, "0008NAK\n")
+			})
+			gitUpstream(t, origin, upstream_entity.ProtocolStatic, upstream_entity.ProtocolGit)
+			// answer 为 nil：镜像这一次不接，走穿透。
+			withMirror(t, &fakeMirror{})
+
+			header := http.Header{}
+			header.Set("Content-Type", "application/x-git-upload-pack-request")
+			header.Set("Content-Encoding", "gzip")
+			w := gitRequest(t, http.MethodPost, uploadPackPath, gzipBody(t, wantLine), header)
+
+			convey.So(w.Code, convey.ShouldEqual, http.StatusOK)
+			convey.So(gotBody, convey.ShouldEqual, wantLine)
+			convey.So(gotLength, convey.ShouldEqual, int64(len(wantLine)))
+			convey.So(gotEncoding, convey.ShouldBeEmpty)
+		})
+
+		convey.Convey("保不开的 gzip 原样交给上游，声明跟着走", func() {
+			var gotBody, gotEncoding string
+			origin := fakeOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+				b, _ := io.ReadAll(r.Body)
+				gotBody = string(b)
+				gotEncoding = r.Header.Get("Content-Encoding")
+				w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
+				_, _ = io.WriteString(w, "0008NAK\n")
+			})
+			gitUpstream(t, origin, upstream_entity.ProtocolStatic, upstream_entity.ProtocolGit)
+			withMirror(t, &fakeMirror{})
+
+			// 声称压过、其实是一个字节都没压的体。
+			bogus := "并不是 gzip 的一体"
+			header := http.Header{}
+			header.Set("Content-Type", "application/x-git-upload-pack-request")
+			header.Set("Content-Encoding", "gzip")
+			w := gitRequest(t, http.MethodPost, uploadPackPath, bogus, header)
+
+			convey.So(w.Code, convey.ShouldEqual, http.StatusOK)
+			// 解不开就不替上游下结论，但声明不能丢：给它一个「声明 gzip、送明文」
+			// 的请求，比把一份解不开的数据原样交给它更槽。
+			convey.So(gotBody, convey.ShouldEqual, bogus)
+			convey.So(gotEncoding, convey.ShouldEqual, "gzip")
+		})
+
+		convey.Convey("本地镜像拿到的是明文，因此照常命中", func() {
+			result := "0008NAK\nPACKDATA"
+			hits := &atomic.Int64{}
+			origin := fakeOrigin(t, func(_ http.ResponseWriter, _ *http.Request) { hits.Add(1) })
+			gitUpstream(t, origin, upstream_entity.ProtocolStatic, upstream_entity.ProtocolGit)
+			mirror := &fakeMirror{answer: func(*git_svc.AnswerRequest) *git_svc.Answer {
+				return &git_svc.Answer{
+					ContentType: "application/x-git-upload-pack-result",
+					Body:        io.NopCloser(strings.NewReader(result)),
+				}
+			}}
+			withMirror(t, mirror)
+
+			header := http.Header{}
+			header.Set("Content-Type", "application/x-git-upload-pack-request")
+			header.Set("Content-Encoding", "gzip")
+			w := gitRequest(t, http.MethodPost, uploadPackPath, gzipBody(t, wantLine), header)
+
+			convey.So(w.Code, convey.ShouldEqual, http.StatusOK)
+			convey.So(string(mirror.lastRequest().Body), convey.ShouldEqual, wantLine)
+			convey.So(w.Header().Get("X-Katch-Git"), convey.ShouldEqual, "local")
+			convey.So(hits.Load(), convey.ShouldEqual, 0)
+		})
 	})
 }

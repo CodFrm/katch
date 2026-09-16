@@ -1,5 +1,6 @@
 import { useTranslation } from 'react-i18next'
 
+import { Table } from '@/components/ui/table'
 import { useRecentRequests } from '@/hooks/use-admin-data'
 import { type RecentRequestItem } from '@/lib/api'
 import { formatBytes, formatClock, formatLatency } from '@/lib/format'
@@ -57,7 +58,10 @@ export function RecentRequests({
       <h2 className="text-foreground text-[12.5px] font-semibold">
         {t('admin.upstream.recent.title')}
       </h2>
-      <table aria-label={t('admin.upstream.recent.title')} className="w-full text-left">
+      <Table
+        aria-label={t('admin.upstream.recent.title')}
+        className="min-w-[640px] table-fixed text-left"
+      >
         <thead>
           <tr className="border-border text-ink-3 border-b text-[11px] tracking-[0.12em]">
             <th scope="col" className="w-[84px] pb-2.5 font-normal">
@@ -83,7 +87,7 @@ export function RecentRequests({
             <RequestRow key={`${item.at}-${index}`} item={item} />
           ))}
         </tbody>
-      </table>
+      </Table>
     </section>
   )
 }
@@ -98,7 +102,11 @@ function RequestRow({ item }: { item: RecentRequestItem }) {
       <td className="text-muted-foreground py-2.5 font-mono text-[12.5px]">
         {formatClock(item.at)}
       </td>
-      <td className="text-foreground py-2.5 font-mono text-[12.5px]">{item.object}</td>
+      <td className="text-foreground py-2.5 font-mono text-[12.5px]">
+        <span className="block truncate pr-4" title={item.object}>
+          {item.object}
+        </span>
+      </td>
       <td className={`py-2.5 text-[12.5px] ${RESULT_TONE[item.result] ?? 'text-muted-foreground'}`}>
         <span className="flex items-center gap-1.5">
           <span aria-hidden className="size-[5px] shrink-0 rounded-full bg-current" />

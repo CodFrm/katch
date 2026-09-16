@@ -1,0 +1,44 @@
+# k3s-master-1 那台集群的实际部署值，由 .gitea/workflows/deploy.yaml 使用。
+#
+# 为什么不只用 helm 的 release 记住这些值：那样「线上到底跑的什么」就只能去集群里问，
+# 而 git 里读不出来。集群相关的东西（域名、storageClass、ingress class）入库，
+# 改的时候是一份可 review 的 diff。
+#
+# 用法（CI 里就是这么调的）：
+#   helm upgrade --install katch deploy/helm/katch -n app \
+#     -f deploy/helm/katch/values-ggnb.yaml --set image.tag=main.<短 sha>
+
+image:
+  repository: gitea.icodef.com/codfrm/katch
+  # tag 每次由 CI --set 进来。留空会用 Chart.yaml 的 appVersion，不是想要的结果，
+  # 所以 CI 必须给。
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# 镜像在 gitea 的私有包里，节点匿名拉不到：报 401 而不是「找不到镜像」。
+# dockersecret 是 ns app 里本来就有的一份 dockerconfigjson，那批应用共用。
+imagePullSecrets:
+  - name: dockersecret
+
+# 缓存、sqlite 库和日志都在这个卷上。ssd-nfs-client 是集群里那个 NFS provisioner，
+# 换 storageClass 等于把数据搬到别的卷上，别在升级时顺手改。
+persistence:
+  enabled: true
+  storageClass: ssd-nfs-client
+  size: 50Gi
+
+ingress:
+  enabled: true
+  className: k3s-main-nginx
+  # annotations 不写在这里：values.yaml 里那几条（关响应缓冲、超时 900s）是必须的，
+  # 用 -f 时 map 会与默认值合并，写了反而容易漏掉其中一条。
+  hosts:
+    - host: katch.ggnb.top
+      paths:
+        - path: /
+          pathType: Prefix
+  # ns app 里已有的通配证书（*.ggnb.top）。
+  tls:
+    - secretName: ggnb-top-tls
+      hosts:
+        - katch.ggnb.top

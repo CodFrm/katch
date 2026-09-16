@@ -109,6 +109,10 @@ ingress:
     nginx.ingress.kubernetes.io/proxy-read-timeout: "900"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "900"
     nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    # github.com 一个 HTML 页面的响应头就有 5KB（一堆 Set-Cookie），超过 nginx
+    # 默认的 4k 缓冲之后 ingress 直接 502，日志里写的是
+    # "upstream sent too big header while reading response header from upstream"。
+    nginx.ingress.kubernetes.io/proxy-buffer-size: "16k"
   hosts:
     - host: katch.example.com
       paths:

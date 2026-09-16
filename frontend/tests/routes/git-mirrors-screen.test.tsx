@@ -108,12 +108,17 @@ describe('后台 · git 镜像', () => {
     renderAdmin('/admin/git')
 
     const table = await screen.findByRole('table', { name: 'Git 镜像' })
+    expect(table).toHaveClass('table-fixed', 'min-w-[760px]')
+    expect(table.parentElement).toHaveAttribute('data-slot', 'table-container')
+    expect(table.parentElement).toHaveClass('min-w-0', 'overflow-x-auto')
     const rows = within(table).getAllByRole('row')
     // 一条表头 + 两条数据。
     expect(rows).toHaveLength(3)
 
     const ready = within(rows[1])
-    expect(ready.getByText('github.com/foo/bar.git')).toBeInTheDocument()
+    const repo = ready.getByText('github.com/foo/bar.git')
+    expect(repo).toHaveClass('block', 'truncate')
+    expect(repo).toHaveAttribute('title', 'github.com/foo/bar.git')
     expect(ready.getByText('已就绪')).toBeInTheDocument()
 
     const failed = within(rows[2])

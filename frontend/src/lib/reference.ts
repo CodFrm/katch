@@ -14,10 +14,9 @@ export type UpstreamProtocol = 'registry' | 'static' | 'git'
  * 一条引用识别成了哪种形态。
  *
  * 它是**这一次识别**的结论，不是上游开着的协议集合：一条上游可以同时开几种，
- * 但一行引用只对应一条命令，要么 docker pull 要么 curl。git 不在里面——clone
- * 的地址照抄就行，助手没有第三条命令要拼。
+ * 但一行引用只对应一条命令：docker pull、curl 或 git clone。
  */
-export type ReferenceKind = 'registry' | 'static'
+export type ReferenceKind = 'registry' | 'static' | 'git'
 
 /** 解析时用得上的上游字段，由公开上游列表接口提供。 */
 export interface UpstreamRef {
@@ -125,6 +124,18 @@ export function parseReference(input: string, options: ParseOptions): ParsedRefe
   }
 
   const target = `${host}${path}`
+  if (kind === 'git') {
+    return {
+      status: 'ok',
+      host,
+      kind,
+      verified,
+      target,
+      command: `git clone ${site}/${target}`,
+      prefix: `${site}/${host}`,
+    }
+  }
+
   // -O 取远端文件名，路径落在目录上时没有文件名可取，那条命令会直接报错。
   const download = path !== '' && !path.endsWith('/') ? '-fLO' : '-fL'
   return {
@@ -151,14 +162,18 @@ function looksLikeHost(segment: string): boolean {
 /**
  * 这一行引用落到哪种形态上。
  *
- * 先按写法猜，再拿上游开着的协议去校：一条同时开了 static 与 git 的记录，
- * 静态资源照常拼成下载命令；一条只开 registry 的记录，即使写法不像镜像引用
- * （比如没写 tag）也只能是镜像引用。上游表拿不到时只剩猜这一条路。
+ * 先识别明确的 Git 仓库地址，再按写法猜 registry 或 static，并拿上游开着的
+ * 协议去校：只有声明支持 git 的上游才会把 `.git` 结尾的路径识别成仓库；一条
+ * 同时开了 static 与 git 的记录，其余静态资源仍照常拼成下载命令。
  *
  * registry 优先于 static，与「裸镜像名只落到 registry」那一条同向：两种都开着
  * 的记录上，猜不出来的写法按镜像引用处理。
  */
 function resolveKind(entry: UpstreamRef | null, hadScheme: boolean, path: string): ReferenceKind {
+  if (entry?.protocols.includes('git') && path.endsWith('.git')) {
+    return 'git'
+  }
+
   const guessed = guessKind(hadScheme, path)
   if (entry === null || entry.protocols.includes(guessed)) {
     return guessed
