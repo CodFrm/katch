@@ -14,6 +14,7 @@ import (
 	"github.com/CodFrm/katch/internal/model/entity/setting_entity"
 	"github.com/CodFrm/katch/internal/pkg/code"
 	"github.com/CodFrm/katch/internal/repository/setting_repo"
+	"github.com/CodFrm/katch/internal/repository/upstream_repo"
 )
 
 // 运行时设置的键。
@@ -178,6 +179,11 @@ func jsonInt(v int64) json.RawMessage {
 	return json.RawMessage(fmt.Sprintf("%d", v))
 }
 
+// SiteBaseURL returns the canonical public base URL used by generated configuration.
+func SiteBaseURL(domain string) string {
+	return siteBaseURL(domain)
+}
+
 // normalize 校验一个值并给出落库用的 JSON 文本。
 //
 // 重新编码而不是原样存请求里的字节：请求里的 `0300`、多余空白、超长小数都能表达
@@ -261,10 +267,9 @@ func (s *settingSvc) current(ctx context.Context, def *settingDef) (json.RawMess
 }
 
 func (s *settingSvc) Save(ctx context.Context, req *admin.SaveSettingsRequest) (*admin.SaveSettingsResponse, error) {
-	// 先把整批校验完再写。挑能写的写进去，会在一次「保存失败」之后留下半套设置：
-	// 界面刚说没保存成功，库里却已经变了一部分，而且变了哪一部分取决于 map
-	// 的遍历顺序，同一个请求重放两次结果还不一样。
+	// 先把整批校验完再写。挑能写的写进去，会在一次「保存失败」之后留下半套设置。
 	pending := make([]*setting_entity.Setting, 0, len(req.Settings))
+	hasSiteDomain := false
 	for key, raw := range req.Settings {
 		def, ok := settingDefIndex[key]
 		if !ok {
@@ -275,29 +280,59 @@ func (s *settingSvc) Save(ctx context.Context, req *admin.SaveSettingsRequest) (
 			return nil, i18n.NewError(ctx, code.SettingValueInvalid, key, err.Error())
 		}
 		pending = append(pending, &setting_entity.Setting{Key: key, Value: string(value)})
+		hasSiteDomain = hasSiteDomain || key == SiteDomainSetting
 	}
-	now := time.Now().Unix()
-	for _, row := range pending {
-		exist, err := setting_repo.Setting().Find(ctx, row.Key)
-		if err != nil {
-			return nil, err
+
+	save := func(txCtx context.Context) error {
+		now := time.Now().Unix()
+		siteDomainChanged := false
+		for _, row := range pending {
+			exist, err := setting_repo.Setting().Find(txCtx, row.Key)
+			if err != nil {
+				return err
+			}
+			row.Createtime = now
+			if exist != nil {
+				row.Createtime = exist.Createtime
+			}
+			if row.Key == SiteDomainSetting {
+				siteDomainChanged = storedSettingValue(settingDefIndex[row.Key], exist) != row.Value
+			}
+			row.Updatetime = now
+			if err := setting_repo.Setting().Save(txCtx, row); err != nil {
+				return err
+			}
 		}
-		row.Createtime = now
-		if exist != nil {
-			// 保留原来的创建时间：Save 是整行写回，不带上它这一行会显得像是
-			// 每次保存都新建的。
-			row.Createtime = exist.Createtime
+		if siteDomainChanged {
+			return upstream_repo.RewriteConfig().AdvanceGeneration(txCtx)
 		}
-		row.Updatetime = now
-		if err := setting_repo.Setting().Save(ctx, row); err != nil {
-			return nil, err
-		}
+		return nil
+	}
+	var err error
+	if hasSiteDomain {
+		err = upstream_repo.RewriteConfig().Transaction(ctx, save)
+	} else {
+		err = save(ctx)
+	}
+	if err != nil {
+		return nil, err
 	}
 	list, err := s.List(ctx, &admin.ListSettingsRequest{})
 	if err != nil {
 		return nil, err
 	}
 	return &admin.SaveSettingsResponse{List: list.List}, nil
+}
+
+func storedSettingValue(def *settingDef, row *setting_entity.Setting) string {
+	if row == nil || row.Value == "" {
+		return string(def.Default)
+	}
+	normalized, err := def.normalize(json.RawMessage(row.Value))
+	if err != nil {
+		return string(def.Default)
+	}
+	return string(normalized)
 }
 
 func (s *settingSvc) RotateAdminKey(ctx context.Context, req *admin.RotateAdminKeyRequest) (*admin.RotateAdminKeyResponse, error) {

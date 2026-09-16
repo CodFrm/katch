@@ -18,6 +18,46 @@ const (
 	ProtocolGit = "git"
 )
 
+// PackageProfile 是静态传输之上的包管理器语义。none 保持原有字节透明行为。
+type PackageProfile string
+
+const (
+	PackageProfileNone     PackageProfile = "none"
+	PackageProfileNPM      PackageProfile = "npm"
+	PackageProfilePyPI     PackageProfile = "pypi"
+	PackageProfileGoProxy  PackageProfile = "goproxy"
+	PackageProfileMaven    PackageProfile = "maven"
+	PackageProfileCargo    PackageProfile = "cargo"
+	PackageProfileNuGet    PackageProfile = "nuget"
+	PackageProfileRubyGems PackageProfile = "rubygems"
+	PackageProfileAPT      PackageProfile = "apt"
+	PackageProfileRPM      PackageProfile = "rpm"
+	PackageProfileAPK      PackageProfile = "apk"
+	PackageProfileComposer PackageProfile = "composer"
+	PackageProfileHomebrew PackageProfile = "homebrew"
+)
+
+// Valid 报告 profile 是否属于公开配置契约。
+func (p PackageProfile) Valid() bool {
+	switch p {
+	case PackageProfileNone, PackageProfileNPM, PackageProfilePyPI, PackageProfileGoProxy,
+		PackageProfileMaven, PackageProfileCargo, PackageProfileNuGet, PackageProfileRubyGems,
+		PackageProfileAPT, PackageProfileRPM, PackageProfileAPK, PackageProfileComposer,
+		PackageProfileHomebrew:
+		return true
+	default:
+		return false
+	}
+}
+
+// NormalizePackageProfile 把迁移前记录和省略的 API 值归一化为 none。
+func NormalizePackageProfile(p PackageProfile) PackageProfile {
+	if p == "" {
+		return PackageProfileNone
+	}
+	return p
+}
+
 // 上游的默认策略。它是上游上的一个字段而不是一条访问规则——它没有 pattern，
 // 混进规则表会让规则的具体度排序无从谈起。
 const (
@@ -119,7 +159,9 @@ type Upstream struct {
 	Host string `gorm:"column:host" json:"host"`
 	// Protocols 这条记录开着的协议，非空。见 ProtocolSet。
 	Protocols ProtocolSet `gorm:"column:protocols;type:text" json:"protocols"`
-	Origin    string      `gorm:"column:origin" json:"origin"`
+	// PackageProfile 描述 static 传输承载的包管理器语义；none 保持原行为。
+	PackageProfile PackageProfile `gorm:"column:package_profile" json:"package_profile"`
+	Origin         string         `gorm:"column:origin" json:"origin"`
 	// Enabled 为 false 时等同于不存在：既不回源，也不在拉取路径上回显。
 	Enabled bool `gorm:"column:enabled" json:"enabled"`
 	// ImmutablePatterns 命中即视为内容寻址、可长期缓存的补充路径模式。
@@ -136,4 +178,10 @@ type Upstream struct {
 	Note              string `gorm:"column:note" json:"note"`
 	Createtime        int64  `gorm:"column:createtime" json:"createtime"`
 	Updatetime        int64  `gorm:"column:updatetime" json:"updatetime"`
+}
+
+// RewriteState 是 rewrite 配置的单行版本时钟。ID 固定为 1。
+type RewriteState struct {
+	ID         int64 `gorm:"column:id;primary_key"`
+	Generation int64 `gorm:"column:generation"`
 }

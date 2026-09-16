@@ -15,6 +15,7 @@ import (
 	"github.com/CodFrm/katch/internal/model/entity/setting_entity"
 	"github.com/CodFrm/katch/internal/repository/setting_repo"
 	mock_setting_repo "github.com/CodFrm/katch/internal/repository/setting_repo/mock"
+	"github.com/CodFrm/katch/internal/repository/upstream_repo"
 )
 
 // memorySettingRepo 一张背在内存里的设置表，用来数「库被问了几次」。
@@ -28,7 +29,25 @@ type memorySettingRepo struct {
 	rows  map[string]*setting_entity.Setting
 }
 
+type memoryRewriteConfigRepo struct {
+	advances int
+}
+
+func (m *memoryRewriteConfigRepo) Transaction(ctx context.Context, fn func(context.Context) error) error {
+	return fn(ctx)
+}
+
+func (m *memoryRewriteConfigRepo) AdvanceGeneration(context.Context) error {
+	m.advances++
+	return nil
+}
+
+func (m *memoryRewriteConfigRepo) Snapshot(context.Context) (*upstream_repo.RewriteConfigSnapshot, error) {
+	return &upstream_repo.RewriteConfigSnapshot{}, nil
+}
+
 func newMemorySettingRepo() *memorySettingRepo {
+	upstream_repo.RegisterRewriteConfig(&memoryRewriteConfigRepo{})
 	return &memorySettingRepo{finds: map[string]int{}, rows: map[string]*setting_entity.Setting{}}
 }
 
@@ -136,6 +155,29 @@ func TestRuntime_CoversEverySettingDef(t *testing.T) {
 	})
 }
 
+func TestSiteDomainAdvancesRewriteGenerationOnlyWhenChanged(t *testing.T) {
+	convey.Convey("site_domain 与 rewrite generation 同一次保存生效", t, func() {
+		repo := newMemorySettingRepo()
+		setting_repo.RegisterSetting(repo)
+		rewrite := &memoryRewriteConfigRepo{}
+		upstream_repo.RegisterRewriteConfig(rewrite)
+		ctx := context.Background()
+
+		save := func(domain string) {
+			_, err := Setting().Save(ctx, saveRequest(map[string]json.RawMessage{
+				SiteDomainSetting: mustJSON(domain),
+			}))
+			convey.So(err, convey.ShouldBeNil)
+		}
+		save("mirror.example.com")
+		convey.So(rewrite.advances, convey.ShouldEqual, 1)
+		save("mirror.example.com")
+		convey.So(rewrite.advances, convey.ShouldEqual, 1)
+		save("new.example.com")
+		convey.So(rewrite.advances, convey.ShouldEqual, 2)
+	})
+}
+
 // TestCachedSettingRepo_AnswersFromMemory 进程内缓存：同一个键不该每次都查库。
 func TestCachedSettingRepo_AnswersFromMemory(t *testing.T) {
 	convey.Convey("设置表包上进程内缓存之后", t, func() {
@@ -145,7 +187,8 @@ func TestCachedSettingRepo_AnswersFromMemory(t *testing.T) {
 
 		convey.Convey("写过的键只查一次库，其余请求从内存答", func() {
 			convey.So(cached.Save(ctx, &setting_entity.Setting{
-				Key: CacheQuotaBytesSetting, Value: "4096"}), convey.ShouldBeNil)
+				Key: CacheQuotaBytesSetting, Value: "4096",
+			}), convey.ShouldBeNil)
 			for range 5 {
 				row, err := cached.Find(ctx, CacheQuotaBytesSetting)
 				convey.So(err, convey.ShouldBeNil)
@@ -169,7 +212,8 @@ func TestCachedSettingRepo_AnswersFromMemory(t *testing.T) {
 			_, err := cached.Find(ctx, SiteDomainSetting)
 			convey.So(err, convey.ShouldBeNil)
 			convey.So(cached.Save(ctx, &setting_entity.Setting{
-				Key: SiteDomainSetting, Value: `"mirror.example.com"`}), convey.ShouldBeNil)
+				Key: SiteDomainSetting, Value: `"mirror.example.com"`,
+			}), convey.ShouldBeNil)
 
 			row, err := cached.Find(ctx, SiteDomainSetting)
 			convey.So(err, convey.ShouldBeNil)
@@ -186,7 +230,8 @@ func TestCachedSettingRepo_AnswersFromMemory(t *testing.T) {
 			_, err := repo.Find(ctx, SiteNameSetting)
 			convey.So(err, convey.ShouldBeNil)
 			convey.So(repo.Save(ctx, &setting_entity.Setting{
-				Key: SiteNameSetting, Value: `"新名字"`}), convey.ShouldNotBeNil)
+				Key: SiteNameSetting, Value: `"新名字"`,
+			}), convey.ShouldNotBeNil)
 			// 库里没变，缓存就还是对的：这一次读不该再去问库。
 			row, err := repo.Find(ctx, SiteNameSetting)
 			convey.So(err, convey.ShouldBeNil)

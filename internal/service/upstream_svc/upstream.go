@@ -77,6 +77,7 @@ func (u *upstreamSvc) PublicList(ctx context.Context, _ *api_upstream.ListReques
 		resp.List = append(resp.List, &api_upstream.Item{
 			Host:              v.Host,
 			Protocols:         protocols(v),
+			PackageProfile:    upstream_entity.NormalizePackageProfile(v.PackageProfile),
 			LibraryCompletion: v.LibraryCompletion,
 		})
 	}
@@ -104,8 +105,30 @@ func (u *upstreamSvc) Update(ctx context.Context, req *admin.UpdateUpstreamReque
 // 新增与更新共用这一段而不是各写一份：两者的差别只有「要不要先把库里那条捞出来」，
 // 余下的重名判定、默认策略兜底与字段映射一模一样，分成两份迟早会只改其中一份。
 func (u *upstreamSvc) write(ctx context.Context, id int64, spec *admin.UpstreamSpec) (int64, error) {
+	profile := upstream_entity.NormalizePackageProfile(spec.PackageProfile)
+	if !profile.Valid() {
+		return 0, i18n.NewError(ctx, code.SettingValueInvalid, "package_profile", "未知 profile")
+	}
+	if profile != upstream_entity.PackageProfileNone &&
+		!upstream_entity.ProtocolSet(spec.Protocols).Has(upstream_entity.ProtocolStatic) {
+		return 0, i18n.NewError(ctx, code.SettingValueInvalid,
+			"package_profile", "非 none profile 必须启用 static 协议")
+	}
+	spec.PackageProfile = profile
+
+	var savedID int64
+	err := upstream_repo.RewriteConfig().Transaction(ctx, func(txCtx context.Context) error {
+		var err error
+		savedID, err = u.writeTx(txCtx, id, spec)
+		return err
+	})
+	return savedID, err
+}
+
+func (u *upstreamSvc) writeTx(ctx context.Context, id int64, spec *admin.UpstreamSpec) (int64, error) {
 	now := time.Now().Unix()
 	upstream := &upstream_entity.Upstream{Createtime: now}
+	var before *upstream_entity.Upstream
 	if id != 0 {
 		exist, err := upstream_repo.Upstream().Find(ctx, id)
 		if err != nil {
@@ -114,6 +137,9 @@ func (u *upstreamSvc) write(ctx context.Context, id int64, spec *admin.UpstreamS
 		if exist == nil {
 			return 0, i18n.NewNotFoundError(ctx, code.UpstreamNotFound)
 		}
+		copied := *exist
+		copied.Protocols = append(upstream_entity.ProtocolSet(nil), exist.Protocols...)
+		before = &copied
 		// 以库里那条为底再覆盖字段，而不是拿一个空实体去 Save：后者会把
 		// createtime 这类请求里没有的字段一起清零。
 		upstream = exist
@@ -133,6 +159,7 @@ func (u *upstreamSvc) write(ctx context.Context, id int64, spec *admin.UpstreamS
 	}
 	upstream.Host = spec.Host
 	upstream.Protocols = upstream_entity.ProtocolSet(spec.Protocols)
+	upstream.PackageProfile = spec.PackageProfile
 	upstream.Origin = spec.Origin
 	// 整条替换，所以 enabled 原样照抄：这里任何一处「false 就不覆盖」的写法，
 	// 都会让停用这个动作在库里什么也没发生。
@@ -143,41 +170,68 @@ func (u *upstreamSvc) write(ctx context.Context, id int64, spec *admin.UpstreamS
 	upstream.LibraryCompletion = spec.LibraryCompletion
 	upstream.Note = spec.Note
 	upstream.Updatetime = now
-	// 写库这一步会顺手把拉取路径上的那份进程内快照掀掉（proxy_svc 的
-	// cachedUpstreamRepo 包在这个接口外面），停用因此在下一个请求上就生效。
 	if err := upstream_repo.Upstream().Save(ctx, upstream); err != nil {
 		return 0, err
+	}
+	if rewriteUpstreamChanged(before, upstream) {
+		if err := upstream_repo.RewriteConfig().AdvanceGeneration(ctx); err != nil {
+			return 0, err
+		}
 	}
 	return upstream.ID, nil
 }
 
+func rewriteUpstreamChanged(before, after *upstream_entity.Upstream) bool {
+	if before == nil {
+		return after.Enabled
+	}
+	return before.Host != after.Host || before.Enabled != after.Enabled ||
+		upstream_entity.NormalizePackageProfile(before.PackageProfile) != after.PackageProfile ||
+		!sameProtocols(before.Protocols, after.Protocols)
+}
+
+func sameProtocols(a, b upstream_entity.ProtocolSet) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := make(map[string]int, len(a))
+	for _, protocol := range a {
+		counts[protocol]++
+	}
+	for _, protocol := range b {
+		counts[protocol]--
+		if counts[protocol] < 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func (u *upstreamSvc) Delete(ctx context.Context, req *admin.DeleteUpstreamRequest) (*admin.DeleteUpstreamResponse, error) {
-	exist, err := upstream_repo.Upstream().Find(ctx, req.ID)
-	if err != nil {
-		return nil, err
-	}
-	if exist == nil {
-		// 不存在的 id 不能当成删除成功：界面上「删掉了」和「这条根本不在」是
-		// 两件事，后者通常意味着调用方拿的是一份过期的列表。
-		return nil, i18n.NewNotFoundError(ctx, code.UpstreamNotFound)
-	}
-	// 先连带删掉这个上游名下的规则，再删上游本身。
-	//
-	// 留着的孤儿规则不会立刻出事——求值只看全局那层和当前上游那层，id 不在表里
-	// 时谁都匹配不到。出事的是自增 id 被复用之后：下一个拿到这个 id 的上游会
-	// 毫无征兆地继承一批本该消失的规则。写入侧已经有对称的一半（rule_svc.Save
-	// 拒绝把规则挂到不存在的上游上），删除侧不能缺这一半。
-	//
-	// 顺序不能反：先删上游再删规则的话，规则那步一失败就正好落成上面那个缺陷，
-	// 而且上游已经不在了，重试都找不到该清哪一批。级联做在这一层而不是数据库的
-	// ON DELETE CASCADE：迁移只追加不修改，且要同时对 sqlite 和 MySQL 成立。
-	if err := rule_repo.AccessRule().DeleteByUpstream(ctx, req.ID); err != nil {
-		return nil, err
-	}
-	if err := upstream_repo.Upstream().Delete(ctx, req.ID); err != nil {
-		return nil, err
-	}
-	return &admin.DeleteUpstreamResponse{}, nil
+	var resp *admin.DeleteUpstreamResponse
+	err := upstream_repo.RewriteConfig().Transaction(ctx, func(txCtx context.Context) error {
+		exist, err := upstream_repo.Upstream().Find(txCtx, req.ID)
+		if err != nil {
+			return err
+		}
+		if exist == nil {
+			return i18n.NewNotFoundError(txCtx, code.UpstreamNotFound)
+		}
+		if err := rule_repo.AccessRule().DeleteByUpstream(txCtx, req.ID); err != nil {
+			return err
+		}
+		if err := upstream_repo.Upstream().Delete(txCtx, req.ID); err != nil {
+			return err
+		}
+		if exist.Enabled {
+			if err := upstream_repo.RewriteConfig().AdvanceGeneration(txCtx); err != nil {
+				return err
+			}
+		}
+		resp = &admin.DeleteUpstreamResponse{}
+		return nil
+	})
+	return resp, err
 }
 
 // protocols 把协议集合拷成一份普通 []string，不把存储形态泄漏给调用方。
@@ -198,6 +252,7 @@ func toItem(v *upstream_entity.Upstream) *admin.UpstreamItem {
 		ID:                v.ID,
 		Host:              v.Host,
 		Protocols:         protocols(v),
+		PackageProfile:    upstream_entity.NormalizePackageProfile(v.PackageProfile),
 		Origin:            v.Origin,
 		Enabled:           v.Enabled,
 		ImmutablePatterns: patterns,

@@ -18,8 +18,14 @@ import (
 
 func setupUpstreamTest(t *testing.T) *mock_upstream_repo.MockUpstreamRepo {
 	t.Helper()
-	repo := mock_upstream_repo.NewMockUpstreamRepo(gomock.NewController(t))
+	ctrl := gomock.NewController(t)
+	repo := mock_upstream_repo.NewMockUpstreamRepo(ctrl)
 	upstream_repo.RegisterUpstream(repo)
+	rewrite := mock_upstream_repo.NewMockRewriteConfigRepo(ctrl)
+	rewrite.EXPECT().Transaction(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(ctx context.Context, fn func(context.Context) error) error { return fn(ctx) }).AnyTimes()
+	rewrite.EXPECT().AdvanceGeneration(gomock.Any()).Return(nil).AnyTimes()
+	upstream_repo.RegisterRewriteConfig(rewrite)
 	return repo
 }
 
@@ -132,6 +138,112 @@ func TestSaveDefaultPolicy(t *testing.T) {
 		convey.So(err, convey.ShouldBeNil)
 		convey.So(saved.DefaultPolicy, convey.ShouldEqual, upstream_entity.PolicyAllowAll)
 	})
+}
+
+func TestPackageProfilePersistenceAndValidation(t *testing.T) {
+	profiles := []upstream_entity.PackageProfile{
+		upstream_entity.PackageProfileNone,
+		upstream_entity.PackageProfileNPM,
+		upstream_entity.PackageProfilePyPI,
+		upstream_entity.PackageProfileGoProxy,
+		upstream_entity.PackageProfileMaven,
+		upstream_entity.PackageProfileCargo,
+		upstream_entity.PackageProfileNuGet,
+		upstream_entity.PackageProfileRubyGems,
+		upstream_entity.PackageProfileAPT,
+		upstream_entity.PackageProfileRPM,
+		upstream_entity.PackageProfileAPK,
+		upstream_entity.PackageProfileComposer,
+		upstream_entity.PackageProfileHomebrew,
+	}
+	convey.Convey("每个批准的 package profile 都能保存", t, func() {
+		repo := setupUpstreamTest(t)
+		for _, profile := range profiles {
+			host := string(profile) + ".example.com"
+			repo.EXPECT().FindByHost(gomock.Any(), host).Return(nil, nil)
+			repo.EXPECT().Save(gomock.Any(), gomock.Any()).DoAndReturn(
+				func(_ context.Context, got *upstream_entity.Upstream) error {
+					convey.So(got.PackageProfile, convey.ShouldEqual, profile)
+					return nil
+				})
+			_, err := Upstream().Save(context.Background(), &admin.SaveUpstreamRequest{
+				Host: host, Protocols: []string{upstream_entity.ProtocolStatic},
+				Origin: "https://" + host, Enabled: true, PackageProfile: profile,
+			})
+			convey.So(err, convey.ShouldBeNil)
+		}
+	})
+
+	convey.Convey("省略 profile 时持久化为 none", t, func() {
+		repo := setupUpstreamTest(t)
+		repo.EXPECT().FindByHost(gomock.Any(), "legacy.example.com").Return(nil, nil)
+		repo.EXPECT().Save(gomock.Any(), gomock.Any()).DoAndReturn(
+			func(_ context.Context, got *upstream_entity.Upstream) error {
+				convey.So(got.PackageProfile, convey.ShouldEqual, upstream_entity.PackageProfileNone)
+				return nil
+			})
+		_, err := Upstream().Save(context.Background(), &admin.SaveUpstreamRequest{
+			Host: "legacy.example.com", Protocols: []string{upstream_entity.ProtocolStatic},
+			Origin: "https://legacy.example.com",
+		})
+		convey.So(err, convey.ShouldBeNil)
+	})
+
+	convey.Convey("非 none profile 没有 static transport 时拒绝且不写库", t, func() {
+		setupUpstreamTest(t)
+		_, err := Upstream().Save(context.Background(), &admin.SaveUpstreamRequest{
+			Host: "registry.example.com", Protocols: []string{upstream_entity.ProtocolRegistry},
+			Origin: "https://registry.example.com", PackageProfile: upstream_entity.PackageProfileNPM,
+		})
+		convey.So(err, convey.ShouldNotBeNil)
+	})
+}
+
+func TestRewriteGenerationChangesOnlyForEffectiveUpstreamConfig(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*admin.UpdateUpstreamRequest)
+		bump   bool
+	}{
+		{name: "完全相同", mutate: func(*admin.UpdateUpstreamRequest) {}, bump: false},
+		{name: "只改 origin", mutate: func(r *admin.UpdateUpstreamRequest) { r.Origin = "https://cdn.example.com" }, bump: false},
+		{name: "改 profile", mutate: func(r *admin.UpdateUpstreamRequest) { r.PackageProfile = upstream_entity.PackageProfileNPM }, bump: true},
+		{name: "改 transport", mutate: func(r *admin.UpdateUpstreamRequest) {
+			r.Protocols = []string{upstream_entity.ProtocolStatic, upstream_entity.ProtocolGit}
+		}, bump: true},
+		{name: "改 enabled", mutate: func(r *admin.UpdateUpstreamRequest) { r.Enabled = false }, bump: true},
+		{name: "改 companion host", mutate: func(r *admin.UpdateUpstreamRequest) { r.Host = "files.example.com" }, bump: true},
+	}
+	for _, tc := range cases {
+		convey.Convey(tc.name, t, func() {
+			ctrl := gomock.NewController(t)
+			repo := mock_upstream_repo.NewMockUpstreamRepo(ctrl)
+			rewrite := mock_upstream_repo.NewMockRewriteConfigRepo(ctrl)
+			upstream_repo.RegisterUpstream(repo)
+			upstream_repo.RegisterRewriteConfig(rewrite)
+			rewrite.EXPECT().Transaction(gomock.Any(), gomock.Any()).DoAndReturn(
+				func(ctx context.Context, fn func(context.Context) error) error { return fn(ctx) })
+			if tc.bump {
+				rewrite.EXPECT().AdvanceGeneration(gomock.Any()).Return(nil)
+			}
+			existing := &upstream_entity.Upstream{
+				ID: 7, Host: "index.example.com", Origin: "https://index.example.com", Enabled: true,
+				Protocols:      upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+				PackageProfile: upstream_entity.PackageProfileNone, Createtime: 11,
+			}
+			req := &admin.UpdateUpstreamRequest{
+				ID: 7, Host: existing.Host, Origin: existing.Origin, Enabled: existing.Enabled,
+				Protocols: []string{upstream_entity.ProtocolStatic}, PackageProfile: existing.PackageProfile,
+			}
+			tc.mutate(req)
+			repo.EXPECT().Find(gomock.Any(), int64(7)).Return(existing, nil)
+			repo.EXPECT().FindByHost(gomock.Any(), req.Host).Return(existing, nil)
+			repo.EXPECT().Save(gomock.Any(), gomock.Any()).Return(nil)
+
+			_, err := Upstream().Update(context.Background(), req)
+			convey.So(err, convey.ShouldBeNil)
+		})
+	}
 }
 
 // TestDeleteCascadesRules 删掉一个上游，它名下的规则必须跟着走。

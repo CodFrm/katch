@@ -6,7 +6,11 @@
 // 值错得没有任何征兆。
 package upstream
 
-import "github.com/cago-frame/cago/server/mux"
+import (
+	"github.com/cago-frame/cago/server/mux"
+
+	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
+)
 
 // 上游此刻的可服务状态。降级是内存里的退避状态（决策 17），不落库——它说的是
 // 「现在」，重启后重新探测。
@@ -27,8 +31,9 @@ const (
 type Item struct {
 	Host string `json:"host"`
 	// Protocols 这条上游开着的协议，取值见 upstream_entity 的 Protocol* 常量。
-	Protocols         []string `json:"protocols"`
-	LibraryCompletion bool     `json:"library_completion"`
+	Protocols         []string                       `json:"protocols"`
+	PackageProfile    upstream_entity.PackageProfile `json:"package_profile"`
+	LibraryCompletion bool                           `json:"library_completion"`
 	// HitRate 近 24 小时的命中率，取值 0~1。
 	//
 	// 由计数推导而不是存一个比值（可观测性一节），口径与后台那张健康矩阵同一套。
