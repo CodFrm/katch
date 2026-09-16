@@ -126,16 +126,71 @@ curl -X POST http://localhost:8080/api/v1/admin/upstreams \
 
 `protocols` 是这条上游开着的协议集合，取值为 `registry`、`static`、`git`
 的任意非空子集——一条记录可以同时开几种，比如 `github.com` 既服务 `git clone`
-也服务 release 资产下载。registry 的 blob 与按 digest 请求的 manifest 会按协议语义
-自动长期缓存，tag manifest 走 `mutable_ttl_seconds`；`immutable_patterns` 用来声明
-static 或非标准路径中哪些对象是内容寻址的（可长期缓存 + LRU 淘汰），其余路径按
-`mutable_ttl_seconds` 走短 TTL。
+也服务 release 资产下载。
 
-拉取时响应上的 `X-Katch-Cache: HIT|MISS` 能直接看出这一次有没有回源：
+### 缓存策略
+
+不可变判定分两类，边界不重叠：
+
+- **registry 按协议自动判定**，不需要也不看 `immutable_patterns`：blob 与按 digest
+  寻址的 manifest（`.../blobs/sha256:...`、`.../manifests/sha256:...`）是内容寻址
+  对象，自动长期缓存、只由 LRU 淘汰；tag manifest、`referrers` 与 `tags/list` 会变，
+  按 `mutable_ttl_seconds` 过期。
+- **static 与 git 路径只认显式模式**，不存在按 URL 里像不像 hash 的外观推断：
+  `immutable_patterns` 为空则全部按 TTL；非空时命中的对象长期缓存，其余仍按
+  `mutable_ttl_seconds`。模式对整条上游侧路径做**子串**匹配（不锚定首尾）：不含
+  通配符时直接找子串，`*` 匹配任意多个字符（含 `/`），`?` 匹配任意一个字符。
+
+管理界面「缓存策略」里的预设只是把下表的模式填进 `immutable_patterns`，保存的是
+模式本身而不是预设名称——已登记的上游不会因为预设调整而静默改变；「自定义」可以
+逐行编辑任意模式。
+
+| 预设 | 写入的模式 | 判为不可变 | 仍按 TTL 的可变例外 |
+| --- | --- | --- | --- |
+| APT 软件包 | `/pool/` | `pool/` 下的 deb 包与源码包 | `dists/` 下的 `InRelease`、`Release`、`Packages*` 等索引 |
+| Go Module Proxy | `/@v/*.info`、`/@v/*.mod`、`/@v/*.zip` | 具体版本文件 | `@v/list`、`@latest` |
+| Git commit 静态文件 | 一整段 40 个 `?`（commit SHA） | 路径中含 40 位 commit 的对象 | 分支名、tag、`HEAD`、`info/refs` 这类会移动的引用 |
+| PyPI 文件 | `/packages/??/??/` + 64 个 `?` | hash 目录下的包文件 | `/simple/` 索引与 JSON API |
+
+### 命中验证
+
+`X-Katch-Cache: HIT|MISS` 说明这一次有没有回源。要看到完整的 MISS → HIT，必须用
+**GET 读完整响应体**再比对：普通 HEAD 和可本地求值的条件请求在命中时同样报 `HIT`，
+但 HEAD 没有响应体、条件请求可能只拿到 `304`，单看一次命中说明不了本地那份副本
+完整；`MISS → HIT` 加上两次内容逐字节相同才是完整证据。
+
+请求的对象没有副本（或可变对象已过 TTL）时第一次才是 `MISS`；已在 TTL 内或不可变
+对象一上手就是 `HIT`，换一个没缓存过的路径再验。
 
 ```bash
-curl -sI http://localhost:8080/deb.debian.org/debian/dists/bookworm/InRelease | grep -i x-katch-cache
+URL=http://localhost:8080/deb.debian.org/debian/dists/bookworm/InRelease
+
+curl -s -D /tmp/first.h -o /tmp/first.b "$URL"
+grep -i '^x-katch-cache' /tmp/first.h            # MISS：这一次回源
+
+curl -s -D /tmp/second.h -o /tmp/second.b "$URL"
+grep -i '^x-katch-cache' /tmp/second.h           # HIT：这一次由本地副本应答
+cmp /tmp/first.b /tmp/second.b                   # 命中内容与回源逐字节相同
+
+# 新鲜副本上的 HEAD：本地 200、无响应体、命中
+curl -sI "$URL" | grep -i '^x-katch-cache'                              # HIT
+# 条件请求命中：星号问的是「还有没有这份表示」，本地 304
+curl -s -o /dev/null -w '%{http_code}\n' -H 'If-None-Match: *' "$URL"   # 304
 ```
+
+TTL 内的副本由本地应答，命中响应原样回放上游保存下来的 `ETag`/`Last-Modified`
+（registry 对象没有上游 ETag 时退回内容摘要推导）。由此：
+
+- 普通 `HEAD`：本地 `200`，状态与响应头同一套，只是不带响应体，`X-Katch-Cache: HIT`；
+- 条件请求：`If-None-Match` 按弱比较、逗号列表与 `*` 求值，命中返回本地 `304`
+  （也是 `HIT`），明确不匹配则本地 `200`；只有没有 `If-None-Match` 时才看
+  `If-Modified-Since`，日期不晚于请求时间即 `304`；
+- 副本缺少求值所需的 validator（上游从未给过 `ETag`/`Last-Modified`，或副本是加
+  该字段之前写下的历史记录）：本地不猜，这一次透传上游（`MISS`）；
+- `Range` 与 `If-Range` 一律透传，本地不处理任何分段。
+
+未命中时的 HEAD 与条件请求也不会写缓存——它们可能拿到 `304` 或一个由上游判断的
+`200`，不能当成一份完整副本存下来。
 
 ### git clone
 
