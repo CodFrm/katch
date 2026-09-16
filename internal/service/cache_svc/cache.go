@@ -239,13 +239,7 @@ func (c *cacheSvc) Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCl
 		if err != nil {
 			return nil, nil, err
 		}
-		if meta != nil && meta.Header.Get(cacheStatusHeader) != cacheStatusHit {
-			if meta.Header == nil {
-				meta.Header = make(http.Header, 1)
-			}
-			meta.Header.Set(cacheStatusHeader, cacheStatusMiss)
-		}
-		return body, m.stamp(meta), nil
+		return body, stampPassthroughMiss(meta, m), nil
 	}
 	body, meta, err = c.fetchAndCache(ctx, target, upstream, key, immutable)
 	if err != nil {
@@ -319,12 +313,20 @@ func rangePassthroughMiss(target *proxy_svc.Target, meta *proxy_svc.Meta) *proxy
 	if meta == nil || target.Git.IsGit() || !rangeRequest(target) {
 		return meta
 	}
+	return stampPassthroughMiss(meta, &miss{reason: metrics.MissFirst})
+}
+
+// stampPassthroughMiss 给本跳直接回源的响应写入 MISS 与未命中原因。
+// 上游 katch 自带的缓存状态描述的是上游那一跳，不能冒充本地命中。
+func stampPassthroughMiss(meta *proxy_svc.Meta, m *miss) *proxy_svc.Meta {
+	if meta == nil {
+		return nil
+	}
 	if meta.Header == nil {
 		meta.Header = make(http.Header, 2)
 	}
 	meta.Header.Set(cacheStatusHeader, cacheStatusMiss)
-	// 归因与 HEAD/条件请求的透传保持一档：手上没有任何可复用的副本，算首次拉取。
-	return (&miss{reason: metrics.MissFirst}).stamp(meta)
+	return m.stamp(meta)
 }
 
 // writableRequest 未命中时这次请求能不能写缓存。

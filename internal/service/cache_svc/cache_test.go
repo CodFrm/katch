@@ -13,6 +13,7 @@ import (
 
 	"github.com/smartystreets/goconvey/convey"
 
+	"github.com/CodFrm/katch/internal/metrics"
 	"github.com/CodFrm/katch/internal/model/entity/cache_entity"
 )
 
@@ -742,6 +743,37 @@ func TestGet_ConditionalWithoutValidatorPassesThrough(t *testing.T) {
 		// 透传不写缓存：记录的 validator 仍是空，数量也没有变。
 		convey.So(len(repo.all()), convey.ShouldEqual, 1)
 		convey.So(repo.byKey(path).ETag, convey.ShouldBeEmpty)
+	})
+}
+
+// TestGet_NonWritablePassthroughOverridesUpstreamHit 验证本跳直接回源时，不能继承
+// 上游 katch 的缓存归因。
+func TestGet_NonWritablePassthroughOverridesUpstreamHit(t *testing.T) {
+	convey.Convey("HEAD 与条件请求的上游 HIT 必须覆盖为本跳 MISS", t, func() {
+		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set(cacheStatusHeader, cacheStatusHit)
+			_, _ = io.WriteString(w, "body")
+		})
+		svc, repo, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+
+		head := target("deb.debian.org", "/pool/head.deb")
+		head.Method = http.MethodHead
+		body, meta, err := svc.Get(context.Background(), head)
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(body.Close(), convey.ShouldBeNil)
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusMiss)
+		convey.So(meta.Header.Get(metrics.MissHeader), convey.ShouldEqual, string(metrics.MissFirst))
+
+		conditional := target("deb.debian.org", "/pool/conditional.deb")
+		conditional.Header.Set("If-None-Match", `"v1"`)
+		body, meta, err = svc.Get(context.Background(), conditional)
+		convey.So(err, convey.ShouldBeNil)
+		_, _ = io.ReadAll(body)
+		convey.So(body.Close(), convey.ShouldBeNil)
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusMiss)
+		convey.So(meta.Header.Get(metrics.MissHeader), convey.ShouldEqual, string(metrics.MissFirst))
+		convey.So(len(repo.all()), convey.ShouldEqual, 0)
+		convey.So(o.hits.Load(), convey.ShouldEqual, 2)
 	})
 }
 
