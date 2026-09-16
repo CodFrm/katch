@@ -6,6 +6,7 @@ package web
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"embed"
 	"errors"
@@ -183,6 +184,12 @@ func serveProxy(c *gin.Context, kind dispatch.Kind, host, rest string) {
 	}
 	ctx := c.Request.Context()
 	request := gitRequestBody(c.Request, git)
+	// 请求体已经在入口解开了的话，转发的头里不能再带着那个编码声明。
+	forwardHeader := c.Request.Header
+	if request.decoded {
+		forwardHeader = c.Request.Header.Clone()
+		forwardHeader.Del("Content-Encoding")
+	}
 	// 本地镜像答得了就由它答，答不了才穿透（决策 5）。判断必须在这里做完：
 	// 响应一旦开了头就没法再改主意。
 	if request.answerable && serveGitLocal(c, host, git, request.local) {
@@ -194,7 +201,7 @@ func serveProxy(c *gin.Context, kind dispatch.Kind, host, rest string) {
 		Path:          rest,
 		RawQuery:      c.Request.URL.RawQuery,
 		Method:        c.Request.Method,
-		Header:        c.Request.Header,
+		Header:        forwardHeader,
 		Git:           git,
 		Body:          request.upstream,
 		ContentLength: request.length,
@@ -268,6 +275,9 @@ type gitBody struct {
 	upstream io.Reader
 	// length 上面那一份有多长，-1 表示分块。
 	length int64
+	// decoded 表示 upstream 那份的 Content-Encoding 已经在入口解开了：
+	// 转发时得把这个头摘掉，否则就是反过来的同一个错——声明 gzip、送的是明文。
+	decoded bool
 }
 
 // gitRequestBody 把请求体读成本地应答与穿透各自要的形态。
@@ -294,17 +304,50 @@ func gitRequestBody(r *http.Request, git dispatch.GitEndpoint) gitBody {
 	if len(buffered) > maxGitRequestBytes {
 		// 太大：不留在内存里，把已读的那一段和剩下的接起来继续流给上游。
 		// ContentLength 原样抄客户端那一侧，-1 表示分块。
+		//
+		// 这一份**不解压**：手上从来没有完整的一份，流到一半去解反而会把字节弄丢。
+		// 它带着什么编码就原样转给上游，Content-Encoding 在回源头的转发白名单里
+		// （origin.forwardedRequestHeaders），那个头会跟着走。
 		return gitBody{
 			upstream: io.MultiReader(bytes.NewReader(buffered), r.Body),
 			length:   r.ContentLength,
 		}
 	}
+	plain, decoded := decodeGitBody(buffered, r.Header.Get("Content-Encoding"))
 	return gitBody{
-		local: buffered, answerable: true,
+		local: plain, answerable: true,
 		// 长度用实际读到的字节数，不用客户端声明的那个：两者不一致时，
 		// 按声明的发会让上游一直等一段永远不会来的字节。
-		upstream: bytes.NewReader(buffered), length: int64(len(buffered)),
+		upstream: bytes.NewReader(plain), length: int64(len(plain)),
+		decoded: decoded,
 	}
+}
+
+// decodeGitBody 按 Content-Encoding 解开协商请求体。
+//
+// git 对超过 1KB 的协商请求体会压成 gzip 再发，而 ref 多的仓库正好落在这条线上。
+// 不解开的话两头都坏：回源头的白名单里虽然有 Content-Encoding，但本地镜像读不懂
+// 压缩字节，于是一次都答不上来——而「ref 多到要压缩」正是最该命中镜像的那一类。
+// 穿透那一侧也不剩好处：多一个上游去解压，就多一处可以解错的地方。
+//
+// 解不开就把原字节原样交出去并如实报告没解开。上游的 git 比这里的解压器认得多，
+// 由它给出判断比在这里替它下一个结论可靠。
+func decodeGitBody(body []byte, contentEncoding string) ([]byte, bool) {
+	encoding := strings.TrimSpace(contentEncoding)
+	// x-gzip 是 gzip 的别名（RFC 9110 的 8.4.1.2），历史上有人只发这个。
+	if !strings.EqualFold(encoding, "gzip") && !strings.EqualFold(encoding, "x-gzip") {
+		return body, false
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(body))
+	if err != nil {
+		return body, false
+	}
+	defer func() { _ = zr.Close() }()
+	plain, err := io.ReadAll(zr)
+	if err != nil {
+		return body, false
+	}
+	return plain, true
 }
 
 // serveGitLocal 尝试由本地镜像应答，返回这次请求是否已经答完。
