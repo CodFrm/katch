@@ -66,6 +66,79 @@ func (c *Cache) Pin(ctx context.Context, req *admin.PinCacheObjectRequest) (*adm
 	return &admin.PinCacheObjectResponse{}, nil
 }
 
+// Tree 列缓存对象目录树的一层。
+func (c *Cache) Tree(ctx context.Context, req *admin.CacheTreeRequest) (*admin.CacheTreeResponse, error) {
+	result, err := cache_svc.Cache().Tree(ctx, &cache_svc.TreeRequest{Path: req.Path, Offset: req.Offset})
+	if err != nil {
+		return nil, err
+	}
+	resp := &admin.CacheTreeResponse{
+		Path:        result.Path,
+		TotalCount:  result.TotalCount,
+		TotalPinned: result.TotalPinned,
+		TotalSize:   result.TotalSize,
+		Children:    make([]*admin.CacheTreeNode, 0, len(result.Children)),
+		HasMore:     result.HasMore,
+		NextOffset:  result.NextOffset,
+	}
+	for _, node := range result.Children {
+		item := &admin.CacheTreeNode{
+			Kind:         node.Kind,
+			Name:         node.Name,
+			Path:         node.Path,
+			Count:        node.Count,
+			PinnedCount:  node.PinnedCount,
+			Size:         node.Size,
+			LastAccessAt: node.LastAccessAt,
+			Variant:      node.Variant,
+		}
+		if node.Object != nil {
+			item.Object = toTreeItem(node.Object, node.Host)
+		}
+		resp.Children = append(resp.Children, item)
+	}
+	return resp, nil
+}
+
+// TreeSearch 在目录树的一个目录下搜索对象。
+func (c *Cache) TreeSearch(ctx context.Context, req *admin.CacheTreeSearchRequest) (*admin.CacheTreeSearchResponse, error) {
+	result, err := cache_svc.Cache().TreeSearch(ctx, &cache_svc.TreeSearchRequest{Path: req.Path, Keyword: req.Keyword})
+	if err != nil {
+		return nil, err
+	}
+	resp := &admin.CacheTreeSearchResponse{
+		Path:      result.Path,
+		Matched:   result.Matched,
+		Truncated: result.Truncated,
+		Objects:   make([]*admin.CacheTreeSearchObject, 0, len(result.Objects)),
+		Dirs:      make([]*admin.CacheTreeSearchDir, 0, len(result.Dirs)),
+	}
+	for _, object := range result.Objects {
+		resp.Objects = append(resp.Objects, &admin.CacheTreeSearchObject{
+			Name:    object.Name,
+			Path:    object.Path,
+			Variant: object.Variant,
+			Object:  toTreeItem(object.Object, object.Host),
+		})
+	}
+	for _, dir := range result.Dirs {
+		resp.Dirs = append(resp.Dirs, &admin.CacheTreeSearchDir{
+			Path:         dir.Path,
+			NameMatch:    dir.NameMatch,
+			Count:        dir.Count,
+			Size:         dir.Size,
+			MatchedCount: dir.MatchedCount,
+			MatchedSize:  dir.MatchedSize,
+			LastAccessAt: dir.LastAccessAt,
+		})
+	}
+	return resp, nil
+}
+
+func toTreeItem(object *cache_entity.CacheObject, host string) *admin.CacheTreeObjectItem {
+	return &admin.CacheTreeObjectItem{CacheObjectItem: *toItem(object), Host: host}
+}
+
 func toItem(object *cache_entity.CacheObject) *admin.CacheObjectItem {
 	return &admin.CacheObjectItem{
 		ID:           object.ID,

@@ -55,6 +55,22 @@ type CacheObjectRepo interface {
 	CountByDigest(ctx context.Context, digest string) (int64, error)
 	Search(ctx context.Context, opt *cache_entity.SearchOption) ([]*cache_entity.CacheObject, int64, error)
 	ListByUpstream(ctx context.Context, upstreamID int64) ([]*cache_entity.CacheObject, error)
+
+	// 下面几条是管理界面的目录树（实现见 cache_tree.go）。层级不落表，按键前缀现算：
+	// 键以 / 开头，查询串之前的 `/` 才是目录分隔，查询串里的 `/` 不算。
+
+	// StatByUpstream 树根：每个有缓存对象的上游一行合计。
+	StatByUpstream(ctx context.Context) ([]*cache_entity.UpstreamTreeStat, error)
+	// StatByPrefix 一个目录下的合计，以及直接子目录数与直接对象数。
+	StatByPrefix(ctx context.Context, upstreamID int64, prefix string) (*cache_entity.PrefixTreeStat, error)
+	// ListTreeDirs 一层的子目录，按名称排序。
+	ListTreeDirs(ctx context.Context, opt *cache_entity.TreeOption) ([]*cache_entity.TreeDir, error)
+	// ListTreeObjects 一层的对象（不在任何子目录里的记录），按键排序。
+	ListTreeObjects(ctx context.Context, opt *cache_entity.TreeOption) ([]*cache_entity.CacheObject, error)
+	// SearchTree 目录下不区分大小写的子串搜索，返回前 Limit 条与命中总数。
+	SearchTree(ctx context.Context, opt *cache_entity.TreeSearchOption) ([]*cache_entity.CacheObject, int64, error)
+	// StatTreeMatch 搜索结果里一个目录的合计与命中部分的合计。
+	StatTreeMatch(ctx context.Context, opt *cache_entity.TreeMatchOption) (*cache_entity.TreeMatchStat, error)
 }
 
 var defaultCacheObject CacheObjectRepo

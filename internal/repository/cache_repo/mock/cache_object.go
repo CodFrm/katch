@@ -175,6 +175,36 @@ func (mr *MockCacheObjectRepoMockRecorder) ListByUpstream(ctx, upstreamID any) *
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListByUpstream", reflect.TypeOf((*MockCacheObjectRepo)(nil).ListByUpstream), ctx, upstreamID)
 }
 
+// ListTreeDirs mocks base method.
+func (m *MockCacheObjectRepo) ListTreeDirs(ctx context.Context, opt *cache_entity.TreeOption) ([]*cache_entity.TreeDir, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ListTreeDirs", ctx, opt)
+	ret0, _ := ret[0].([]*cache_entity.TreeDir)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ListTreeDirs indicates an expected call of ListTreeDirs.
+func (mr *MockCacheObjectRepoMockRecorder) ListTreeDirs(ctx, opt any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListTreeDirs", reflect.TypeOf((*MockCacheObjectRepo)(nil).ListTreeDirs), ctx, opt)
+}
+
+// ListTreeObjects mocks base method.
+func (m *MockCacheObjectRepo) ListTreeObjects(ctx context.Context, opt *cache_entity.TreeOption) ([]*cache_entity.CacheObject, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ListTreeObjects", ctx, opt)
+	ret0, _ := ret[0].([]*cache_entity.CacheObject)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ListTreeObjects indicates an expected call of ListTreeObjects.
+func (mr *MockCacheObjectRepoMockRecorder) ListTreeObjects(ctx, opt any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListTreeObjects", reflect.TypeOf((*MockCacheObjectRepo)(nil).ListTreeObjects), ctx, opt)
+}
+
 // PromoteImmutable mocks base method.
 func (m *MockCacheObjectRepo) PromoteImmutable(ctx context.Context, id int64) error {
 	m.ctrl.T.Helper()
@@ -219,6 +249,22 @@ func (mr *MockCacheObjectRepoMockRecorder) Search(ctx, opt any) *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Search", reflect.TypeOf((*MockCacheObjectRepo)(nil).Search), ctx, opt)
 }
 
+// SearchTree mocks base method.
+func (m *MockCacheObjectRepo) SearchTree(ctx context.Context, opt *cache_entity.TreeSearchOption) ([]*cache_entity.CacheObject, int64, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "SearchTree", ctx, opt)
+	ret0, _ := ret[0].([]*cache_entity.CacheObject)
+	ret1, _ := ret[1].(int64)
+	ret2, _ := ret[2].(error)
+	return ret0, ret1, ret2
+}
+
+// SearchTree indicates an expected call of SearchTree.
+func (mr *MockCacheObjectRepoMockRecorder) SearchTree(ctx, opt any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SearchTree", reflect.TypeOf((*MockCacheObjectRepo)(nil).SearchTree), ctx, opt)
+}
+
 // SetPinned mocks base method.
 func (m *MockCacheObjectRepo) SetPinned(ctx context.Context, id int64, pinned bool) error {
 	m.ctrl.T.Helper()
@@ -246,6 +292,51 @@ func (m *MockCacheObjectRepo) SizeByUpstream(ctx context.Context) (map[int64]int
 func (mr *MockCacheObjectRepoMockRecorder) SizeByUpstream(ctx any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SizeByUpstream", reflect.TypeOf((*MockCacheObjectRepo)(nil).SizeByUpstream), ctx)
+}
+
+// StatByPrefix mocks base method.
+func (m *MockCacheObjectRepo) StatByPrefix(ctx context.Context, upstreamID int64, prefix string) (*cache_entity.PrefixTreeStat, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "StatByPrefix", ctx, upstreamID, prefix)
+	ret0, _ := ret[0].(*cache_entity.PrefixTreeStat)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// StatByPrefix indicates an expected call of StatByPrefix.
+func (mr *MockCacheObjectRepoMockRecorder) StatByPrefix(ctx, upstreamID, prefix any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StatByPrefix", reflect.TypeOf((*MockCacheObjectRepo)(nil).StatByPrefix), ctx, upstreamID, prefix)
+}
+
+// StatByUpstream mocks base method.
+func (m *MockCacheObjectRepo) StatByUpstream(ctx context.Context) ([]*cache_entity.UpstreamTreeStat, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "StatByUpstream", ctx)
+	ret0, _ := ret[0].([]*cache_entity.UpstreamTreeStat)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// StatByUpstream indicates an expected call of StatByUpstream.
+func (mr *MockCacheObjectRepoMockRecorder) StatByUpstream(ctx any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StatByUpstream", reflect.TypeOf((*MockCacheObjectRepo)(nil).StatByUpstream), ctx)
+}
+
+// StatTreeMatch mocks base method.
+func (m *MockCacheObjectRepo) StatTreeMatch(ctx context.Context, opt *cache_entity.TreeMatchOption) (*cache_entity.TreeMatchStat, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "StatTreeMatch", ctx, opt)
+	ret0, _ := ret[0].(*cache_entity.TreeMatchStat)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// StatTreeMatch indicates an expected call of StatTreeMatch.
+func (mr *MockCacheObjectRepoMockRecorder) StatTreeMatch(ctx, opt any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StatTreeMatch", reflect.TypeOf((*MockCacheObjectRepo)(nil).StatTreeMatch), ctx, opt)
 }
 
 // TotalSize mocks base method.

@@ -80,3 +80,84 @@ type PinCacheObjectRequest struct {
 
 // PinCacheObjectResponse 钉住成功没有额外信息可返回。
 type PinCacheObjectResponse struct{}
+
+// CacheTreeRequest 列缓存对象目录树的一层。
+//
+// Path 不以 / 开头，第一段是上游主机名，其余各段对应缓存键里查询串之前的路径；
+// 留空表示根（列出有缓存对象的上游主机）。每次最多返回 200 项，Offset 取上一批的
+// next_offset。
+type CacheTreeRequest struct {
+	mux.Meta `path:"/admin/cache/tree" method:"GET"`
+	Path     string `form:"path" binding:"omitempty,max=1024" label:"目录"`
+	Offset   int    `form:"offset" binding:"omitempty,gte=0" label:"偏移"`
+}
+
+// CacheTreeObjectItem 目录树里的缓存对象：比对象搜索多一个主机名。
+type CacheTreeObjectItem struct {
+	CacheObjectItem
+	Host string `json:"host"`
+}
+
+// CacheTreeNode 一层里的一个子项，Kind 是 dir 或 object。
+//
+// 目录行给的是其下（递归）全部对象的合计；对象行的数字看 Object，Variant 表示
+// 这条记录是同一路径按 Accept 区分出来的变体之一，Name 已经去掉了变体段。
+type CacheTreeNode struct {
+	Kind         string               `json:"kind"`
+	Name         string               `json:"name"`
+	Path         string               `json:"path"`
+	Count        int64                `json:"count"`
+	PinnedCount  int64                `json:"pinned_count"`
+	Size         int64                `json:"size"`
+	LastAccessAt int64                `json:"last_access_at"`
+	Variant      bool                 `json:"variant"`
+	Object       *CacheTreeObjectItem `json:"object,omitempty"`
+}
+
+// CacheTreeResponse 一层的子项（目录在前、对象在后，各按名称排序）与当前目录的合计。
+type CacheTreeResponse struct {
+	Path        string           `json:"path"`
+	TotalCount  int64            `json:"total_count"`
+	TotalPinned int64            `json:"total_pinned"`
+	TotalSize   int64            `json:"total_size"`
+	Children    []*CacheTreeNode `json:"children"`
+	HasMore     bool             `json:"has_more"`
+	NextOffset  int              `json:"next_offset"`
+}
+
+// CacheTreeSearchRequest 在一个目录下按路径做不区分大小写的子串搜索。
+type CacheTreeSearchRequest struct {
+	mux.Meta `path:"/admin/cache/tree/search" method:"GET"`
+	Path     string `form:"path" binding:"omitempty,max=1024" label:"目录"`
+	Keyword  string `form:"keyword" binding:"required,max=256" label:"关键字"`
+}
+
+// CacheTreeSearchObject 一个匹配的对象。
+type CacheTreeSearchObject struct {
+	Name    string               `json:"name"`
+	Path    string               `json:"path"`
+	Variant bool                 `json:"variant"`
+	Object  *CacheTreeObjectItem `json:"object"`
+}
+
+// CacheTreeSearchDir 匹配对象的一个上级目录：全部对象与其中匹配部分的合计。
+// NameMatch 表示目录名本身就含关键字。
+type CacheTreeSearchDir struct {
+	Path         string `json:"path"`
+	NameMatch    bool   `json:"name_match"`
+	Count        int64  `json:"count"`
+	Size         int64  `json:"size"`
+	MatchedCount int64  `json:"matched_count"`
+	MatchedSize  int64  `json:"matched_size"`
+	LastAccessAt int64  `json:"last_access_at"`
+}
+
+// CacheTreeSearchResponse 搜索结果：最多 200 个对象，Matched 是匹配总数，
+// 超出时 Truncated 为真。
+type CacheTreeSearchResponse struct {
+	Path      string                   `json:"path"`
+	Matched   int64                    `json:"matched"`
+	Truncated bool                     `json:"truncated"`
+	Objects   []*CacheTreeSearchObject `json:"objects"`
+	Dirs      []*CacheTreeSearchDir    `json:"dirs"`
+}
