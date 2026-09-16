@@ -3,7 +3,9 @@
 多上游镜像代理站。把 container registry、APT 源、Go module proxy、GitHub 静态资源
 统一收到一个域名下，**路径的第一段就是上游主机名**。
 
-使用者只需要记一条规则：把 `https://` 换成 `https://<katch>/`，其余照抄。
+对于已经支持的协议，或者满足 static 条件的上游，使用者只需要记一条规则：把
+`https://` 换成 `https://<katch>/`，其余照抄。元数据包含绝对外链的包仓库需要额外的
+客户端配置或协议适配器，具体见[公开包镜像加速兼容性](docs/package-manager-mirrors.md)。
 
 ```bash
 docker pull katch.example.com/docker.io/library/redis:7
@@ -18,7 +20,8 @@ deb https://katch.example.com/deb.debian.org/debian bookworm main
 export GOPROXY=https://katch.example.com/proxy.golang.org
 ```
 
-加一个新上游是**在界面上加一条记录**，不是加一条路径前缀约定，也不需要重启进程。
+符合上述条件时，加一个新上游只需**在界面上加一条记录**，不是加一条路径前缀约定，
+也不需要重启进程。需要解释或改写元数据的上游还需要对应的协议适配器。
 
 ## 它解决什么
 
@@ -131,10 +134,12 @@ curl -X POST http://localhost:8080/api/v1/admin/upstreams \
 static 或非标准路径中哪些对象是内容寻址的（可长期缓存 + LRU 淘汰），其余路径按
 `mutable_ttl_seconds` 走短 TTL。
 
-拉取时响应上的 `X-Katch-Cache: HIT|MISS` 能直接看出这一次有没有回源：
+拉取时响应上的 `X-Katch-Cache: HIT|MISS` 能直接看出这一次有没有回源。这里必须发
+GET；HEAD 会按只读探测请求直接穿透上游，不进入对象缓存：
 
 ```bash
-curl -sI http://localhost:8080/deb.debian.org/debian/dists/bookworm/InRelease | grep -i x-katch-cache
+curl -sD - -o /dev/null http://localhost:8080/deb.debian.org/debian/dists/bookworm/InRelease \
+  | grep -i x-katch-cache
 ```
 
 ### git clone
@@ -209,6 +214,7 @@ make mock       # go generate ./...（mockgen）
 
 - [AGENTS.md](AGENTS.md) — 工程约定（硬约束，包括测试先行、产物不引入 cgo、分层单向）
 - [docs/deploy.md](docs/deploy.md) — 部署（compose / helm / 裸 manifests）、反代要调什么、排障对照表
+- [docs/package-manager-mirrors.md](docs/package-manager-mirrors.md) — 公开包管理器的兼容边界、完整支持所需处理与验收方法
 - [docs/architecture.md](docs/architecture.md) — 分层、路由命名空间、拉取路径、数据库
 - [docs/frontend.md](docs/frontend.md) — 前端目录、i18n、静态资源缓存
 - [docs/observability.md](docs/observability.md) — 日志与指标
