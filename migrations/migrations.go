@@ -26,6 +26,7 @@ func migrationList() []*gormigrate.Migration {
 		recentRequest(),
 		upstreamProtocols(),
 		gitMirror(),
+		cacheValidator(),
 	}
 }
 

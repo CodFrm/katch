@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -412,6 +413,92 @@ func TestGet_OriginFailureIsNotCached(t *testing.T) {
 		_, _, err := svc.Get(context.Background(), target("deb.debian.org", "/pool/x.deb"))
 		convey.So(err, convey.ShouldNotBeNil)
 		convey.So(len(repo.all()), convey.ShouldEqual, 0)
+	})
+}
+
+// TestGet_RewriteDropsStaleValidators 失败与恢复：上游重写同一路径且这次没带
+// validator 时，上一份内容的校验值必须跟着覆盖掉。
+//
+// 留着旧的 ETag，客户端会拿一个对不上的强校验符去做条件请求；上游说「不知道这个
+// 标识」，而我们的命中却回放它，等于替上游背书了一份它从未声明过的事实。
+func TestGet_RewriteDropsStaleValidators(t *testing.T) {
+	convey.Convey("重写内容时上一份的 validator 不能留下", t, func() {
+		var served atomic.Int64
+		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			if served.Add(1) == 1 {
+				w.Header().Set("Etag", `"v1"`)
+				w.Header().Set("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+				_, _ = io.WriteString(w, "v1")
+				return
+			}
+			// 第二份没有 validator：旧的必须被清掉。
+			_, _ = io.WriteString(w, "v2")
+		})
+		svc, repo, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+		ctx := context.Background()
+		// 不在 /pool/ 里，按 TTL 可变（staticUpstream 的不可变模式只有 /pool/）。
+		const key = "/dists/stable/InRelease"
+
+		r, _, err := svc.Get(ctx, target("deb.debian.org", key))
+		convey.So(err, convey.ShouldBeNil)
+		_, _ = io.ReadAll(r)
+		convey.So(r.Close(), convey.ShouldBeNil)
+		_, firstHit := pullWith(t, svc, target("deb.debian.org", key))
+		convey.So(firstHit.Header.Get("Etag"), convey.ShouldEqual, `"v1"`)
+		first := repo.byKey(key)
+		convey.So(first, convey.ShouldNotBeNil)
+		convey.So(first.ETag, convey.ShouldEqual, `"v1"`)
+		convey.So(first.LastModified, convey.ShouldEqual, "Wed, 21 Oct 2015 07:28:00 GMT")
+
+		// 把这条记录拨到过期，让它必须回源重取。
+		repo.expire(key)
+		r2, _, err := svc.Get(ctx, target("deb.debian.org", key))
+		convey.So(err, convey.ShouldBeNil)
+		body, err := io.ReadAll(r2)
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(r2.Close(), convey.ShouldBeNil)
+		convey.So(string(body), convey.ShouldEqual, "v2")
+		convey.So(o.hits.Load(), convey.ShouldEqual, 2)
+		// 过期重取不留下第二条记录。
+		convey.So(len(repo.all()), convey.ShouldEqual, 1)
+
+		_, secondHit := pullWith(t, svc, target("deb.debian.org", key))
+		convey.So(secondHit.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
+		convey.So(secondHit.Header.Get("Etag"), convey.ShouldBeEmpty)
+		convey.So(secondHit.Header.Get("Last-Modified"), convey.ShouldBeEmpty)
+		// 库里也不能留着上一份的校验值。
+		rewritten := repo.byKey(key)
+		convey.So(rewritten.ETag, convey.ShouldBeEmpty)
+		convey.So(rewritten.LastModified, convey.ShouldBeEmpty)
+		convey.So(rewritten.Digest, convey.ShouldEqual, digestOfString("v2"))
+	})
+}
+
+// TestPut_LeavesValidatorsEmpty 直接写缓存的管理/内部路径没有上游响应头，
+// 落库的 validator 必须为空，命中也不许回放一个从未存在过的校验符。
+func TestPut_LeavesValidatorsEmpty(t *testing.T) {
+	convey.Convey("直接写入的缓存对象没有 validator", t, func() {
+		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Etag", `"should-not-leak"`)
+			_, _ = io.WriteString(w, "origin")
+		})
+		svc, repo, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+		const key = "/pool/manual.deb"
+		convey.So(svc.Put(context.Background(), &PutRequest{
+			UpstreamID: 7, Key: key,
+			Content: strings.NewReader("manual"), ContentType: "text/plain", Immutable: true,
+		}), convey.ShouldBeNil)
+		put := repo.byKey(key)
+		convey.So(put, convey.ShouldNotBeNil)
+		convey.So(put.ETag, convey.ShouldBeEmpty)
+		convey.So(put.LastModified, convey.ShouldBeEmpty)
+
+		_, hitMeta := pullWith(t, svc, target("deb.debian.org", key))
+		convey.So(hitMeta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
+		convey.So(hitMeta.Header.Get("Etag"), convey.ShouldBeEmpty)
+		convey.So(hitMeta.Header.Get("Last-Modified"), convey.ShouldBeEmpty)
+		// 命中由磁盘服务，没有回源。
+		convey.So(o.hits.Load(), convey.ShouldEqual, 0)
 	})
 }
 

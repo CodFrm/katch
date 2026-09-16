@@ -385,26 +385,35 @@ func (c *cacheSvc) serveFromDisk(ctx context.Context, upstream *upstream_entity.
 		// 命中已经成立了，访问时间没更新上只影响淘汰顺序，不该让这次拉取失败。
 		logger.Ctx(ctx).Warn("更新缓存访问时间失败", zap.Int64("id", object.ID), zap.Error(err))
 	}
-	header := make(http.Header, 5)
+	header := make(http.Header, 7)
 	if object.ContentType != "" {
 		header.Set("Content-Type", object.ContentType)
 	}
 	header.Set("Content-Length", strconv.FormatInt(object.Size, 10))
 	header.Set(cacheStatusHeader, cacheStatusHit)
+	// 上游的 validator 原样回放：未命中时客户端拿到的就是这两串，命中时若缺席，
+	// 同一个 URL 的响应头就随「这次有没有命中」而变，靠它做条件请求的客户端会
+	// 退回整份重传。空值不回放——那是「上游没给」，不是「上游给了空」。（决策 3/5）
+	if object.ETag != "" {
+		header.Set("Etag", object.ETag)
+	}
+	if object.LastModified != "" {
+		header.Set("Last-Modified", object.LastModified)
+	}
 	// registry 的摘要头补在这里：未命中时它们来自上游，命中时若没有人补，同一个
 	// URL 的响应头就随「这次有没有命中」而变，而摘要是 registry 协议里客户端可以
 	// 依赖的字段。
 	//
-	// 值是推导出来的，不是从上游那份拷贝存下来的：上面几行刚刚校验过盘上的字节与
-	// Digest 相符，推导出来的头因此不可能和发出去的字节对不上；存一份副本则会多出
-	// 一个能和字节分叉的事实，而那正是这段校验要防的东西。
-	//
-	// 只给 registry 补。static 那一侧的 Etag 在未命中时是**上游那一串**，命中时换成
-	// katch 自己的摘要，同一份内容就有了两个互不相认的强校验符——客户端拿着后者去做
-	// 条件请求，只会换回一次整份重传。那一侧要一致得把上游的头存下来，是另一条路。
+	// Docker-Content-Digest 的值是推导出来的，不是从上游那份拷贝存下来的：上面几行
+	// 刚刚校验过盘上的字节与 Digest 相符，推导出来的头因此不可能和发出去的字节对
+	// 不上。Etag 则是上游给了就用上游那一串（上面已经原样回放），只有它没给时才退回
+	// 这串推导值——否则未命中发上游、命中换推导，同一份内容就有了两个互不相认的强
+	// 校验符，客户端拿着命中的那个去回源做条件请求，只会换回一次整份重传。
 	if upstream.Protocols.Has(upstream_entity.ProtocolRegistry) && object.Digest != "" {
 		header.Set("Docker-Content-Digest", object.Digest)
-		header.Set("Etag", `"`+object.Digest+`"`)
+		if object.ETag == "" {
+			header.Set("Etag", `"`+object.Digest+`"`)
+		}
 	}
 	return file, &proxy_svc.Meta{
 		StatusCode:    http.StatusOK,
@@ -543,13 +552,15 @@ func (c *cacheSvc) pump(ctx context.Context, flightKey string, current *flight,
 			logger.Ctx(ctx).Error("提交缓存文件失败", zap.String("key", key), zap.Error(err))
 			digest = ""
 		} else if err := c.saveRecord(ctx, &recordInput{
-			UpstreamID:  upstream.ID,
-			Key:         key,
-			Digest:      digest,
-			Size:        size,
-			ContentType: meta.Header.Get("Content-Type"),
-			Immutable:   immutable,
-			TTLSeconds:  int64(upstream.MutableTTLSeconds),
+			UpstreamID:   upstream.ID,
+			Key:          key,
+			Digest:       digest,
+			Size:         size,
+			ContentType:  meta.Header.Get("Content-Type"),
+			ETag:         meta.Header.Get("ETag"),
+			LastModified: meta.Header.Get("Last-Modified"),
+			Immutable:    immutable,
+			TTLSeconds:   int64(upstream.MutableTTLSeconds),
 		}); err != nil {
 			logger.Ctx(ctx).Error("写缓存记录失败", zap.String("key", key), zap.Error(err))
 		}
@@ -591,7 +602,13 @@ type recordInput struct {
 	Digest      string
 	Size        int64
 	ContentType string
-	Immutable   bool
+	// ETag 与 LastModified 是上游成功响应里的 validator，随内容一起原子落库。
+	//
+	// 上游没给时写空：saveRecord 无条件赋值，所以重写内容时上一份的校验值会被
+	// 一起覆盖掉，不会留着给下一次命中回放。
+	ETag         string
+	LastModified string
+	Immutable    bool
 	// TTLSeconds 可变对象的存活时长，0 表示用全局默认值。
 	TTLSeconds int64
 }
@@ -616,6 +633,10 @@ func (c *cacheSvc) saveRecord(ctx context.Context, in *recordInput) error {
 	object.Digest = in.Digest
 	object.Size = in.Size
 	object.ContentType = in.ContentType
+	// 无条件覆盖，不给上一份内容留旧 validator：上游重写同一路径却不再提供
+	// ETag/Last-Modified 时，留着它们会让命中回放一个对不上的校验符。
+	object.ETag = in.ETag
+	object.LastModified = in.LastModified
 	object.Immutable = in.Immutable
 	object.ExpiresAt = 0
 	if !in.Immutable {
