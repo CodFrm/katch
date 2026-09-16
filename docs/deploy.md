@@ -167,14 +167,18 @@ kubectl apply -k deploy/kubernetes/
 
 ## 放在反代后面
 
-katch 自己不做 TLS，要 HTTPS 就在前面加一层。那一层有两件事必须调，否则症状
-不是「不能用」而是「巨慢」或者「大文件传一半断」：
+katch 自己不做 TLS，要 HTTPS 就在前面加一层。那一层有三件事必须调，否则症状
+不是「不能用」而是「巨慢」、「大文件传一半断」或者单独的某个上游整个 502：
 
 1. **关掉响应缓冲。** 不关的话，一个几 GB 的镜像层会先被反代整个收下来再转给客户端，
    既把首字节推迟到整体下载完成，又能把反代的盘写满。katch 这边是 `io.Copy` 流式
    转发的，缓冲会把这个设计整个抵消掉。
 2. **把读写超时调大。** 大对象在慢网络上会传很久，nginx 默认 60 秒会在中途把连接
    切断，客户端看到的是一个下到一半的文件。
+3. **把响应头缓冲调大。** nginx 默认 4k，而 github.com 一个 HTML 页面的响应头就有
+   5KB（一堆 Set-Cookie），超了之后 ingress 会直接 502，日志里是
+   `upstream sent too big header while reading response header from upstream`。
+   这个错看起来像回源挂了，实际上 katch 已经拉到并转发了——直连 service 是 200。
 
 ingress-nginx 的写法（chart 和裸 manifests 里都已经是默认值）：
 
@@ -183,10 +187,11 @@ nginx.ingress.kubernetes.io/proxy-buffering: "off"
 nginx.ingress.kubernetes.io/proxy-read-timeout: "900"
 nginx.ingress.kubernetes.io/proxy-send-timeout: "900"
 nginx.ingress.kubernetes.io/proxy-body-size: "0"
+nginx.ingress.kubernetes.io/proxy-buffer-size: "16k"
 ```
 
 独立 nginx 的对应写法是 `proxy_buffering off;`、`proxy_read_timeout 900s;`、
-`client_max_body_size 0;`。
+`client_max_body_size 0;`、`proxy_buffer_size 16k;`。
 
 还有一条：**反代必须把整个 `/` 都转给 katch**，不能按前缀挑。路径的第一段就是上游
 主机名，挑路径等于把上游挑着代理，而且每加一个上游都要回来改一次反代配置。
