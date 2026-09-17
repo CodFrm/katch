@@ -52,6 +52,7 @@ fi
 : "${KATCH_HOST:?KATCH_HOST is required}"
 : "${KATCH_PORT:?KATCH_PORT is required}"
 : "${KATCH_ARTIFACTS:?KATCH_ARTIFACTS is required}"
+: "${KATCH_CLIENT_USER:=client}"
 
 for command in iptables ip6tables iptables-save iptables-restore ip6tables-save ip6tables-restore strace runuser; do
   command -v "$command" >/dev/null 2>&1 || {
@@ -112,7 +113,7 @@ ip6tables -A OUTPUT -j REJECT --reject-with icmp6-port-unreachable
 
 status=0
 strace -f -qq -e trace=connect,sendto -s 256 -o "$connect_log" \
-  runuser -u client --preserve-environment -- /bin/sh -eu -c '
+  runuser -u "$KATCH_CLIENT_USER" --preserve-environment -- /bin/sh -eu -c '
     /bin/sh -eu /case/setup
     /bin/sh -eu /case/run
     /bin/sh -eu /case/assert

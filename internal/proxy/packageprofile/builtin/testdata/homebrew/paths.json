@@ -1,0 +1,14 @@
+[
+  {"path":"/api/formula.jws.json","class":"mutable"},
+  {"path":"/api/cask.jws.json","class":"mutable"},
+  {"path":"/api/formula.json","class":"mutable"},
+  {"path":"/api/cask.json","class":"mutable"},
+  {"path":"/api/formula/jq.json","class":"mutable"},
+  {"path":"/api/cask/firefox.json","class":"mutable"},
+  {"path":"/api/analytics/install/30d.json","class":"mutable"},
+  {"path":"/api","class":"unknown"},
+  {"path":"/bottles/jq--1.7.1.arm64_sonoma.bottle.tar.gz","class":"unknown"},
+  {"path":"/v2/ghcr.io/homebrew/core/jq/manifests/4.0.0","class":"unknown"},
+  {"path":"/source/jq-1.7.1.tar.gz","class":"unknown"},
+  {"path":"/index.html","class":"unknown"}
+]
