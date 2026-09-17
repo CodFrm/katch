@@ -150,8 +150,10 @@ if grep -n -E '(AllowUnauthenticated|AllowInsecureRepositories|AllowDowngradeToI
 fi
 
 npm_run=$(jq -r '.run' "$CASES/npm.yaml")
-printf '%s\n' "$npm_run" | grep -Fx '(cd npm && npm install --ignore-scripts --no-audit --registry="$registry" --replace-registry-host=always)' >/dev/null ||
-  fail "npm mirror case does not disable out-of-scope audit requests"
+printf '%s\n' "$npm_run" | grep -Fx '(cd npm && npm install --ignore-scripts --no-audit --no-update-notifier --registry="$registry" --replace-registry-host=always)' >/dev/null ||
+  fail "npm mirror case does not disable audit and the npm update notifier"
+printf '%s\n' "$npm_run" | grep -Fx '(cd pnpm && PNPM_CONFIG_UPDATE_NOTIFIER=false pnpm install --ignore-scripts --registry="$registry")' >/dev/null ||
+  fail "npm mirror case does not disable the pnpm update notifier"
 printf '%s\n' "$npm_run" | grep -Fx '(cd yarn-berry && yarn-berry config set npmRegistryServer "$registry" && yarn-berry config set unsafeHttpWhitelist --json "[\"$KATCH_HOST\"]" && yarn-berry install --mode=skip-build)' >/dev/null ||
   fail "npm mirror case does not allow HTTP only for the configured Katch host before Yarn Berry install"
 
