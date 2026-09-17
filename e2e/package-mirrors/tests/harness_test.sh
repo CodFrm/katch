@@ -665,8 +665,12 @@ printf '%s\n' "$homebrew_assert" | grep -Fx "grep -Eqx 'jq [0-9]+([.][0-9]+)+([.
   fail "Homebrew does not require one exact native formula version line"
 printf '%s\n' "$homebrew_assert" | grep -Fx 'test -s "$(cat results/jq-cellar)/$jq_version/INSTALL_RECEIPT.json"' >/dev/null ||
   fail "Homebrew does not require a nonempty receipt for the listed Cellar version"
-[ "$(printf '%s\n' "$homebrew_assert" | grep -Ec "^ruby -rjson -e '")" -eq 1 ] ||
-  fail "Homebrew does not assert installed metadata with Ruby stdlib JSON"
+printf '%s\n' "$homebrew_assert" | grep -Fx 'portable_ruby="$(brew --repository)/Library/Homebrew/vendor/portable-ruby/current/bin/ruby"' >/dev/null ||
+  fail "Homebrew does not resolve portable Ruby from the active brew repository"
+printf '%s\n' "$homebrew_assert" | grep -Fx 'test -x "$portable_ruby"' >/dev/null ||
+  fail "Homebrew does not require its vendored portable Ruby to be executable"
+[ "$(printf '%s\n' "$homebrew_assert" | grep -Ec '^"[$]portable_ruby" -rjson -e ')" -eq 1 ] ||
+  fail "Homebrew does not assert installed metadata with portable Ruby stdlib JSON"
 homebrew_commands=$(jq -r '[.setup, .run, .assert] | join("\n")' "$homebrew_case")
 if printf '%s\n' "$homebrew_commands" | grep -E '(^|[;&|()][[:space:]]*)jq([[:space:]]|$)|(brew --prefix jq|[/]bin[/]jq|jq-version)'; then
   fail "Homebrew mirror case executes the installed Bottle binary"
@@ -692,6 +696,10 @@ mkdir -p "$homebrew_case_bin" "$homebrew_prefix/bin"
 cat > "$homebrew_case_bin/brew" <<'EOF'
 #!/bin/sh
 set -eu
+if [ "$*" = '--repository' ]; then
+  printf '%s\n' "$HOMEBREW_TEST_REPOSITORY"
+  exit 0
+fi
 printf 'brew|%s|%s|%s|%s|%s|%s|%s\n' "$KATCH_PHASE" "$HOME" "$HOMEBREW_API_DOMAIN" \
   "$HOMEBREW_ARTIFACT_DOMAIN" "$HOMEBREW_ARTIFACT_DOMAIN_NO_FALLBACK" \
   "${HOMEBREW_NO_INSTALL_FROM_API-unset}" "$*" >> "$HOMEBREW_EVENT_LOG"
@@ -718,11 +726,34 @@ set -eu
 printf '%s\n' 'installed Bottle binary was executed' >&2
 exit 86
 EOF
+cat > "$homebrew_case_bin/ruby" <<'EOF'
+#!/bin/sh
+set -eu
+: > "${PATH_RUBY_EXECUTION_LOG:?PATH_RUBY_EXECUTION_LOG is required}"
+printf '%s\n' 'PATH Ruby was executed' >&2
+exit 87
+EOF
 homebrew_jq_execution_log=$workdir/homebrew-jq-execution.log
+homebrew_path_ruby_execution_log=$workdir/homebrew-path-ruby-execution.log
+homebrew_portable_ruby_execution_log=$workdir/homebrew-portable-ruby-execution.log
 homebrew_cellar=$workdir/homebrew-cellar
+homebrew_repository=$workdir/homebrew-repository
+homebrew_portable_ruby=$homebrew_repository/Library/Homebrew/vendor/portable-ruby/current/bin/ruby
 mkdir -p "$homebrew_cellar/jq/1.8.2"
+mkdir -p "$(dirname "$homebrew_portable_ruby")"
 printf '%s\n' '{"source":{"path":"/home/linuxbrew/.linuxbrew/Homebrew/Library/Taps/homebrew/homebrew-core/Formula/j/jq.rb"}}' > "$homebrew_cellar/jq/1.8.2/INSTALL_RECEIPT.json"
-chmod 0555 "$homebrew_case_bin"/* "$homebrew_prefix/bin/jq"
+cat > "$homebrew_portable_ruby" <<'EOF'
+#!/bin/sh
+set -eu
+[ "$#" -eq 4 ] && [ "$1" = -rjson ] && [ "$2" = -e ] && [ "$4" = results/jq.json ]
+case "$3" in
+  *'JSON.parse'*'entry["name"] == "jq"'*'entry["version"] == "1.8.2"'*) ;;
+  *) exit 88 ;;
+esac
+printf '%s\n' "$4" >> "${PORTABLE_RUBY_EXECUTION_LOG:?PORTABLE_RUBY_EXECUTION_LOG is required}"
+grep -Fqx '{"formulae":[{"name":"jq","installed":[{"version":"1.8.2"}]}]}' "$4"
+EOF
+chmod 0555 "$homebrew_case_bin"/* "$homebrew_prefix/bin/jq" "$homebrew_portable_ruby"
 homebrew_phase_root=$workdir/homebrew-phase
 mkdir -p "$homebrew_phase_root/cold" "$homebrew_phase_root/warm"
 homebrew_phase_root=$(CDPATH= cd -- "$homebrew_phase_root" && pwd)
@@ -731,28 +762,38 @@ for phase in cold warm; do
     cd "$homebrew_phase_root/$phase"
     PATH="$homebrew_case_bin:$homebrew_prefix/bin:$PATH" KATCH_PHASE=$phase KATCH_URL=https://katch.test \
       HOMEBREW_EVENT_LOG="$homebrew_events" HOMEBREW_TEST_PREFIX="$homebrew_prefix" \
-      HOMEBREW_TEST_CELLAR="$homebrew_cellar" JQ_EXECUTION_LOG="$homebrew_jq_execution_log" \
+      HOMEBREW_TEST_CELLAR="$homebrew_cellar" HOMEBREW_TEST_REPOSITORY="$homebrew_repository" \
+      JQ_EXECUTION_LOG="$homebrew_jq_execution_log" PATH_RUBY_EXECUTION_LOG="$homebrew_path_ruby_execution_log" \
       /bin/sh "$homebrew_setup_script"
     PATH="$homebrew_case_bin:$homebrew_prefix/bin:$PATH" KATCH_PHASE=$phase KATCH_URL=https://katch.test \
       HOMEBREW_EVENT_LOG="$homebrew_events" HOMEBREW_TEST_PREFIX="$homebrew_prefix" \
-      HOMEBREW_TEST_CELLAR="$homebrew_cellar" JQ_EXECUTION_LOG="$homebrew_jq_execution_log" \
+      HOMEBREW_TEST_CELLAR="$homebrew_cellar" HOMEBREW_TEST_REPOSITORY="$homebrew_repository" \
+      JQ_EXECUTION_LOG="$homebrew_jq_execution_log" PATH_RUBY_EXECUTION_LOG="$homebrew_path_ruby_execution_log" \
       /bin/sh "$homebrew_run_script"
-    PATH="$homebrew_prefix/bin:$PATH" JQ_EXECUTION_LOG="$homebrew_jq_execution_log" \
+    PATH="$homebrew_case_bin:$homebrew_prefix/bin:$PATH" HOMEBREW_TEST_REPOSITORY="$homebrew_repository" \
+      JQ_EXECUTION_LOG="$homebrew_jq_execution_log" PATH_RUBY_EXECUTION_LOG="$homebrew_path_ruby_execution_log" \
+      PORTABLE_RUBY_EXECUTION_LOG="$homebrew_portable_ruby_execution_log" \
       /bin/sh "$homebrew_assert_script"
   ) || fail "Homebrew $phase phase does not satisfy the isolated runtime contract"
 done
 [ ! -e "$homebrew_jq_execution_log" ] || fail "Homebrew assertion executed the installed jq command"
+[ ! -e "$homebrew_path_ruby_execution_log" ] || fail "Homebrew assertion executed Ruby from PATH"
 for invalid_homebrew_json in \
   '{"formulae":[{"name":"not-jq","installed":[{"version":"1.8.2"}]}]}' \
   '{"formulae":[{"name":"jq","installed":[]}]}' \
   '{"formulae":[{"name":"jq","installed":[{"version":"1.8.1"}]}]}'; do
   printf '%s\n' "$invalid_homebrew_json" > "$homebrew_phase_root/cold/results/jq.json"
-  if (cd "$homebrew_phase_root/cold" && PATH="$homebrew_prefix/bin:$PATH" \
-    JQ_EXECUTION_LOG="$homebrew_jq_execution_log" /bin/sh "$homebrew_assert_script"); then
+  if (cd "$homebrew_phase_root/cold" && PATH="$homebrew_case_bin:$homebrew_prefix/bin:$PATH" \
+    HOMEBREW_TEST_REPOSITORY="$homebrew_repository" JQ_EXECUTION_LOG="$homebrew_jq_execution_log" \
+    PATH_RUBY_EXECUTION_LOG="$homebrew_path_ruby_execution_log" \
+    PORTABLE_RUBY_EXECUTION_LOG="$homebrew_portable_ruby_execution_log" /bin/sh "$homebrew_assert_script"); then
     fail "Homebrew assertion accepted invalid installed formula metadata: $invalid_homebrew_json"
   fi
 done
 [ ! -e "$homebrew_jq_execution_log" ] || fail "Homebrew assertion executed the installed jq command"
+[ ! -e "$homebrew_path_ruby_execution_log" ] || fail "Homebrew assertion executed Ruby from PATH"
+[ "$(wc -l < "$homebrew_portable_ruby_execution_log" | tr -d ' ')" -eq 5 ] ||
+  fail "Homebrew assertion did not execute vendored portable Ruby for every JSON check"
 [ "$(grep -c '^git|' "$homebrew_events")" -eq 2 ] ||
   fail "Homebrew does not execute mirrored git ls-remote in both phases"
 grep -F "brew|cold|$homebrew_phase_root/cold/client-home|https://katch.test/formulae.brew.sh/api|https://katch.test/registry/ghcr.io|1|unset|install jq" "$homebrew_events" >/dev/null ||
