@@ -627,8 +627,11 @@ printf '%s\n' "$composer_run" | grep -Fx 'composer config --global notify-on-ins
   fail "Composer mirror case does not disable the out-of-scope install notification"
 printf '%s\n' "$composer_run" | grep -Fx 'test "$(composer config --global notify-on-install)" = false' >/dev/null ||
   fail "Composer mirror case does not assert that install notifications are disabled"
-printf '%s\n' "$composer_run" | grep -F 'composer install --prefer-dist --no-dev --no-interaction --no-progress --no-audit --no-security-blocking' >/dev/null ||
-  fail "Composer mirror case does not disable optional audit/security-list egress"
+printf '%s\n' "$composer_run" | grep -Fx 'composer install --prefer-dist --no-dev --no-interaction --no-progress --no-security-blocking' >/dev/null ||
+  fail "Composer mirror case does not use the expected non-auditing install command"
+if printf '%s\n' "$composer_run" | grep -E -- '(^|[[:space:]])--(no-)?audit([=[:space:]]|$)'; then
+  fail "Composer mirror case passes an audit flag"
+fi
 if printf '%s\n%s\n' "$composer_setup" "$composer_run" | grep -E -- '("secure-http"[[:space:]]*:[[:space:]]*false|secure-http[[:space:]]+false|--disable-tls|COMPOSER_DISABLE_TLS)'; then
   fail "Composer mirror case disables HTTPS/TLS verification"
 fi
