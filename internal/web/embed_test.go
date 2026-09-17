@@ -1,9 +1,13 @@
 package web
 
 import (
+	"context"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -13,6 +17,7 @@ import (
 	"go.uber.org/mock/gomock"
 
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
+	"github.com/CodFrm/katch/internal/proxy/destination"
 	"github.com/CodFrm/katch/internal/repository/upstream_repo"
 	mock_upstream_repo "github.com/CodFrm/katch/internal/repository/upstream_repo/mock"
 	"github.com/CodFrm/katch/internal/service/proxy_svc"
@@ -305,4 +310,159 @@ func TestProxy_DistFileWinsOverUpstreamRule(t *testing.T) {
 		convey.So(w.Code, convey.ShouldEqual, http.StatusOK)
 		convey.So(w.Body.Len(), convey.ShouldBeGreaterThan, 0)
 	})
+}
+
+type fixedWebRewriteSource struct {
+	snapshot *proxy_svc.RewriteSnapshot
+}
+
+func (s fixedWebRewriteSource) Snapshot(context.Context) (*proxy_svc.RewriteSnapshot, error) {
+	return s.snapshot, nil
+}
+
+type webResolverFunc func(context.Context, *url.URL, destination.DestinationRequirement) (*destination.ResolvedTarget, error)
+
+func (f webResolverFunc) Resolve(ctx context.Context, target *url.URL, requirement destination.DestinationRequirement) (*destination.ResolvedTarget, error) {
+	return f(ctx, target, requirement)
+}
+
+func configuredWebSumDB() *proxy_svc.RewriteSnapshot {
+	return &proxy_svc.RewriteSnapshot{Upstreams: map[string]proxy_svc.RewriteUpstream{
+		"sum.golang.org": {
+			Profile: upstream_entity.PackageProfileGoProxy,
+			Transports: upstream_entity.ProtocolSet{
+				upstream_entity.ProtocolStatic,
+			},
+		},
+	}}
+}
+
+func useWebSumDB(t *testing.T, snapshot *proxy_svc.RewriteSnapshot, resolver destination.DestinationResolver) {
+	t.Helper()
+	upstreamTable(t, &upstream_entity.Upstream{
+		ID: 9, Host: "sum.golang.org", Origin: "https://sum.golang.org", Enabled: true,
+		Protocols:      upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+		PackageProfile: upstream_entity.PackageProfileGoProxy,
+	})
+	previous := proxy_svc.Proxy()
+	proxy_svc.Register(proxy_svc.New(proxy_svc.Options{
+		RewriteConfig: fixedWebRewriteSource{snapshot: snapshot}, DestinationResolver: resolver,
+	}))
+	t.Cleanup(func() { proxy_svc.Register(previous) })
+}
+
+func TestProxy_SumDBSupportedUsesBothNoRouteShapes(t *testing.T) {
+	resolverCalls := 0
+	useWebSumDB(t, configuredWebSumDB(), webResolverFunc(func(context.Context, *url.URL, destination.DestinationRequirement) (*destination.ResolvedTarget, error) {
+		resolverCalls++
+		return nil, errors.New("supported must not reach origin")
+	}))
+
+	for _, path := range []string{
+		"/proxy.golang.org/sumdb/sum.golang.org/supported",
+		"/sumdb/sum.golang.org/supported",
+	} {
+		w := request(t, http.MethodGet, path)
+		if w.Code != http.StatusOK || w.Body.Len() != 0 || strings.Contains(w.Header().Get("Content-Type"), "text/html") {
+			t.Fatalf("GET %s = status %d, content-type %q, body %q; want empty 200", path, w.Code, w.Header().Get("Content-Type"), w.Body.String())
+		}
+	}
+	if resolverCalls != 0 {
+		t.Fatalf("resolver calls = %d, want 0", resolverCalls)
+	}
+}
+
+func TestProxy_SumDBInvalidConfigurationIs503(t *testing.T) {
+	useWebSumDB(t, &proxy_svc.RewriteSnapshot{Upstreams: map[string]proxy_svc.RewriteUpstream{}}, nil)
+	for _, path := range []string{
+		"/proxy.golang.org/sumdb/sum.golang.org/supported",
+		"/sumdb/sum.golang.org/supported",
+	} {
+		if got := request(t, http.MethodGet, path).Code; got != http.StatusServiceUnavailable {
+			t.Fatalf("GET %s = %d, want 503", path, got)
+		}
+	}
+}
+
+func TestProxy_SumDBRejectsMalformedHostsAndMethods(t *testing.T) {
+	resolverCalls := 0
+	useWebSumDB(t, configuredWebSumDB(), webResolverFunc(func(context.Context, *url.URL, destination.DestinationRequirement) (*destination.ResolvedTarget, error) {
+		resolverCalls++
+		return nil, errors.New("rejected request reached origin")
+	}))
+
+	for _, path := range []string{
+		"/sumdb/other.example/supported",
+		"/sumdb/sum.golang.org",
+		"/sumdb/sum.golang.org/not-a-route",
+		"/proxy.golang.org/sumdb/other.example/supported",
+		"/proxy.golang.org/sumdb/sum.golang.org/latest/extra",
+	} {
+		if got := request(t, http.MethodGet, path).Code; got != http.StatusNotFound {
+			t.Fatalf("GET %s = %d, want 404", path, got)
+		}
+	}
+	for _, path := range []string{
+		"/proxy.golang.org/sumdb/sum.golang.org/supported",
+		"/sumdb/sum.golang.org/lookup/example.com/mod@v1.0.0",
+	} {
+		if got := request(t, http.MethodPost, path).Code; got != http.StatusMethodNotAllowed {
+			t.Fatalf("POST %s = %d, want 405", path, got)
+		}
+	}
+	if resolverCalls != 0 {
+		t.Fatalf("resolver calls = %d, want 0", resolverCalls)
+	}
+}
+
+func TestProxy_SumDBNestedRoutesAreCanonicalAndOriginFailuresAre502(t *testing.T) {
+	var requests []string
+	origin := fakeOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.URL.RequestURI())
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusTeapot)
+		_, _ = io.WriteString(w, "checksum-bytes")
+	})
+	originURL, err := url.Parse(origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, port, err := net.SplitHostPort(originURL.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver := webResolverFunc(func(_ context.Context, target *url.URL, requirement destination.DestinationRequirement) (*destination.ResolvedTarget, error) {
+		if target.Scheme != "https" || target.Host != "sum.golang.org" || !requirement.RequireRegistered ||
+			requirement.Transport != upstream_entity.ProtocolStatic || requirement.Profile != upstream_entity.PackageProfileGoProxy {
+			t.Fatalf("resolver target = %s, requirement = %+v", target, requirement)
+		}
+		mapped := *target
+		mapped.Scheme = "http"
+		return &destination.ResolvedTarget{
+			URL: &mapped, Authority: "sum.golang.org", Host: "sum.golang.org",
+			ServerName: "sum.golang.org", DialAddress: net.JoinHostPort("127.0.0.1", port),
+		}, nil
+	})
+	useWebSumDB(t, configuredWebSumDB(), resolver)
+
+	cases := []struct{ request, origin string }{
+		{"/proxy.golang.org/sumdb/sum.golang.org/lookup/example.com/mod@v1.0.0?x=1", "/lookup/example.com/mod@v1.0.0?x=1"},
+		{"/sumdb/sum.golang.org/tile/8/1/000.p/16", "/tile/8/1/000.p/16"},
+	}
+	for _, tc := range cases {
+		w := request(t, http.MethodGet, tc.request)
+		if w.Code != http.StatusTeapot || w.Body.String() != "checksum-bytes" {
+			t.Fatalf("GET %s = status %d body %q", tc.request, w.Code, w.Body.String())
+		}
+	}
+	if len(requests) != len(cases) || requests[0] != cases[0].origin || requests[1] != cases[1].origin {
+		t.Fatalf("origin requests = %v", requests)
+	}
+
+	useWebSumDB(t, configuredWebSumDB(), webResolverFunc(func(context.Context, *url.URL, destination.DestinationRequirement) (*destination.ResolvedTarget, error) {
+		return nil, errors.New("origin unavailable")
+	}))
+	if got := request(t, http.MethodGet, "/sumdb/sum.golang.org/latest").Code; got != http.StatusBadGateway {
+		t.Fatalf("origin failure status = %d, want 502", got)
+	}
 }

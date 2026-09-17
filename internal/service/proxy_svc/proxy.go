@@ -143,7 +143,7 @@ func New(opt Options) ProxySvc {
 	if opt.Runtime == nil {
 		opt.Runtime = setting_svc.Setting()
 	}
-	return &proxySvc{
+	proxy := &proxySvc{
 		origin: client,
 		registry: registry.New(registry.Options{
 			Origin: client, Resolver: opt.DestinationResolver, Metrics: opt.Metrics,
@@ -152,6 +152,9 @@ func New(opt Options) ProxySvc {
 		runtime:  opt.Runtime,
 		recorder: opt.Metrics,
 	}
+	return NewSumDB(SumDBOptions{
+		RewriteConfig: opt.RewriteConfig, DestinationResolver: opt.DestinationResolver, Fallback: proxy,
+	})
 }
 
 type destinationConfigSource struct {

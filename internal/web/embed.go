@@ -43,6 +43,13 @@ const immutableCacheControl = "public, max-age=31536000, immutable"
 // 跟着一起被永久缓存——否则滚动更新之后浏览器永远拿着旧名片，新版本再也上不去。
 const revalidateCacheControl = "no-cache"
 
+const (
+	goProxyHost        = "proxy.golang.org"
+	goSumDBHost        = "sum.golang.org"
+	goSumDBNamespace   = "/sumdb"
+	goSumDBRoutePrefix = goSumDBNamespace + "/" + goSumDBHost
+)
+
 // git 的应答是谁答的：local（本地镜像）或 passthrough（穿透上游）。
 //
 // 不复用 X-Katch-Cache：那个头的语义是「这个对象有没有回源」，而 git 的一次应答
@@ -109,6 +116,7 @@ func newNoRouteHandlerFS(sub fs.FS) gin.HandlerFunc {
 			fileSrv.ServeHTTP(c.Writer, c.Request)
 			return
 		}
+		kind, host, rest = normalizeSumDBRoute(c.Request.URL.EscapedPath(), kind, host, rest)
 		if serveUpstream(c, kind, host, rest) {
 			return
 		}
@@ -129,6 +137,42 @@ func newNoRouteHandlerFS(sub fs.FS) gin.HandlerFunc {
 		c.Writer.Header().Set("Content-Type", "text/html; charset=utf-8")
 		http.ServeContent(c.Writer, c.Request, "index.html", time.Time{}, bytes.NewReader(idx))
 	}
+}
+
+// normalizeSumDBRoute 把 Go 客户端实际使用的 GOPROXY 子路径和公开的顶层别名
+// 收敛成同一个 sum.golang.org static target。/sumdb 是保留命名空间，但其中只有
+// 固定的公共 checksum database 可以成为 target，客户端不能借它选择任意主机。
+func normalizeSumDBRoute(path string, kind dispatch.Kind, host, rest string) (dispatch.Kind, string, string) {
+	if kind == dispatch.KindStatic && strings.EqualFold(host, goProxyHost) && sumDBNamespacePath(rest) {
+		canonical, ok := canonicalSumDBPath(rest)
+		if !ok {
+			return dispatch.KindInvalid, "", ""
+		}
+		return dispatch.KindStatic, goSumDBHost, canonical
+	}
+	if kind == dispatch.KindSPA && sumDBNamespacePath(path) {
+		canonical, ok := canonicalSumDBPath(path)
+		if !ok {
+			return dispatch.KindInvalid, "", ""
+		}
+		return dispatch.KindStatic, goSumDBHost, canonical
+	}
+	return kind, host, rest
+}
+
+func sumDBNamespacePath(path string) bool {
+	return path == goSumDBNamespace || strings.HasPrefix(path, goSumDBNamespace+"/")
+}
+
+func canonicalSumDBPath(path string) (string, bool) {
+	if path != goSumDBRoutePrefix && !strings.HasPrefix(path, goSumDBRoutePrefix+"/") {
+		return "", false
+	}
+	path = strings.TrimPrefix(path, goSumDBRoutePrefix)
+	if path == "" {
+		path = "/"
+	}
+	return path, true
 }
 
 // serveUpstream 处理拉取路径，返回这次请求是否已由它接管。
