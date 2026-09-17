@@ -1,15 +1,20 @@
-import { useState, type FormEvent, type ReactNode } from 'react'
+import { useEffect, useState, type FormEvent, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useNavigate, useParams } from 'react-router-dom'
 
 import { ScreenHeader } from '@/components/admin/admin-shell'
+import { PackageReadinessPanel } from '@/components/pull-assistant'
 import { Input } from '@/components/ui/input'
 import { useAdminAction } from '@/hooks/use-admin-action'
 import {
+  fetchPackageReadiness,
+  fetchSiteInfo,
   saveUpstream,
   toUpstreamDraft,
   type AdminUpstreamItem,
   type DefaultPolicy,
+  type PackageProfileOption,
+  type PackageReadiness,
   type UpstreamDraft,
   type UpstreamProtocol,
 } from '@/lib/api'
@@ -26,12 +31,19 @@ import {
 
 const PROTOCOLS: UpstreamProtocol[] = ['registry', 'static', 'git']
 const POLICIES: DefaultPolicy[] = ['allow_all', 'deny_unless_matched']
+const FALLBACK_PROFILES: PackageProfileOption[] = [{ profile: 'none', name: '' }]
+
+type ReadinessPreview = {
+  key: string
+  value: PackageReadiness | null
+}
 
 /** 新登记一条上游时的出厂值，和后端 SaveUpstreamRequest 的默认行为对齐。 */
 const BLANK: UpstreamDraft = {
   id: 0,
   host: '',
   protocols: ['registry'],
+  package_profile: 'none',
   origin: '',
   enabled: true,
   immutable_patterns: [],
@@ -69,6 +81,9 @@ export function UpstreamFormScreen({
   // 立刻变成 0 或 NaN，使用者根本没法把值改掉。
   const [ttlText, setTtlText] = useState<string | null>(null)
   const [ttlInvalid, setTtlInvalid] = useState(false)
+  const [profileInvalid, setProfileInvalid] = useState(false)
+  const [profiles, setProfiles] = useState<PackageProfileOption[]>([])
+  const [readinessPreview, setReadinessPreview] = useState<ReadinessPreview | null>(null)
   const action = useAdminAction(onUnauthorized)
 
   // 编辑时以库里那条为底：表单是这条上游此刻的样子，不是一张空表。
@@ -76,6 +91,74 @@ export function UpstreamFormScreen({
   // 菜单显示的是当前模式对应的预设；模式被改过就落回自定义。
   const preset = matchPreset(current.immutable_patterns)
   const ttlValue = ttlText ?? String(current.mutable_ttl_seconds)
+  const previewID = current.id
+  const previewHost = current.host
+  const previewEnabled = current.enabled
+  const previewProfile = current.package_profile
+  const previewProtocols = current.protocols
+  const previewKey = JSON.stringify([
+    previewID,
+    previewHost,
+    previewEnabled,
+    previewProfile,
+    previewProtocols,
+  ])
+  const readiness = readinessPreview?.key === previewKey ? readinessPreview.value : null
+
+  useEffect(() => {
+    const controller = new AbortController()
+    void fetchSiteInfo(controller.signal).then((site) => {
+      if (!controller.signal.aborted && site) {
+        setProfiles(site.package_profiles)
+      }
+    })
+    return () => controller.abort()
+  }, [])
+
+  useEffect(() => {
+    if (previewProfile === 'none') {
+      return
+    }
+    const controller = new AbortController()
+    const timer = window.setTimeout(() => {
+      void fetchPackageReadiness(
+        adminKey,
+        {
+          id: previewID,
+          host: previewHost,
+          enabled: previewEnabled,
+          package_profile: previewProfile,
+          protocols: previewProtocols,
+        },
+        controller.signal
+      ).then((result) => {
+        if (controller.signal.aborted) {
+          return
+        }
+        if (!result.ok) {
+          if (result.reason === 'unauthorized') {
+            onUnauthorized()
+          }
+          return
+        }
+        setReadinessPreview({ key: previewKey, value: result.data.preview ?? null })
+      })
+    }, 100)
+    return () => {
+      controller.abort()
+      window.clearTimeout(timer)
+    }
+  }, [
+    adminKey,
+    previewEnabled,
+    previewHost,
+    previewID,
+    previewKey,
+    previewProfile,
+    previewProtocols,
+    onUnauthorized,
+  ])
+
   if (id && !editing && upstreams.length > 0) {
     return (
       <div className="px-8 py-7">
@@ -85,6 +168,7 @@ export function UpstreamFormScreen({
   }
 
   function change(patch: Partial<UpstreamDraft>) {
+    setProfileInvalid(false)
     setDraft({ ...current, ...patch })
   }
 
@@ -115,6 +199,10 @@ export function UpstreamFormScreen({
       current.protocols.length === 0 ||
       action.pending
     ) {
+      return
+    }
+    if (current.package_profile !== 'none' && !current.protocols.includes('static')) {
+      setProfileInvalid(true)
       return
     }
     const ttl = parseMutableTTL(ttlValue)
@@ -175,6 +263,23 @@ export function UpstreamFormScreen({
             onToggle={(value) => toggleProtocol(value as UpstreamProtocol)}
           />
         </Field>
+        <Field label={t('admin.upstream.form.packageProfile')} htmlFor="upstream-package-profile">
+          <select
+            id="upstream-package-profile"
+            value={current.package_profile}
+            onChange={(event) => change({ package_profile: event.target.value })}
+            className="border-line-strong bg-background text-foreground h-9 min-w-[240px] border px-2.5 text-[13px]"
+          >
+            {(profiles.length > 0 ? profiles : FALLBACK_PROFILES).map((profile) => (
+              <option key={profile.profile} value={profile.profile}>
+                {t(`package.profile.${profile.profile}`, { defaultValue: profile.name })}
+              </option>
+            ))}
+          </select>
+        </Field>
+        {readiness && (
+          <PackageReadinessPanel profile={current.package_profile} readiness={readiness} />
+        )}
         <Field label={t('admin.upstream.form.defaultPolicy')}>
           <Segmented
             label={t('admin.upstream.form.defaultPolicy')}
@@ -259,6 +364,11 @@ export function UpstreamFormScreen({
           {action.errorKey && (
             <span role="alert" className="text-destructive text-[12.5px]">
               {t(action.errorKey)}
+            </span>
+          )}
+          {profileInvalid && (
+            <span role="alert" className="text-destructive text-[12.5px]">
+              {t('admin.upstream.form.profileNeedsStatic')}
             </span>
           )}
           {ttlInvalid && (

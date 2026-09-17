@@ -6,6 +6,7 @@ import (
 
 	"github.com/CodFrm/katch/internal/api/site"
 	"github.com/CodFrm/katch/internal/service/setting_svc"
+	"github.com/CodFrm/katch/internal/service/upstream_svc"
 )
 
 // Site 站点名片控制器。
@@ -18,5 +19,10 @@ func NewSite() *Site {
 
 // Info 站点名称与拉取命令里用的站点地址。
 func (s *Site) Info(ctx context.Context, req *site.InfoRequest) (*site.InfoResponse, error) {
-	return setting_svc.Setting().SiteInfo(ctx, req)
+	resp, err := setting_svc.Setting().SiteInfo(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	resp.PackageProfiles = upstream_svc.Upstream().PackageProfiles()
+	return resp, nil
 }

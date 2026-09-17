@@ -56,6 +56,10 @@ git:
   # 总配额、单仓体积上限、同步超时与同步并发是运行时项，在界面的「设置」里改。
   dir: ./data/mirrors
 
+# 上游、package profile、companion 和 site_domain 都是运行时数据，不放在这个文件里：
+# 上游与 profile 在管理后台的「上游」页维护，site_domain 在「设置」页维护。生成客户端
+# 配置前必须设置 site_domain；后台会逐项检查 profile 要求的 companion 主机、transport
+# 和 profile。真实客户端阻断公网矩阵通过前，界面只显示待验证，不提供可复制配置。
 admin:
   # 管理接口（/api/v1/admin/*）的**初始**密钥。密钥以 bcrypt 哈希存在库的 setting
   # 表里，这里的值只在库中尚无密钥时生效一次；之后的轮换在界面上完成，改这里不会

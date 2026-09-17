@@ -24,14 +24,54 @@
 4. GET、HEAD、Range、条件请求及内容协商满足客户端的只读下载流程；
 5. 冷缓存可以回源，热缓存不再回源，并发拉取不会重复下载同一对象。
 
-katch 当前的 static 协议适合“HTTP GET/HEAD + 同一仓库基地址 + 相对制品路径 +
-同一 URL 不按未进入缓存键的请求头返回不同表示”的仓库。它会跟随上游 HTTP 重定向，
-但不会改写 JSON、HTML 或 XML 响应体中的绝对 URL。因此，元数据里只要出现另一个
-下载域名，客户端就仍可能直连那个域名。当前 HEAD、Range 和条件请求会穿透上游且
-不写入缓存；static 缓存命中也不会恢复上游的 ETag 等校验头，所以“传输可用”和
-“完整缓存语义”需要分别判断。
+katch 的 generic static 协议适合“HTTP GET/HEAD + 同一仓库基地址 + 相对制品路径 +
+同一 URL 不按未进入缓存键的请求头返回不同表示”的仓库；包管理器 profile 则可以声明
+实际使用的 `Accept` 变体、结构化改写元数据中的已知 URL，并在目标主机已经登记为兼容
+companion 时把绝对外链改回 katch。签名元数据和制品字节不改写。完整缓存对象保存
+validator 与安全响应头，可以从本地回答 GET、HEAD、条件请求及单段/多段 Range；冷缓存
+拿到的 partial 或 304/412/416 不会被误存成完整对象。重定向目标也必须通过已登记主机、
+transport、HTTPS 降级和实际拨号地址检查。
 
-## 2026-09-16 真实客户端调研
+## 当前实现、就绪判定与证据状态
+
+上游记录可以选择包管理器 `package_profile`。选项来自后端实际注册的适配器，不是前端
+硬编码；`none` 表示只走通用 static/registry/git 传输。非 `none` profile 必须开启
+`static`。适配器已经覆盖以下只读范围：
+
+| profile    | 客户端 / 范围                            | 必需 companion（transport / profile）                                                 |
+| ---------- | ---------------------------------------- | ------------------------------------------------------------------------------------- |
+| `npm`      | npm、pnpm、Yarn Classic、Yarn Berry、Bun | `registry.npmjs.org`（static / npm）                                                  |
+| `pypi`     | pip、uv、Poetry                          | `files.pythonhosted.org`（static / pypi）                                             |
+| `goproxy`  | Go modules + sumdb                       | `sum.golang.org`（static / goproxy）                                                  |
+| `maven`    | Maven、Gradle、sbt                       | 无                                                                                    |
+| `cargo`    | Cargo sparse index                       | `static.crates.io`（static / cargo）                                                  |
+| `nuget`    | dotnet/NuGet restore、search             | `api.nuget.org`、`azuresearch-usnc.nuget.org`、`www.nuget.org`（均为 static / nuget） |
+| `rubygems` | gem、Bundler                             | 无                                                                                    |
+| `apt`      | APT 固定 source                          | 无                                                                                    |
+| `rpm`      | DNF、YUM 固定 baseurl                    | 无                                                                                    |
+| `apk`      | Alpine apk 固定 repository               | 无                                                                                    |
+| `composer` | Composer 2 dist 安装                     | 无固定 companion；元数据里的 dist host 仍必须已注册且符合目的地址策略                 |
+| `homebrew` | Homebrew 标准 Bottle 安装                | `ghcr.io`（registry / none）、`github.com`（git / none）                              |
+
+后端对每条 profile 上游返回 `package_readiness`，后台还能用未保存草稿请求同一套 preview。
+只有以下条件全部满足时 `ready=true`：
+
+1. `site_domain` 已配置，能派生出规范的公开 Base URL；
+2. 主上游已启用并包含 `static` transport；
+3. 每个 companion 主机都存在且启用，transport 与 profile 精确匹配。
+
+缺项不会被合并成含糊的“不支持”：响应会给出主项 `site_domain`、`upstream_disabled`、
+`static_transport`，或 companion 的确切 host 及 `missing`、`disabled`、`transport`、
+`profile` 原因。katch 不会根据这些结果自动新增上游。
+
+客户端配置由后端根据 profile、当前 host 与 `site_domain` 生成，包含尾斜杠、npm 旧
+lockfile/registry-host 约束、Go 与 Homebrew no-fallback、DNF/YUM 固定 `baseurl` 并关闭
+`mirrorlist`/`metalink`、Composer dist-only 等边界。前端只翻译和展示这些 DTO，不复制
+兼容规则。**可复制配置还有第二道门：对应真实客户端必须在阻断公网的 runtime matrix
+中通过。最终矩阵仍待 `coding.local` 执行，当前所有 profile 的 `runtime_verified` 都是
+`false`，因此公开页和后台只显示待验证状态，不显示可复制片段，也不宣称完整支持。**
+
+## 2026-09-16 真实客户端调研（实现前基线）
 
 本轮在本机启动真实 katch 二进制，监听 `127.0.0.1:18081`。客户端环境只对
 `127.0.0.1` 设置 `NO_PROXY`，其余 HTTP(S) 流量统一发往不可达的 `127.0.0.1:9`；
@@ -62,7 +102,11 @@ katch 当前的 static 协议适合“HTTP GET/HEAD + 同一仓库基地址 + �
   编码响应，因此真实客户端的元数据会反复 MISS。元数据适配器需要向上游请求 identity
   表示，或扩充缓存记录并完整保存编码相关响应头；前者更适合需要解析正文的适配器。
 
-## 兼容性与所需处理
+## 调研时的兼容性与所需处理（历史基线）
+
+下表记录上述调研时发现的缺口，用来解释各 profile 为什么需要当前实现；表中的“需要
+增加适配器”等措辞不是当前代码状态。实现是否存在看上一节，完整支持是否成立只看尚待
+执行的阻断公网 runtime matrix。
 
 | 生态 / 客户端           | 公开仓库特点与当前边界                                                                                                                                                                                             | 要做到完整支持需要的处理                                                                                                                                                                                             | 缓存边界                                                                                                                                               | 建议优先级 / 工作量         |
 | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------- |
@@ -110,8 +154,7 @@ katch 当前的 static 协议适合“HTTP GET/HEAD + 同一仓库基地址 + �
 6. 并发请求同一制品，确认只发生一次回源；
 7. 对带签名或摘要的生态执行原生校验，确认代理没有改变受保护的字节。
 
-建议把全量目标拆成有依赖关系的实现轮次，而不是只完成前几项：先修共享缓存头、内容协商、
-受控重定向和适配器框架；再实现 npm、PyPI 与 Go sumdb；随后实现 Cargo、NuGet、
-Composer 和 Homebrew Bottle 配置；最后补齐 Maven、RubyGems、APT、DNF、APK 的协议级
-缓存分类、配置模板及缺失的真实客户端验收。每一轮都必须在禁止客户端公网直连的环境下
-通过后，才能把对应行标为完整支持。
+当前各 profile 的适配器、缓存分类、结构化改写和 runtime case 已实现并由协议级测试
+覆盖；这不替代真实客户端证据。下一步是在 `coding.local` 运行全量阻断公网矩阵，核对
+冷/暖缓存、源站计数、签名/摘要以及拒绝的非 katch 连接。矩阵通过前不得把任何对应行
+标成完整支持，也不得把配置片段开放为可复制状态。

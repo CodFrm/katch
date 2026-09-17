@@ -2,6 +2,7 @@ package setting_svc
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 
 	"github.com/CodFrm/katch/internal/api/site"
@@ -19,6 +20,19 @@ func (s *settingSvc) SiteInfo(ctx context.Context, _ *site.InfoRequest) (*site.I
 		return nil, err
 	}
 	return &site.InfoResponse{Name: rt.SiteName, BaseURL: siteBaseURL(rt.SiteDomain)}, nil
+}
+
+// BaseURL 只读取包管理器配置所需的站点域名。
+func (s *settingSvc) BaseURL(ctx context.Context) (string, error) {
+	raw, err := s.current(ctx, settingDefIndex[SiteDomainSetting])
+	if err != nil {
+		return "", err
+	}
+	var domain string
+	if err := json.Unmarshal(raw, &domain); err != nil {
+		return "", err
+	}
+	return siteBaseURL(domain), nil
 }
 
 // siteBaseURL 把设置里的站点域名变成命令里那一段地址。

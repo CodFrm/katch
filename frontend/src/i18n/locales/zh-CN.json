@@ -27,6 +27,86 @@
     "static": "静态资源",
     "git": "Git 仓库"
   },
+  "package": {
+    "profile": {
+      "none": "无",
+      "npm": "npm",
+      "pypi": "PyPI",
+      "goproxy": "Go Modules",
+      "maven": "Maven",
+      "cargo": "Cargo",
+      "nuget": "NuGet",
+      "rubygems": "RubyGems",
+      "apt": "APT",
+      "rpm": "DNF / YUM",
+      "apk": "Alpine APK",
+      "composer": "Composer 2",
+      "homebrew": "Homebrew"
+    },
+    "client": {
+      "npm": "npm",
+      "pnpm": "pnpm",
+      "yarn_classic": "Yarn Classic",
+      "yarn_berry": "Yarn Berry",
+      "bun": "Bun",
+      "pip": "pip",
+      "uv": "uv",
+      "poetry": "Poetry",
+      "go": "Go",
+      "maven": "Maven",
+      "gradle": "Gradle",
+      "sbt": "sbt",
+      "cargo": "Cargo",
+      "dotnet": "dotnet",
+      "nuget": "NuGet",
+      "gem": "gem",
+      "bundler": "Bundler",
+      "apt": "APT",
+      "dnf": "DNF",
+      "yum": "YUM",
+      "apk": "apk",
+      "composer": "Composer 2",
+      "homebrew": "Homebrew"
+    },
+    "readiness": {
+      "label": "包管理器就绪状态",
+      "configured": "配置已就绪",
+      "incomplete": "配置不完整",
+      "runtimeVerified": "已在阻断公网环境通过真实客户端验证",
+      "runtimePending": "尚未通过真实客户端验证",
+      "runtimeVerifiedShort": "已通过运行时验证",
+      "runtimePendingShort": "待真实客户端验证",
+      "notApplicable": "未配置"
+    },
+    "missing": {
+      "profile": "当前构建没有注册这个适配器。",
+      "site_domain": "先设置对外域名，才能生成客户端配置。",
+      "upstream_disabled": "需要启用这条上游。",
+      "static_transport": "需要启用静态资源协议。"
+    },
+    "companion": {
+      "ready": " · 已就绪",
+      "missing": " · 缺少上游",
+      "disabled": " · 上游已停用",
+      "transport": " · 协议不匹配",
+      "profile": " · 包管理器配置不匹配",
+      "requirement": " · 需要 {{transport}} / {{profile}}"
+    },
+    "constraint": {
+      "trailing_slash": "保留配置中显示的尾斜杠。",
+      "old_lockfile": "旧 lockfile 含公网绝对地址时，需要映射 registry host 或重新生成。",
+      "no_fallback": "不要添加 direct fallback；镜像失败时必须保持关闭。",
+      "fixed_base": "使用固定的 katch base URL，不使用 mirrorlist 或动态镜像。",
+      "sparse_only": "这份配置只覆盖 Cargo sparse index，不覆盖 Git index。",
+      "read_only": "只支持 restore、install 与 search；不支持 push 和私有 feed。",
+      "no_dynamic_mirrors": "mirrorlist 与 metalink 必须留空。",
+      "dist_only": "Composer 只支持 Composer 2 dist 安装。",
+      "bottles_only": "Homebrew 只支持标准 Bottle 安装，不支持源码构建。",
+      "insecure_localhost": "明文 HTTP 只用于 localhost 开发，需要显式配置客户端的不安全本机例外。",
+      "placeholder": "把尖括号占位符替换成实际仓库、suite、架构或包名。",
+      "verified_only": "只有阻断公网运行时验证通过后才显示可复制配置。"
+    }
+  },
   "status": {
     "normal": "正常",
     "degraded": "限流中"
@@ -191,6 +271,7 @@
         "host": "上游主机名",
         "origin": "回源地址",
         "protocols": "上游协议",
+        "packageProfile": "包管理器配置",
         "defaultPolicy": "默认策略",
         "note": "备注",
         "save": "保存上游",
@@ -200,7 +281,8 @@
         "immutablePatterns": "不可变路径模式",
         "mutableTTL": "可变对象 TTL（秒）",
         "mutableTTLHint": "0 表示使用全局默认 TTL。",
-        "ttlInvalid": "TTL 必须是不小于 0 的整数"
+        "ttlInvalid": "TTL 必须是不小于 0 的整数",
+        "profileNeedsStatic": "包管理器配置必须同时启用静态资源协议"
       },
       "preset": {
         "custom": "自定义",

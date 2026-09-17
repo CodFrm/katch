@@ -7,6 +7,7 @@ import { HourlyChart } from '@/components/admin/hourly-chart'
 import { MetricBar, type Metric } from '@/components/admin/metric-bar'
 import { MissReasons } from '@/components/admin/miss-reasons'
 import { RecentRequests } from '@/components/admin/recent-requests'
+import { PackageReadinessPanel } from '@/components/pull-assistant'
 import { useAdminAction } from '@/hooks/use-admin-action'
 import { useUpstreamSeries } from '@/hooks/use-admin-data'
 import {
@@ -167,6 +168,12 @@ export function UpstreamScreen({
         <>
           <MetricBar label={t('admin.upstream.metricsLabel')} metrics={metrics} />
           <div className="flex flex-col gap-8 px-8 py-7">
+            {upstream?.package_readiness && (
+              <PackageReadinessPanel
+                profile={upstream.package_profile}
+                readiness={upstream.package_readiness}
+              />
+            )}
             {points && (
               // 一排两块：左边「有多少请求去了上游」，右边「为什么去」。
               // 分两屏会逼人把两个数记在脑子里再比。

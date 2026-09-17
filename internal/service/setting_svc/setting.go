@@ -46,6 +46,8 @@ type SettingSvc interface {
 	Runtime(ctx context.Context) (*RuntimeSettings, error)
 	// SiteInfo 站点名片：名称与拉取命令里用的站点地址，供公开接口用。
 	SiteInfo(ctx context.Context, req *site.InfoRequest) (*site.InfoResponse, error)
+	// BaseURL 只读站点域名，供包管理器配置生成规范公开地址。
+	BaseURL(ctx context.Context) (string, error)
 	// List 读出全部运行时设置，库里没写过的项给默认值。
 	List(ctx context.Context, req *admin.ListSettingsRequest) (*admin.ListSettingsResponse, error)
 	// Save 写入若干运行时设置。不认识的键、类型不对或超出取值范围的值会让整批

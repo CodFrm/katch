@@ -33,6 +33,7 @@ type Item struct {
 	// Protocols 这条上游开着的协议，取值见 upstream_entity 的 Protocol* 常量。
 	Protocols         []string                       `json:"protocols"`
 	PackageProfile    upstream_entity.PackageProfile `json:"package_profile"`
+	PackageReadiness  *PackageReadiness              `json:"package_readiness,omitempty"`
 	LibraryCompletion bool                           `json:"library_completion"`
 	// HitRate 近 24 小时的命中率，取值 0~1。
 	//
@@ -47,6 +48,38 @@ type Item struct {
 // ListRequest 列出公开的上游。
 type ListRequest struct {
 	mux.Meta `path:"/upstreams" method:"GET"`
+}
+
+// PackageProfile 是一个由本构建实际注册、可供管理员选择的 adapter。
+type PackageProfile struct {
+	Profile upstream_entity.PackageProfile `json:"profile"`
+	Name    string                         `json:"name"`
+}
+
+// PackageGuidance 是后端按当前 site_domain 和上游 host 生成的客户端配置。
+// Constraints 是稳定枚举，由界面翻译成说明；配置片段本身是客户端消费的机器文本。
+type PackageGuidance struct {
+	Clients         []string `json:"clients"`
+	Configuration   []string `json:"configuration"`
+	Constraints     []string `json:"constraints"`
+	RuntimeVerified bool     `json:"runtime_verified"`
+}
+
+// PackageCompanion 是 profile 声明的一个 companion 及其当前配置状态。
+type PackageCompanion struct {
+	Host           string                         `json:"host"`
+	Transport      string                         `json:"transport"`
+	PackageProfile upstream_entity.PackageProfile `json:"package_profile"`
+	Ready          bool                           `json:"ready"`
+	Reason         string                         `json:"reason,omitempty"`
+}
+
+// PackageReadiness 是一个具体上游 profile 的完整可用性投影。
+type PackageReadiness struct {
+	Ready      bool               `json:"ready"`
+	Missing    []string           `json:"missing"`
+	Companions []PackageCompanion `json:"companions"`
+	Guidance   PackageGuidance    `json:"guidance"`
 }
 
 // ListResponse 公开的上游列表，只含启用中的记录。

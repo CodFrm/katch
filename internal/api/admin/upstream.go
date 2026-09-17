@@ -7,8 +7,14 @@ package admin
 import (
 	"github.com/cago-frame/cago/server/mux"
 
+	"github.com/CodFrm/katch/internal/api/upstream"
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
 )
+
+// Package readiness DTOs are shared by the public and admin upstream surfaces.
+type PackageGuidance = upstream.PackageGuidance
+type PackageCompanion = upstream.PackageCompanion
+type PackageReadiness = upstream.PackageReadiness
 
 // UpstreamItem 一条上游在管理接口上的表示。
 //
@@ -20,6 +26,7 @@ type UpstreamItem struct {
 	// Protocols 这条上游开着的协议，取值见 upstream_entity 的 Protocol* 常量。
 	Protocols         []string                       `json:"protocols"`
 	PackageProfile    upstream_entity.PackageProfile `json:"package_profile"`
+	PackageReadiness  *PackageReadiness              `json:"package_readiness,omitempty"`
 	Origin            string                         `json:"origin"`
 	Enabled           bool                           `json:"enabled"`
 	ImmutablePatterns []string                       `json:"immutable_patterns"`
@@ -34,6 +41,12 @@ type UpstreamItem struct {
 // ListUpstreamsRequest 列出全部上游。
 type ListUpstreamsRequest struct {
 	mux.Meta `path:"/admin/upstreams" method:"GET"`
+	// Preview* 让新建/编辑表单向后端询问草稿的 readiness；省略时就是普通列表。
+	PreviewID             int64                          `form:"preview_id" binding:"omitempty,gte=0"`
+	PreviewHost           string                         `form:"preview_host"`
+	PreviewProtocols      []string                       `form:"preview_protocol" binding:"omitempty,dive,oneof=registry static git"`
+	PreviewPackageProfile upstream_entity.PackageProfile `form:"preview_package_profile" binding:"omitempty,oneof=none npm pypi goproxy maven cargo nuget rubygems apt rpm apk composer homebrew"`
+	PreviewEnabled        bool                           `form:"preview_enabled"`
 }
 
 // ListUpstreamsResponse 上游列表。
@@ -41,7 +54,8 @@ type ListUpstreamsRequest struct {
 // 不分页：上游是人工维护的白名单，规模是几十条而不是几万条，分页只会让界面上
 // 「支持哪些上游」这个问题需要翻页才能答。
 type ListUpstreamsResponse struct {
-	List []*UpstreamItem `json:"list"`
+	List    []*UpstreamItem   `json:"list"`
+	Preview *PackageReadiness `json:"preview,omitempty"`
 }
 
 // UpstreamSpec 一条上游的可写字段，新增与整条替换共用的那一份。

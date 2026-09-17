@@ -5,7 +5,7 @@ import { useTranslation } from 'react-i18next'
 import { CopyButton } from '@/components/copy-button'
 import { Input } from '@/components/ui/input'
 import { useCopy } from '@/hooks/use-copy'
-import type { UpstreamItem } from '@/lib/api'
+import type { PackageReadiness, UpstreamItem } from '@/lib/api'
 import { formatBytes } from '@/lib/format'
 import { parseReference, type UpstreamRef } from '@/lib/reference'
 
@@ -77,6 +77,20 @@ export function PullAssistant({
         </div>
       </form>
 
+      {upstreams
+        ?.filter(
+          (upstream) =>
+            upstream.package_readiness?.ready &&
+            upstream.package_readiness.guidance.runtime_verified
+        )
+        .map((upstream) => (
+          <PackageReadinessPanel
+            key={upstream.host}
+            profile={upstream.package_profile}
+            readiness={upstream.package_readiness!}
+          />
+        ))}
+
       {ready && parsed.status === 'unknown' && (
         <p className="text-warn mt-5 flex items-center gap-2 text-[13px]">
           <CornerDownRight className="text-ink-3 size-3.5 shrink-0" aria-hidden="true" />
@@ -143,5 +157,93 @@ export function PullAssistant({
         </>
       )}
     </div>
+  )
+}
+
+export function PackageReadinessPanel({
+  profile,
+  readiness,
+}: {
+  profile: string
+  readiness: PackageReadiness
+}) {
+  const { t } = useTranslation()
+  const configuration = readiness.guidance.configuration.join('\n')
+  const clientNames = readiness.guidance.clients
+    .map((client) => t(`package.client.${client}`))
+    .join(' · ')
+  const copy = useCopy(configuration)
+  const showConfiguration =
+    readiness.ready && readiness.guidance.runtime_verified && configuration !== ''
+
+  return (
+    <section
+      role="region"
+      aria-label={t('package.readiness.label')}
+      className="border-border mt-5 flex flex-col gap-3 border px-4 py-3"
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-foreground text-[13px] font-semibold">
+          {t(`package.profile.${profile}`)}
+        </span>
+        <span className={readiness.ready ? 'text-ok text-xs' : 'text-warn text-xs'}>
+          {t(readiness.ready ? 'package.readiness.configured' : 'package.readiness.incomplete')}
+        </span>
+        <span className="text-muted-foreground text-xs">{clientNames}</span>
+        <span className="text-muted-foreground text-xs">
+          {t(
+            readiness.guidance.runtime_verified
+              ? 'package.readiness.runtimeVerified'
+              : 'package.readiness.runtimePending'
+          )}
+        </span>
+      </div>
+
+      {readiness.missing.map((requirement) => (
+        <p key={requirement} className="text-warn text-xs">
+          {t(`package.missing.${requirement}`)}
+        </p>
+      ))}
+
+      {readiness.companions.length > 0 && (
+        <div className="flex flex-col gap-1.5">
+          {readiness.companions.map((companion) => (
+            <p key={`${companion.host}:${companion.transport}`} className="text-xs">
+              <span className="text-foreground font-mono">{companion.host}</span>
+              <span className={companion.ready ? 'text-ok' : 'text-warn'}>
+                {t(
+                  companion.ready
+                    ? 'package.companion.ready'
+                    : `package.companion.${companion.reason ?? 'missing'}`
+                )}
+              </span>
+              <span className="text-muted-foreground">
+                {t('package.companion.requirement', {
+                  transport: t(`protocol.${companion.transport}`),
+                  profile: t(`package.profile.${companion.package_profile}`),
+                })}
+              </span>
+            </p>
+          ))}
+        </div>
+      )}
+
+      {readiness.guidance.constraints.length > 0 && (
+        <ul className="text-muted-foreground flex flex-col gap-1 text-xs">
+          {readiness.guidance.constraints.map((constraint) => (
+            <li key={constraint}>{t(`package.constraint.${constraint}`)}</li>
+          ))}
+        </ul>
+      )}
+
+      {showConfiguration && (
+        <div className="bg-muted flex items-start gap-3 px-3 py-2.5">
+          <pre className="text-foreground min-w-0 flex-1 overflow-x-auto font-mono text-xs whitespace-pre-wrap">
+            {configuration}
+          </pre>
+          <CopyButton copied={copy.copied} onCopy={copy.copy} />
+        </div>
+      )}
+    </section>
   )
 }

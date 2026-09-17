@@ -88,6 +88,7 @@ func setupTest(t *testing.T, degraded stat_svc.DegradeReporter) (
 	setRepo.EXPECT().Find(gomock.Any(), setting_svc.AdminKeyHashSetting).Return(
 		&setting_entity.Setting{Key: setting_svc.AdminKeyHashSetting, Value: string(hash)}, nil,
 	).AnyTimes()
+	setRepo.EXPECT().Find(gomock.Any(), setting_svc.SiteDomainSetting).Return(nil, nil).AnyTimes()
 
 	testMux := muxtest.NewTestMux()
 	if err := api.Router(context.Background(), testMux.Router); err != nil {

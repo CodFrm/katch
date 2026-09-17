@@ -25,12 +25,33 @@ let acceptedKey = KEY
 /** 让某个请求悬在路上，用来造出「密钥换掉时它才回来」这一幕。 */
 let holdRules: Promise<unknown> | null = null
 
+const pendingAPTReadiness = {
+  ready: true,
+  missing: [],
+  companions: [],
+  guidance: {
+    clients: ['apt'],
+    configuration: [
+      'deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://katch.dev/deb.debian.org/debian <suite> <components>',
+    ],
+    constraints: ['trailing_slash'],
+    runtime_verified: false,
+  },
+}
+
+const packageProfiles = [
+  { profile: 'none', name: 'None' },
+  { profile: 'apt', name: 'APT' },
+  { profile: 'pypi', name: 'pypi' },
+]
+
 function upstreamRows() {
   return [
     {
       id: 1,
       host: 'docker.io',
       protocols: ['registry'],
+      package_profile: 'none',
       origin: 'https://registry-1.docker.io',
       enabled: true,
       immutable_patterns: ['@sha256:'],
@@ -45,6 +66,8 @@ function upstreamRows() {
       id: 2,
       host: 'deb.debian.org',
       protocols: ['static'],
+      package_profile: 'apt',
+      package_readiness: pendingAPTReadiness,
       origin: 'https://deb.debian.org',
       enabled: true,
       immutable_patterns: [],
@@ -181,6 +204,7 @@ const publicUpstreams = {
     {
       host: 'docker.io',
       protocols: ['registry'],
+      package_profile: 'none',
       library_completion: true,
       hit_rate: 0.942,
       cache_bytes: 812 * GB,
@@ -189,6 +213,8 @@ const publicUpstreams = {
     {
       host: 'deb.debian.org',
       protocols: ['static'],
+      package_profile: 'apt',
+      package_readiness: pendingAPTReadiness,
       library_completion: false,
       hit_rate: 0.961,
       cache_bytes: 431 * GB,
@@ -313,6 +339,13 @@ function stubFetch() {
       if (path === '/api/v1/system/version') {
         return envelope({ version: '0.1.0', commit: 'abc1234' })
       }
+      if (path === '/api/v1/site') {
+        return envelope({
+          name: 'katch',
+          base_url: 'https://katch.dev',
+          package_profiles: packageProfiles,
+        })
+      }
       if (header !== `Bearer ${acceptedKey}`) {
         return unauthorized
       }
@@ -337,6 +370,34 @@ function stubFetch() {
             id,
           } as unknown as (typeof backend.upstreams)[number])
           return envelope({ id })
+        }
+        if (query.has('preview_package_profile')) {
+          const profile = query.get('preview_package_profile')
+          return envelope({
+            list: backend.upstreams,
+            preview: {
+              ready: false,
+              missing: [],
+              companions:
+                profile === 'pypi'
+                  ? [
+                      {
+                        host: 'files.pythonhosted.org',
+                        transport: 'static',
+                        package_profile: 'pypi',
+                        ready: false,
+                        reason: 'missing',
+                      },
+                    ]
+                  : [],
+              guidance: {
+                clients: profile === 'pypi' ? ['pip', 'uv', 'poetry'] : [],
+                configuration: [],
+                constraints: ['trailing_slash'],
+                runtime_verified: false,
+              },
+            },
+          })
         }
         return envelope({ list: backend.upstreams })
       }
@@ -1126,5 +1187,64 @@ describe('后台 · 上游的增改与启停', () => {
       'true'
     )
     expect(screen.getByLabelText('不可变路径模式')).toHaveValue('')
+  })
+
+  it('profile 选项来自后端，并把草稿 readiness 与 profile 一起保存', async () => {
+    renderAdmin('/admin/upstreams/new')
+
+    await userEvent.type(await screen.findByLabelText('上游主机名'), 'pypi.org')
+    await userEvent.type(screen.getByLabelText('回源地址'), 'https://pypi.org')
+    await userEvent.click(screen.getByRole('checkbox', { name: '容器镜像' }))
+    await userEvent.click(screen.getByRole('checkbox', { name: '静态资源' }))
+
+    const profile = await screen.findByRole('combobox', { name: '包管理器配置' })
+    expect(
+      within(profile)
+        .getAllByRole('option')
+        .map((option) => option.textContent)
+    ).toEqual(['无', 'APT', 'PyPI'])
+    await userEvent.selectOptions(profile, 'pypi')
+
+    const readiness = await screen.findByRole('region', { name: '包管理器就绪状态' })
+    expect(readiness).toHaveTextContent('配置不完整')
+    expect(readiness).toHaveTextContent('files.pythonhosted.org')
+    expect(readiness).toHaveTextContent('缺少上游')
+    expect(readiness).toHaveTextContent('尚未通过真实客户端验证')
+
+    await userEvent.click(screen.getByRole('button', { name: '保存上游' }))
+    const call = await vi.waitFor(() => {
+      const found = calls.find(
+        (item) => item.url === '/api/v1/admin/upstreams' && item.method === 'POST'
+      )
+      expect(found).toBeDefined()
+      return found!
+    })
+    expect(call.body).toMatchObject({ package_profile: 'pypi', protocols: ['static'] })
+  })
+
+  it('非 none profile 没有 static transport 时在界面拒绝保存', async () => {
+    renderAdmin('/admin/upstreams/new')
+
+    await userEvent.type(await screen.findByLabelText('上游主机名'), 'pypi.org')
+    await userEvent.type(screen.getByLabelText('回源地址'), 'https://pypi.org')
+    await userEvent.selectOptions(
+      await screen.findByRole('combobox', { name: '包管理器配置' }),
+      'pypi'
+    )
+    await userEvent.click(screen.getByRole('button', { name: '保存上游' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('静态资源')
+    expect(
+      calls.some((item) => item.url === '/api/v1/admin/upstreams' && item.method === 'POST')
+    ).toBe(false)
+  })
+
+  it('管理详情展示后端 readiness，但 pending 时不展示可复制配置', async () => {
+    renderAdmin('/admin/upstreams/2')
+
+    const readiness = await screen.findByRole('region', { name: '包管理器就绪状态' })
+    expect(readiness).toHaveTextContent('配置已就绪')
+    expect(readiness).toHaveTextContent('尚未通过真实客户端验证')
+    expect(screen.queryByText(/deb \[signed-by=/)).not.toBeInTheDocument()
   })
 })

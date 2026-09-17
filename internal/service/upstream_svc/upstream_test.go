@@ -3,6 +3,7 @@ package upstream_svc
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/smartystreets/goconvey/convey"
@@ -10,11 +11,187 @@ import (
 
 	"github.com/CodFrm/katch/internal/api/admin"
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
+	_ "github.com/CodFrm/katch/internal/proxy/packageprofile/builtin"
 	"github.com/CodFrm/katch/internal/repository/rule_repo"
 	mock_rule_repo "github.com/CodFrm/katch/internal/repository/rule_repo/mock"
 	"github.com/CodFrm/katch/internal/repository/upstream_repo"
 	mock_upstream_repo "github.com/CodFrm/katch/internal/repository/upstream_repo/mock"
 )
+
+func TestPackageProfileReadiness(t *testing.T) {
+	convey.Convey("readiness 由 site_domain 和 companion 的启用、transport、profile 共同决定", t, func() {
+		primary := &upstream_entity.Upstream{
+			Host: "pypi.org", Enabled: true,
+			Protocols:      upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+			PackageProfile: upstream_entity.PackageProfilePyPI,
+		}
+		files := &upstream_entity.Upstream{
+			Host: "files.pythonhosted.org", Enabled: true,
+			Protocols:      upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+			PackageProfile: upstream_entity.PackageProfilePyPI,
+		}
+
+		ready := packageReadiness("https://mirror.example.com", []*upstream_entity.Upstream{primary, files}, primary)
+		convey.So(ready.Ready, convey.ShouldBeTrue)
+		convey.So(ready.Missing, convey.ShouldBeEmpty)
+		convey.So(ready.Companions, convey.ShouldResemble, []admin.PackageCompanion{
+			{Host: "files.pythonhosted.org", Transport: upstream_entity.ProtocolStatic,
+				PackageProfile: upstream_entity.PackageProfilePyPI, Ready: true},
+		})
+		convey.So(ready.Guidance.Clients, convey.ShouldResemble, []string{"pip", "uv", "poetry"})
+		convey.So(ready.Guidance.Configuration, convey.ShouldResemble, []string{
+			"pip install --index-url https://mirror.example.com/pypi.org/simple/ <package>",
+			"uv pip install --index-url https://mirror.example.com/pypi.org/simple/ <package>",
+			"poetry source add --priority=primary katch https://mirror.example.com/pypi.org/simple/",
+		})
+		convey.So(ready.Guidance.Constraints, convey.ShouldContain, "trailing_slash")
+		convey.So(ready.Guidance.RuntimeVerified, convey.ShouldBeFalse)
+
+		files.Enabled = false
+		blocked := packageReadiness("", []*upstream_entity.Upstream{primary, files}, primary)
+		convey.So(blocked.Ready, convey.ShouldBeFalse)
+		convey.So(blocked.Missing, convey.ShouldResemble, []string{"site_domain"})
+		convey.So(blocked.Companions[0].Ready, convey.ShouldBeFalse)
+		convey.So(blocked.Companions[0].Reason, convey.ShouldEqual, "disabled")
+	})
+
+	convey.Convey("新建草稿可以满足与 primary 同 host 的 companion", t, func() {
+		candidate := &upstream_entity.Upstream{
+			Host: "registry.npmjs.org", Enabled: true,
+			Protocols:      upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+			PackageProfile: upstream_entity.PackageProfileNPM,
+		}
+		readiness := packageReadiness("https://mirror.example.com", nil, candidate)
+		convey.So(readiness.Ready, convey.ShouldBeTrue)
+		convey.So(readiness.Companions, convey.ShouldHaveLength, 1)
+		convey.So(readiness.Companions[0].Ready, convey.ShouldBeTrue)
+	})
+
+	for _, tc := range []struct {
+		name   string
+		files  *upstream_entity.Upstream
+		reason string
+	}{
+		{name: "companion 不存在", reason: "missing"},
+		{name: "companion 已停用", files: &upstream_entity.Upstream{
+			Host: "files.pythonhosted.org", Enabled: false,
+			Protocols:      upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+			PackageProfile: upstream_entity.PackageProfilePyPI,
+		}, reason: "disabled"},
+		{name: "companion transport 不兼容", files: &upstream_entity.Upstream{
+			Host: "files.pythonhosted.org", Enabled: true,
+			Protocols:      upstream_entity.ProtocolSet{upstream_entity.ProtocolRegistry},
+			PackageProfile: upstream_entity.PackageProfilePyPI,
+		}, reason: "transport"},
+		{name: "companion profile 不兼容", files: &upstream_entity.Upstream{
+			Host: "files.pythonhosted.org", Enabled: true,
+			Protocols:      upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+			PackageProfile: upstream_entity.PackageProfileNone,
+		}, reason: "profile"},
+	} {
+		convey.Convey(tc.name, t, func() {
+			primary := &upstream_entity.Upstream{
+				Host: "pypi.org", Enabled: true,
+				Protocols:      upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+				PackageProfile: upstream_entity.PackageProfilePyPI,
+			}
+			configured := []*upstream_entity.Upstream{primary}
+			if tc.files != nil {
+				configured = append(configured, tc.files)
+			}
+			readiness := packageReadiness("https://mirror.example.com", configured, primary)
+			convey.So(readiness.Ready, convey.ShouldBeFalse)
+			convey.So(readiness.Companions, convey.ShouldHaveLength, 1)
+			convey.So(readiness.Companions[0].Reason, convey.ShouldEqual, tc.reason)
+		})
+	}
+}
+
+func TestPackageProfilesComeFromRegisteredBackendAdapters(t *testing.T) {
+	profiles := Upstream().PackageProfiles()
+	convey.Convey("none 和所有实际注册的 adapter 都由后端返回", t, func() {
+		convey.So(profiles, convey.ShouldHaveLength, 13)
+		convey.So(profiles[0].Profile, convey.ShouldEqual, upstream_entity.PackageProfileNone)
+		seen := make(map[upstream_entity.PackageProfile]bool, len(profiles))
+		for _, profile := range profiles {
+			seen[profile.Profile] = true
+		}
+		for _, profile := range []upstream_entity.PackageProfile{
+			upstream_entity.PackageProfileNPM, upstream_entity.PackageProfilePyPI,
+			upstream_entity.PackageProfileGoProxy, upstream_entity.PackageProfileMaven,
+			upstream_entity.PackageProfileCargo, upstream_entity.PackageProfileNuGet,
+			upstream_entity.PackageProfileRubyGems, upstream_entity.PackageProfileAPT,
+			upstream_entity.PackageProfileRPM, upstream_entity.PackageProfileAPK,
+			upstream_entity.PackageProfileComposer, upstream_entity.PackageProfileHomebrew,
+		} {
+			convey.So(seen[profile], convey.ShouldBeTrue)
+		}
+	})
+}
+
+func TestPackageGuidanceCoversRuntimeMatrixWithoutUnsupportedClaims(t *testing.T) {
+	wantClients := map[upstream_entity.PackageProfile][]string{
+		upstream_entity.PackageProfileNPM:      {"npm", "pnpm", "yarn_classic", "yarn_berry", "bun"},
+		upstream_entity.PackageProfilePyPI:     {"pip", "uv", "poetry"},
+		upstream_entity.PackageProfileGoProxy:  {"go"},
+		upstream_entity.PackageProfileMaven:    {"maven", "gradle", "sbt"},
+		upstream_entity.PackageProfileCargo:    {"cargo"},
+		upstream_entity.PackageProfileNuGet:    {"dotnet", "nuget"},
+		upstream_entity.PackageProfileRubyGems: {"gem", "bundler"},
+		upstream_entity.PackageProfileAPT:      {"apt"},
+		upstream_entity.PackageProfileRPM:      {"dnf", "yum"},
+		upstream_entity.PackageProfileAPK:      {"apk"},
+		upstream_entity.PackageProfileComposer: {"composer"},
+		upstream_entity.PackageProfileHomebrew: {"homebrew"},
+	}
+	for profile, clients := range wantClients {
+		convey.Convey(string(profile), t, func() {
+			candidate := &upstream_entity.Upstream{
+				Host: profileHost(profile), Enabled: true,
+				Protocols:      upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+				PackageProfile: profile,
+			}
+			if profile == upstream_entity.PackageProfileHomebrew {
+				candidate.Host = "formulae.brew.sh"
+			}
+			readiness := packageReadiness("https://mirror.example.com", []*upstream_entity.Upstream{candidate}, candidate)
+			convey.So(reflect.DeepEqual(readiness.Guidance.Clients, clients), convey.ShouldBeTrue)
+			joined := ""
+			for _, line := range readiness.Guidance.Configuration {
+				joined += line + "\n"
+			}
+			convey.So(joined, convey.ShouldNotContainSubstring, "publish")
+			convey.So(joined, convey.ShouldNotContainSubstring, "audit")
+			convey.So(joined, convey.ShouldNotContainSubstring, "prefer-source")
+			convey.So(joined, convey.ShouldNotContainSubstring, "mirrorlist=http")
+		})
+	}
+
+	convey.Convey("Homebrew 强制 no-fallback，RPM 使用固定 base 且关闭动态镜像", t, func() {
+		homebrew := packageGuidance(upstream_entity.PackageProfileHomebrew, "formulae.brew.sh", "https://mirror.example.com")
+		convey.So(homebrew.Configuration, convey.ShouldContain,
+			"export HOMEBREW_ARTIFACT_DOMAIN_NO_FALLBACK=1")
+		convey.So(homebrew.Constraints, convey.ShouldContain, "no_fallback")
+
+		rpm := packageGuidance(upstream_entity.PackageProfileRPM, "mirror.stream.centos.org", "https://mirror.example.com")
+		convey.So(rpm.Configuration, convey.ShouldContain,
+			"baseurl=https://mirror.example.com/mirror.stream.centos.org/<repository-path>/")
+		convey.So(rpm.Configuration, convey.ShouldContain, "mirrorlist=")
+		convey.So(rpm.Configuration, convey.ShouldContain, "metalink=")
+		convey.So(rpm.Constraints, convey.ShouldContain, "fixed_base")
+	})
+}
+
+func profileHost(profile upstream_entity.PackageProfile) string {
+	return map[upstream_entity.PackageProfile]string{
+		upstream_entity.PackageProfileNPM: "registry.npmjs.org", upstream_entity.PackageProfilePyPI: "pypi.org",
+		upstream_entity.PackageProfileGoProxy: "proxy.golang.org", upstream_entity.PackageProfileMaven: "repo.maven.apache.org",
+		upstream_entity.PackageProfileCargo: "index.crates.io", upstream_entity.PackageProfileNuGet: "api.nuget.org",
+		upstream_entity.PackageProfileRubyGems: "rubygems.org", upstream_entity.PackageProfileAPT: "deb.debian.org",
+		upstream_entity.PackageProfileRPM: "mirror.stream.centos.org", upstream_entity.PackageProfileAPK: "dl-cdn.alpinelinux.org",
+		upstream_entity.PackageProfileComposer: "repo.packagist.org",
+	}[profile]
+}
 
 func setupUpstreamTest(t *testing.T) *mock_upstream_repo.MockUpstreamRepo {
 	t.Helper()
