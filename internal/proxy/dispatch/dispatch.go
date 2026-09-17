@@ -10,6 +10,14 @@ import (
 	"strings"
 )
 
+const (
+	// registryBaseNamespace is an explicit base for clients such as Homebrew that
+	// append their own /v2/<repository> path to a configured artifact domain.
+	// Keeping the boundary in the route avoids guessing whether a repository's
+	// legitimate first segment named v2 is a protocol prefix.
+	registryBaseNamespace = "/registry"
+)
+
 // Kind 一个路径的归属。
 type Kind int
 
@@ -57,10 +65,11 @@ func (k Kind) String() string {
 // 判定顺序即决策顺序，第一条命中即止：
 //
 //  1. /api/...、/metrics 是 katch 自身的端点；
-//  2. /v2 与 /v2/ 是 registry 的探测请求；
-//  3. /v2/<host>/... 是 registry 协议，主机名在 /v2/ 之后；
-//  4. 第一段含 . 的，该段即主机名（决策 2：公网主机名必然含点）；
-//  5. 其余交给 SPA。
+//  2. /registry/<host>/v2/... 是供会自行追加 /v2 的客户端使用的 registry base；
+//  3. /v2 与 /v2/ 是 registry 的探测请求；
+//  4. /v2/<host>/... 是 registry 协议，主机名在 /v2/ 之后；
+//  5. 第一段含 . 的，该段即主机名（决策 2：公网主机名必然含点）；
+//  6. 其余交给 SPA。
 //
 // 只有 KindRegistry 与 KindStatic 会带回 host/rest，其余两项都是空串。
 // KindRegistry 的 rest **不含** /v2 前缀——那是 registry 的协议前缀，由回源侧
@@ -78,6 +87,9 @@ func Classify(path string) (Kind, string, string) {
 		strings.HasPrefix(path, "/api/") || strings.HasPrefix(path, "/metrics/") {
 		return KindSelf, "", ""
 	}
+	if path == registryBaseNamespace || strings.HasPrefix(path, registryBaseNamespace+"/") {
+		return classifyRegistryBase(path)
+	}
 	if path == "/v2" || path == "/v2/" {
 		return KindRegistryPing, "", ""
 	}
@@ -87,6 +99,28 @@ func Classify(path string) (Kind, string, string) {
 		return upstream(KindRegistry, rest)
 	}
 	return upstream(KindStatic, strings.TrimPrefix(path, "/"))
+}
+
+// classifyRegistryBase parses the one route whose /v2 segment is a delimiter
+// supplied by katch rather than part of the repository path. The host and tail
+// still go through upstream so escaping and traversal rules stay identical to
+// the legacy /v2/<host>/... registry route.
+func classifyRegistryBase(path string) (Kind, string, string) {
+	rest := strings.TrimPrefix(path, registryBaseNamespace)
+	if rest == "" || rest[0] != '/' {
+		return KindInvalid, "", ""
+	}
+	kind, host, tail := upstream(KindRegistry, strings.TrimPrefix(rest, "/"))
+	if kind != KindRegistry {
+		return KindInvalid, "", ""
+	}
+	if tail == "/v2" {
+		return KindRegistry, host, "/"
+	}
+	if registryPath, ok := strings.CutPrefix(tail, "/v2/"); ok {
+		return KindRegistry, host, "/" + registryPath
+	}
+	return KindInvalid, "", ""
 }
 
 // upstream 把「主机名/剩余路径」这段形状解出来，拿不出主机名时降级。

@@ -137,7 +137,7 @@ Composer 1 provider metadata is not transformed. Existing lockfiles with public 
 
 ### Homebrew
 
-Homebrew API and JWS documents pass through byte-identically via `HOMEBREW_API_DOMAIN`. Bottle manifest/blob downloads use `HOMEBREW_ARTIFACT_DOMAIN=<site base>/v2/ghcr.io` and the existing registered `ghcr.io` registry upstream; `HOMEBREW_ARTIFACT_DOMAIN_NO_FALLBACK=1` is mandatory so a mirror failure cannot fall back to public GHCR. Tap Git remotes use the existing Git path. Bottle digest and checksum verification remain unchanged.
+Homebrew API and JWS documents pass through byte-identically via `HOMEBREW_API_DOMAIN`. Bottle manifest/blob downloads use `HOMEBREW_ARTIFACT_DOMAIN=<site base>/registry/ghcr.io` and the existing registered `ghcr.io` registry upstream. Homebrew appends `/v2/<repository>/...` to that base; the explicit `/registry/<host>/v2` route consumes only this protocol boundary and leaves a legitimate repository path such as `v2/foo` intact. `HOMEBREW_ARTIFACT_DOMAIN_NO_FALLBACK=1` is mandatory so a mirror failure cannot fall back to public GHCR. Tap Git remotes use the existing Git path. Bottle digest and checksum verification remain unchanged.
 
 OCI blobs and digest manifests are immutable; tag manifests and API data are mutable. Homebrew 6 does not apply artifact-domain rewriting to ordinary formula source URLs despite its environment-variable description, as confirmed by its download strategy and a blocked-egress run. Standard bottle installation is supported; `--build-from-source` is not presented as mirrored.
 

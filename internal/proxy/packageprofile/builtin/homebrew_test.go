@@ -91,7 +91,7 @@ func TestHomebrewBottleAndTapConfigurationContract(t *testing.T) {
 	guidance := profile.Guidance()
 	wantConfiguration := []string{
 		"HOMEBREW_API_DOMAIN=https://<katch>/formulae.brew.sh/api",
-		"HOMEBREW_ARTIFACT_DOMAIN=https://<katch>/v2/ghcr.io",
+		"HOMEBREW_ARTIFACT_DOMAIN=https://<katch>/registry/ghcr.io",
 		"HOMEBREW_ARTIFACT_DOMAIN_NO_FALLBACK=1",
 		"HOMEBREW_BREW_GIT_REMOTE=https://<katch>/github.com/Homebrew/brew.git",
 		"HOMEBREW_CORE_GIT_REMOTE=https://<katch>/github.com/Homebrew/homebrew-core.git",

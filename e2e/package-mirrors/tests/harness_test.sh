@@ -636,8 +636,89 @@ if printf '%s\n%s\n' "$composer_setup" "$composer_run" | grep -E -- '("secure-ht
   fail "Composer mirror case disables HTTPS/TLS verification"
 fi
 
-jq -r '.run' "$CASES/homebrew.yaml" | grep -F 'HOMEBREW_ARTIFACT_DOMAIN="${KATCH_URL%/}/v2/ghcr.io"' >/dev/null ||
-  fail "Homebrew bottle route changed from the approved /v2/ghcr.io contract"
+homebrew_case=$CASES/homebrew.yaml
+homebrew_setup=$(jq -r '.setup' "$homebrew_case")
+homebrew_run=$(jq -r '.run' "$homebrew_case")
+homebrew_assert=$(jq -r '.assert' "$homebrew_case")
+printf '%s\n' "$homebrew_setup" | grep -Fx 'mkdir -p results client-home' >/dev/null ||
+  fail "Homebrew does not create a phase-local client home"
+printf '%s\n' "$homebrew_run" | grep -Fx 'export HOME="$PWD/client-home"' >/dev/null ||
+  fail "Homebrew does not use its phase-local client home"
+printf '%s\n' "$homebrew_run" | grep -Fx 'export HOMEBREW_ARTIFACT_DOMAIN="${KATCH_URL%/}/registry/ghcr.io"' >/dev/null ||
+  fail "Homebrew does not use the exact registry base route"
+printf '%s\n' "$homebrew_run" | grep -Fx 'export HOMEBREW_ARTIFACT_DOMAIN_NO_FALLBACK=1' >/dev/null ||
+  fail "Homebrew does not force artifact-domain no-fallback"
+printf '%s\n' "$homebrew_run" | grep -Fx '    export HOMEBREW_NO_INSTALL_FROM_API=1' >/dev/null ||
+  fail "Homebrew warm phase does not switch to the pinned core tap"
+[ "$(printf '%s\n' "$homebrew_run" | grep -Fxc 'git ls-remote "$HOMEBREW_CORE_GIT_REMOTE" HEAD > results/core-head')" -eq 1 ] ||
+  fail "Homebrew does not run one unconditional mirrored git ls-remote per phase"
+homebrew_commands=$(jq -r '[.setup, .run, .assert] | join("\n")' "$homebrew_case")
+if printf '%s\n' "$homebrew_commands" | grep -i -E 'https?://([^/]*[.])?ghcr[.]io([/:]|$)'; then
+  fail "Homebrew mirror case contains a direct GHCR URL"
+fi
+if printf '%s\n' "$homebrew_commands" | grep -i -E -- '(^|[[:space:]])--insecure([=[:space:]]|$)|HOMEBREW_.*(NO_VERIFY|DISABLE.*(TLS|SSL|CHECKSUM|SIGNATURE))|(^|[[:space:]])(SSL_CERT_FILE|CURL_CA_BUNDLE)=/dev/null'; then
+  fail "Homebrew mirror case disables TLS, checksum, or signature verification"
+fi
+
+homebrew_setup_script=$workdir/homebrew-setup.sh
+homebrew_run_script=$workdir/homebrew-run.sh
+homebrew_assert_script=$workdir/homebrew-assert.sh
+printf '%s\n' "$homebrew_setup" > "$homebrew_setup_script"
+printf '%s\n' "$homebrew_run" > "$homebrew_run_script"
+printf '%s\n' "$homebrew_assert" > "$homebrew_assert_script"
+homebrew_case_bin=$workdir/homebrew-case-bin
+homebrew_prefix=$workdir/homebrew-prefix
+homebrew_events=$workdir/homebrew-events.log
+mkdir -p "$homebrew_case_bin" "$homebrew_prefix/bin"
+: > "$homebrew_events"
+cat > "$homebrew_case_bin/brew" <<'EOF'
+#!/bin/sh
+set -eu
+printf 'brew|%s|%s|%s|%s|%s|%s|%s\n' "$KATCH_PHASE" "$HOME" "$HOMEBREW_API_DOMAIN" \
+  "$HOMEBREW_ARTIFACT_DOMAIN" "$HOMEBREW_ARTIFACT_DOMAIN_NO_FALLBACK" \
+  "${HOMEBREW_NO_INSTALL_FROM_API-unset}" "$*" >> "$HOMEBREW_EVENT_LOG"
+case $1 in
+  install) ;;
+  info) printf '%s\n' '{"formulae":[{"name":"jq","installed":[{"version":"1.8.1"}]}]}' ;;
+  --prefix) printf '%s\n' "$HOMEBREW_TEST_PREFIX" ;;
+  *) exit 64 ;;
+esac
+EOF
+cat > "$homebrew_case_bin/git" <<'EOF'
+#!/bin/sh
+set -eu
+[ "$#" -eq 3 ] && [ "$1" = ls-remote ] && [ "$2" = "$HOMEBREW_CORE_GIT_REMOTE" ] && [ "$3" = HEAD ]
+printf 'git|%s|%s|%s\n' "$KATCH_PHASE" "$HOME" "$*" >> "$HOMEBREW_EVENT_LOG"
+printf '%s\n' '0123456789abcdef0123456789abcdef01234567\tHEAD'
+EOF
+cat > "$homebrew_prefix/bin/jq" <<'EOF'
+#!/bin/sh
+set -eu
+printf '%s\n' 'jq-1.8.1'
+EOF
+chmod 0555 "$homebrew_case_bin"/* "$homebrew_prefix/bin/jq"
+homebrew_phase_root=$workdir/homebrew-phase
+mkdir -p "$homebrew_phase_root/cold" "$homebrew_phase_root/warm"
+homebrew_phase_root=$(CDPATH= cd -- "$homebrew_phase_root" && pwd)
+for phase in cold warm; do
+  (
+    cd "$homebrew_phase_root/$phase"
+    PATH="$homebrew_case_bin:$PATH" KATCH_PHASE=$phase KATCH_URL=https://katch.test \
+      HOMEBREW_EVENT_LOG="$homebrew_events" HOMEBREW_TEST_PREFIX="$homebrew_prefix" \
+      /bin/sh "$homebrew_setup_script"
+    PATH="$homebrew_case_bin:$PATH" KATCH_PHASE=$phase KATCH_URL=https://katch.test \
+      HOMEBREW_EVENT_LOG="$homebrew_events" HOMEBREW_TEST_PREFIX="$homebrew_prefix" \
+      /bin/sh "$homebrew_run_script"
+    /bin/sh "$homebrew_assert_script"
+  ) || fail "Homebrew $phase phase does not satisfy the isolated runtime contract"
+done
+[ "$(grep -c '^git|' "$homebrew_events")" -eq 2 ] ||
+  fail "Homebrew does not execute mirrored git ls-remote in both phases"
+grep -F "brew|cold|$homebrew_phase_root/cold/client-home|https://katch.test/formulae.brew.sh/api|https://katch.test/registry/ghcr.io|1|unset|install jq" "$homebrew_events" >/dev/null ||
+  fail "Homebrew cold install does not use API mode and the exact Katch environment"
+grep -F "brew|warm|$homebrew_phase_root/warm/client-home|https://katch.test/formulae.brew.sh/api|https://katch.test/registry/ghcr.io|1|1|install jq" "$homebrew_events" >/dev/null ||
+  fail "Homebrew warm install does not use the pinned tap with a fresh HOME"
+
 jq -r '.run' "$CASES/registry-git-regression.yaml" | grep -F 'git clone --depth=1' >/dev/null ||
   fail "Git regression is no longer executed"
 jq -r '.run' "$CASES/registry-git-regression.yaml" | grep -F 'blocked: $client is unavailable in the pinned client image' >/dev/null ||

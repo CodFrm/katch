@@ -465,7 +465,7 @@ func packageGuidance(
 	case upstream_entity.PackageProfileHomebrew:
 		guidance.Configuration = []string{
 			"export HOMEBREW_API_DOMAIN=" + prefix + "/api",
-			"export HOMEBREW_ARTIFACT_DOMAIN=" + baseURL + "/v2/ghcr.io",
+			"export HOMEBREW_ARTIFACT_DOMAIN=" + baseURL + "/registry/ghcr.io",
 			"export HOMEBREW_ARTIFACT_DOMAIN_NO_FALLBACK=1",
 			"export HOMEBREW_BREW_GIT_REMOTE=" + baseURL + "/github.com/Homebrew/brew.git",
 			"export HOMEBREW_CORE_GIT_REMOTE=" + baseURL + "/github.com/Homebrew/homebrew-core.git",

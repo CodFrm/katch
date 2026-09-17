@@ -226,6 +226,8 @@ func TestPackageGuidanceCoversRuntimeMatrixWithoutUnsupportedClaims(t *testing.T
 	convey.Convey("Homebrew 强制 no-fallback，RPM 使用固定 base 且关闭动态镜像", t, func() {
 		homebrew := packageGuidance(upstream_entity.PackageProfileHomebrew, "formulae.brew.sh", "https://mirror.example.com")
 		convey.So(homebrew.Configuration, convey.ShouldContain,
+			"export HOMEBREW_ARTIFACT_DOMAIN=https://mirror.example.com/registry/ghcr.io")
+		convey.So(homebrew.Configuration, convey.ShouldContain,
 			"export HOMEBREW_ARTIFACT_DOMAIN_NO_FALLBACK=1")
 		convey.So(homebrew.Constraints, convey.ShouldContain, "no_fallback")
 

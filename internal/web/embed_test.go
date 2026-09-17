@@ -262,6 +262,35 @@ func TestProxy_RegistryHostSitsAfterV2(t *testing.T) {
 	})
 }
 
+// TestProxy_RegistryBaseForHomebrew reaches the same registry adapter as the legacy
+// route, but reserves an unambiguous base before Homebrew appends its own /v2 path.
+func TestProxy_RegistryBaseForHomebrew(t *testing.T) {
+	convey.Convey("Homebrew registry base forwards exactly one /v2 prefix and keeps the whitelist", t, func() {
+		gotURI := ""
+		originCalls := 0
+		origin := fakeOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+			originCalls++
+			gotURI = r.URL.RequestURI()
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			_, _ = io.WriteString(w, `{"schemaVersion":2}`)
+		})
+		upstreamTable(t, &upstream_entity.Upstream{
+			ID: 1, Host: "ghcr.io", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolRegistry},
+			Origin: origin, Enabled: true,
+		})
+
+		w := request(t, http.MethodGet, "/registry/ghcr.io/v2/homebrew/core/jq/manifests/tag")
+		convey.So(w.Code, convey.ShouldEqual, http.StatusOK)
+		convey.So(gotURI, convey.ShouldEqual, "/v2/homebrew/core/jq/manifests/tag")
+		convey.So(originCalls, convey.ShouldEqual, 1)
+
+		unknown := request(t, http.MethodGet, "/registry/unknown.example/v2/homebrew/core/jq/manifests/tag")
+		convey.So(unknown.Code, convey.ShouldEqual, http.StatusNotFound)
+		convey.So(unknown.Body.String(), convey.ShouldBeEmpty)
+		convey.So(originCalls, convey.ShouldEqual, 1)
+	})
+}
+
 // TestProxy_ClientCredentialsAreNotForwarded 决策 11：客户端的 Authorization
 // 不转发给上游。这条在回源侧已经有用例，这里钉住它没有被拉取路径绕过去。
 func TestProxy_ClientCredentialsAreNotForwarded(t *testing.T) {
