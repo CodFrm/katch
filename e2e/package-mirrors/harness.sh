@@ -128,6 +128,7 @@ run_phase() {
   case_root=$3
   image=$(jq -r '.image' "$case_file")
   phase_root=$case_root/$phase
+  shared=$case_root/shared
   scripts=$phase_root/case
   artifacts=$phase_root/artifacts
   mkdir -p "$scripts" "$artifacts"
@@ -142,7 +143,8 @@ run_phase() {
     --security-opt no-new-privileges \
     --add-host "$KATCH_HOST:${KATCH_ADD_HOST:-host-gateway}" \
     --mount "type=bind,src=$scripts,dst=/case,readonly" \
-    --mount "type=bind,src=$artifacts,dst=/artifacts"
+    --mount "type=bind,src=$artifacts,dst=/artifacts" \
+    --mount "type=bind,src=$shared,dst=/shared"
   if [ -n "${KATCH_CA_CERT:-}" ]; then
     set -- "$@" \
       --mount "type=bind,src=$KATCH_CA_CERT,dst=$CLIENT_CA_CERT,readonly" \
@@ -155,6 +157,7 @@ run_phase() {
     --env "KATCH_PORT=$KATCH_PORT" \
     --env "KATCH_PHASE=$phase" \
     --env KATCH_ARTIFACTS=/artifacts \
+    --env KATCH_SHARED=/shared \
     "$image"
   "$@" > "$phase_root/client.log" 2>&1
 }
@@ -168,7 +171,8 @@ while IFS= read -r case_file; do
   validate_case "$case_file"
   name=$(jq -r '.name' "$case_file")
   case_root=$run_root/$name
-  mkdir -p "$case_root"
+  mkdir -p "$case_root/shared"
+  chmod 0777 "$case_root/shared"
   upstreams=$case_root/required-upstreams
   jq -r '.required_upstreams[]' "$case_file" > "$upstreams"
 

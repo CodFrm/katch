@@ -52,6 +52,8 @@ KATCH_HOST=host.docker.internal KATCH_PORT=8080 \
 
 The harness supplies the same value as both `KATCH_URL` and `KATCH_BASE_URL`. `KATCH_HOST` is injected into `/etc/hosts` with Docker/Podman's `host-gateway`, so bootstrap does not need public DNS. Set `KATCH_ADD_HOST` to a static katch IPv4 address when katch is attached through another bridge.
 
+Each case also receives `KATCH_SHARED=/shared`, backed by a writable `${run_root}/${case}/shared` directory mounted read-write into both its cold and warm containers. The run and case paths are unique, so state cannot cross runs or cases. The directory is empty initially and has no effect unless a case explicitly stores state there; phase workdirs, artifacts, and package installation directories remain separate. The NuGet case opts in only for its documented HTTP metadata cache via `NUGET_HTTP_CACHE_PATH="$KATCH_SHARED/nuget-http-cache"`. It deliberately keeps `--packages "$PWD/packages"` in each fresh phase workdir so the warm phase downloads and validates the nupkg through katch again.
+
 For an HTTPS test endpoint signed by a private test CA, set `KATCH_CA_CERT` to an absolute path to a readable regular certificate file on the host:
 
 ```sh

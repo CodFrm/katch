@@ -182,6 +182,11 @@ actual_nuget_lock=$(jq -Sc . "$nuget_phase_root/warm/app/packages.lock.json")
 [ "$actual_nuget_lock" = "$expected_nuget_lock" ] ||
   fail "NuGet warm lock does not match the approved Newtonsoft.Json 13.0.3 lock"
 nuget_run=$(jq -r '.run' "$CASES/nuget.yaml")
+[ "$(printf '%s\n' "$nuget_run" | grep -Fxc 'export NUGET_HTTP_CACHE_PATH="$KATCH_SHARED/nuget-http-cache"')" -eq 1 ] ||
+  fail "NuGet run does not use the exact documented HTTP metadata cache path under KATCH_SHARED"
+if printf '%s\n' "$nuget_run" | grep -E 'NUGET_PACKAGES=.*KATCH_SHARED|NUGET_PACKAGES=.*[/]shared'; then
+  fail "NuGet run shares the global packages cache instead of only HTTP metadata"
+fi
 [ "$(printf '%s\n' "$nuget_run" | grep -Fxc 'export DOTNET_CLI_TELEMETRY_OPTOUT=1')" -eq 1 ] ||
   fail "NuGet run does not opt out of .NET CLI telemetry with the exact documented environment setting"
 [ "$(printf '%s\n' "$nuget_run" | grep -Fxc 'export NUGET_CERT_REVOCATION_MODE=offline')" -eq 1 ] ||
@@ -196,6 +201,10 @@ cat > "$nuget_phase_bin/dotnet" <<'EOF'
 set -eu
 [ "${DOTNET_CLI_TELEMETRY_OPTOUT:-}" = 1 ] || exit 65
 [ "${NUGET_CERT_REVOCATION_MODE:-}" = offline ] || exit 65
+[ "${NUGET_HTTP_CACHE_PATH:-}" = "$KATCH_SHARED/nuget-http-cache" ] || exit 65
+case ${NUGET_PACKAGES:-} in
+  "$KATCH_SHARED"|"$KATCH_SHARED"/*) exit 65 ;;
+esac
 printf '%s\n' "$*" >> "$NUGET_EVENT_LOG"
 EOF
 chmod 0555 "$nuget_phase_bin/dotnet"
@@ -206,7 +215,9 @@ run_nuget_phase() {
   (
     cd "$phase_root"
     env -u DOTNET_CLI_TELEMETRY_OPTOUT -u NUGET_CERT_REVOCATION_MODE \
+      -u NUGET_HTTP_CACHE_PATH -u NUGET_PACKAGES \
       PATH="$nuget_phase_bin:$PATH" KATCH_PHASE="$phase" KATCH_URL=https://katch.test \
+      KATCH_SHARED=/shared \
       NUGET_EVENT_LOG="$nuget_phase_events" /bin/sh "$nuget_run_script"
   )
 }
@@ -510,17 +521,16 @@ cat > "$harness_bin/curl" <<'EOF'
 set -eu
 count=0
 [ ! -f "$METRIC_STATE" ] || count=$(cat "$METRIC_STATE")
-case $count in
-  0) total=0 ;;
-  *) total=1 ;;
-esac
+total=$(((count + 2) / 3))
 printf '%s\n' "$((count + 1))" > "$METRIC_STATE"
 printf 'katch_origin_requests_total{upstream="example.invalid"} %s\n' "$total"
 EOF
 chmod 0555 "$harness_bin/fake-runtime" "$harness_bin/curl"
 
 harness_case=$workdir/harness-case.yaml
+second_harness_case=$workdir/second-harness-case.yaml
 printf '%s\n' '{"name":"ca-contract","image":"example/client:1","setup":"true","run":"true","assert":"true","required_upstreams":["example.invalid"]}' > "$harness_case"
+printf '%s\n' '{"name":"shared-isolation","image":"example/client:1","setup":"true","run":"true","assert":"true","required_upstreams":["example.invalid"]}' > "$second_harness_case"
 run_harness() {
   artifact_dir=$1
   shift
@@ -534,6 +544,18 @@ run_harness() {
 }
 
 run_harness "$workdir/harness-unset" env -u KATCH_CA_CERT >"$workdir/out" 2>&1
+shared_dir=$(find "$workdir/harness-unset" -type d -name shared -print)
+[ -n "$shared_dir" ] && [ "$(printf '%s\n' "$shared_dir" | wc -l | tr -d ' ')" -eq 1 ] ||
+  fail "harness did not create exactly one per-case shared directory"
+[ -n "$(find "$shared_dir" -prune -perm -0002 -print)" ] ||
+  fail "harness shared directory is not writable by an unprivileged client"
+[ "$(grep -Fc "ARG=type=bind,src=$shared_dir,dst=/shared" "$workdir/runtime.log")" -eq 2 ] ||
+  fail "harness did not mount the same case shared directory read-write in both phases"
+if grep -F "ARG=type=bind,src=$shared_dir,dst=/shared,readonly" "$workdir/runtime.log"; then
+  fail "harness mounted the case shared directory read-only"
+fi
+[ "$(grep -Fc 'ARG=KATCH_SHARED=/shared' "$workdir/runtime.log")" -eq 2 ] ||
+  fail "harness did not export the fixed shared path in both phases"
 if grep -E 'KATCH_(CA_CERT|CLIENT_CA_CERT)|/run/katch-test-ca.crt' "$workdir/runtime.log"; then
   fail "harness changed the container contract when KATCH_CA_CERT was unset"
 fi
@@ -562,6 +584,25 @@ run_harness "$workdir/harness-ca" env KATCH_CA_CERT="$trusted_ca" >"$workdir/out
 if grep -F 'ARG=KATCH_CA_CERT=' "$workdir/runtime.log"; then
   fail "harness exposed the host CA path as a client environment variable"
 fi
+
+: > "$workdir/runtime.log"
+printf '%s\n' 0 > "$workdir/metric-state"
+env PATH="$harness_bin:$PATH" RUNTIME_LOG="$workdir/runtime.log" METRIC_STATE="$workdir/metric-state" \
+  CONTAINER_RUNTIME=fake-runtime ARTIFACT_ROOT="$workdir/harness-two-cases" \
+  KATCH_URL=https://katch.invalid KATCH_METRICS_URL=http://metrics.invalid \
+  KATCH_HOST=katch.invalid KATCH_PORT=443 \
+  "$HARNESS" "$harness_case" "$second_harness_case" >"$workdir/out" 2>&1
+shared_mounts=$(grep -F 'ARG=type=bind,src=' "$workdir/runtime.log" | grep -F ',dst=/shared')
+[ "$(printf '%s\n' "$shared_mounts" | wc -l | tr -d ' ')" -eq 4 ] ||
+  fail "harness did not mount shared storage in both phases of both cases"
+[ "$(printf '%s\n' "$shared_mounts" | sort -u | wc -l | tr -d ' ')" -eq 2 ] ||
+  fail "harness did not isolate shared storage by case"
+for case_name in ca-contract shared-isolation; do
+  [ "$(printf '%s\n' "$shared_mounts" | grep -Fc "/$case_name/shared,dst=/shared")" -eq 2 ] ||
+    fail "harness shared storage is not stable across phases for $case_name"
+done
+[ "$(grep -Fc 'ARG=KATCH_SHARED=/shared' "$workdir/runtime.log")" -eq 4 ] ||
+  fail "harness did not export KATCH_SHARED for every case phase"
 
 grep -F -- '--env "KATCH_URL=$KATCH_URL"' "$HARNESS" >/dev/null ||
   fail "harness does not forward KATCH_URL"
