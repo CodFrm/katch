@@ -156,13 +156,71 @@ nuget_required_upstreams=$(jq -c '.required_upstreams' "$CASES/nuget.yaml")
 nuget_setup=$(jq -r '.setup' "$CASES/nuget.yaml")
 printf '%s\n' "$nuget_setup" | grep -Fx '    <NuGetAudit>false</NuGetAudit>' >/dev/null ||
   fail "NuGet test project does not disable only the out-of-scope vulnerability audit"
+printf '%s\n' "$nuget_setup" | grep -Fx '    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />' >/dev/null ||
+  fail "NuGet test project does not use the exact Newtonsoft.Json dependency"
 printf '%s\n' "$nuget_setup" | grep -F "'using System;'" >/dev/null ||
   fail "NuGet generated source does not import System for Console"
+nuget_setup_script=$workdir/nuget-setup.sh
+nuget_phase_root=$workdir/nuget-phase
+jq -r '.setup' "$CASES/nuget.yaml" > "$nuget_setup_script"
+mkdir -p "$nuget_phase_root/cold" "$nuget_phase_root/warm"
+nuget_phase_root=$(CDPATH= cd -- "$nuget_phase_root" && pwd)
+(
+  cd "$nuget_phase_root/cold"
+  KATCH_PHASE=cold /bin/sh "$nuget_setup_script"
+)
+[ ! -e "$nuget_phase_root/cold/app/packages.lock.json" ] ||
+  fail "NuGet cold setup creates a lock file instead of exercising normal dependency resolution"
+(
+  cd "$nuget_phase_root/warm"
+  KATCH_PHASE=warm /bin/sh "$nuget_setup_script"
+)
+[ -f "$nuget_phase_root/warm/app/packages.lock.json" ] ||
+  fail "NuGet warm setup does not create packages.lock.json"
+expected_nuget_lock=$(printf '%s' '{"dependencies":{"net8.0":{"Newtonsoft.Json":{"contentHash":"HrC5BXdl00IP9zeV+0Z848QWPAoCr9P3bDEZguI+gkLcBKAOxix/tLEAAHC+UvDNPv4a2d18lOReHMOagPa+zQ==","requested":"[13.0.3, )","resolved":"13.0.3","type":"Direct"}}},"version":1}' | jq -Sc .)
+actual_nuget_lock=$(jq -Sc . "$nuget_phase_root/warm/app/packages.lock.json")
+[ "$actual_nuget_lock" = "$expected_nuget_lock" ] ||
+  fail "NuGet warm lock does not match the approved Newtonsoft.Json 13.0.3 lock"
 nuget_run=$(jq -r '.run' "$CASES/nuget.yaml")
 [ "$(printf '%s\n' "$nuget_run" | grep -Fxc 'export DOTNET_CLI_TELEMETRY_OPTOUT=1')" -eq 1 ] ||
   fail "NuGet run does not opt out of .NET CLI telemetry with the exact documented environment setting"
 [ "$(printf '%s\n' "$nuget_run" | grep -Fxc 'export NUGET_CERT_REVOCATION_MODE=offline')" -eq 1 ] ||
   fail "NuGet run does not use the exact documented offline certificate revocation mode"
+nuget_run_script=$workdir/nuget-run.sh
+nuget_phase_bin=$workdir/nuget-phase-bin
+nuget_phase_events=$workdir/nuget-phase-events.log
+jq -r '.run' "$CASES/nuget.yaml" > "$nuget_run_script"
+mkdir -p "$nuget_phase_bin"
+cat > "$nuget_phase_bin/dotnet" <<'EOF'
+#!/bin/sh
+set -eu
+[ "${DOTNET_CLI_TELEMETRY_OPTOUT:-}" = 1 ] || exit 65
+[ "${NUGET_CERT_REVOCATION_MODE:-}" = offline ] || exit 65
+printf '%s\n' "$*" >> "$NUGET_EVENT_LOG"
+EOF
+chmod 0555 "$nuget_phase_bin/dotnet"
+run_nuget_phase() {
+  phase=$1
+  phase_root=$nuget_phase_root/$phase
+  : > "$nuget_phase_events"
+  (
+    cd "$phase_root"
+    env -u DOTNET_CLI_TELEMETRY_OPTOUT -u NUGET_CERT_REVOCATION_MODE \
+      PATH="$nuget_phase_bin:$PATH" KATCH_PHASE="$phase" KATCH_URL=https://katch.test \
+      NUGET_EVENT_LOG="$nuget_phase_events" /bin/sh "$nuget_run_script"
+  )
+}
+run_nuget_phase cold
+expected_cold_restore="restore app/app.csproj --source https://katch.test/api.nuget.org/v3/index.json --packages $nuget_phase_root/cold/packages"
+expected_nuget_search='package search Newtonsoft.Json --source https://katch.test/api.nuget.org/v3/index.json --take 1 --format json'
+expected_cold_events=$(printf '%s\n' "$expected_cold_restore" "$expected_nuget_search" '--info')
+[ "$(cat "$nuget_phase_events")" = "$expected_cold_events" ] ||
+  fail "NuGet cold run is not a normal restore followed by search and client initialization"
+run_nuget_phase warm
+expected_warm_restore="restore app/app.csproj --source https://katch.test/api.nuget.org/v3/index.json --packages $nuget_phase_root/warm/packages --locked-mode"
+expected_warm_events=$(printf '%s\n' "$expected_warm_restore" "$expected_nuget_search" '--info')
+[ "$(cat "$nuget_phase_events")" = "$expected_warm_events" ] ||
+  fail "NuGet warm run is not a locked restore followed by search and client initialization"
 nuget_case=$(jq -r '[.setup, .run, .assert] | join("\n")' "$CASES/nuget.yaml")
 if printf '%s\n' "$nuget_case" | grep -i -E '(signatureValidationMode|allowUntrusted|allowInsecureConnections|disableTLSCertificateValidation|--allow-insecure-connections)'; then
   fail "NuGet mirror case disables package signatures, repository signatures, or TLS certificate validation"
