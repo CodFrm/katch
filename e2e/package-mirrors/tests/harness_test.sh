@@ -149,6 +149,10 @@ if grep -n -E '(AllowUnauthenticated|AllowInsecureRepositories|AllowDowngradeToI
   fail "Homebrew image disables apt signature verification"
 fi
 
+nuget_required_upstreams=$(jq -c '.required_upstreams' "$CASES/nuget.yaml")
+[ "$nuget_required_upstreams" = '["api.nuget.org","nuget.azure.cn","azuresearch-usnc.nuget.org","azuresearch-ea.nuget.org","azuresearch-sea.nuget.org","globalcdn.nuget.org","www.nuget.org"]' ] ||
+  fail "NuGet required_upstreams does not match the fixed official host contract"
+
 npm_run=$(jq -r '.run' "$CASES/npm.yaml")
 printf '%s\n' "$npm_run" | grep -Fx '(cd npm && npm install --ignore-scripts --no-audit --no-update-notifier --registry="$registry" --replace-registry-host=always)' >/dev/null ||
   fail "npm mirror case does not disable audit and the npm update notifier"

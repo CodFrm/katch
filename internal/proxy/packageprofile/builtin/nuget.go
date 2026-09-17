@@ -14,14 +14,22 @@ import (
 )
 
 const (
-	nugetAPIHost    = "api.nuget.org"
-	nugetSearchHost = "azuresearch-usnc.nuget.org"
-	nugetWebHost    = "www.nuget.org"
+	nugetAPIHost            = "api.nuget.org"
+	nugetRegionalAPIHost    = "nuget.azure.cn"
+	nugetSearchUSNCHost     = "azuresearch-usnc.nuget.org"
+	nugetSearchEastAsiaHost = "azuresearch-ea.nuget.org"
+	nugetSearchSEAsiaHost   = "azuresearch-sea.nuget.org"
+	nugetGlobalCDNHost      = "globalcdn.nuget.org"
+	nugetWebHost            = "www.nuget.org"
 )
 
 var nugetCompanions = []packageprofile.Companion{
 	{Host: nugetAPIHost, Profile: upstream_entity.PackageProfileNuGet, Transport: upstream_entity.ProtocolStatic},
-	{Host: nugetSearchHost, Profile: upstream_entity.PackageProfileNuGet, Transport: upstream_entity.ProtocolStatic},
+	{Host: nugetRegionalAPIHost, Profile: upstream_entity.PackageProfileNuGet, Transport: upstream_entity.ProtocolStatic},
+	{Host: nugetSearchUSNCHost, Profile: upstream_entity.PackageProfileNuGet, Transport: upstream_entity.ProtocolStatic},
+	{Host: nugetSearchEastAsiaHost, Profile: upstream_entity.PackageProfileNuGet, Transport: upstream_entity.ProtocolStatic},
+	{Host: nugetSearchSEAsiaHost, Profile: upstream_entity.PackageProfileNuGet, Transport: upstream_entity.ProtocolStatic},
+	{Host: nugetGlobalCDNHost, Profile: upstream_entity.PackageProfileNuGet, Transport: upstream_entity.ProtocolStatic},
 	{Host: nugetWebHost, Profile: upstream_entity.PackageProfileNuGet, Transport: upstream_entity.ProtocolStatic},
 }
 
@@ -50,13 +58,23 @@ func (nugetProfile) Classify(request packageprofile.Request) packageprofile.Repr
 	path := strings.TrimSpace(request.Path)
 
 	switch host {
-	case nugetSearchHost:
+	case nugetSearchUSNCHost, nugetSearchEastAsiaHost, nugetSearchSEAsiaHost:
 		if path == "/query" || path == "/query/" || path == "/autocomplete" || path == "/autocomplete/" {
 			return nugetJSONRepresentation(packageprofile.ClassMutable, true)
 		}
 		return packageprofile.Representation{}
 	case nugetAPIHost:
 		return classifyNuGetAPIPath(path)
+	case nugetRegionalAPIHost:
+		if path == "/v3/index.json" {
+			return nugetJSONRepresentation(packageprofile.ClassMutable, true)
+		}
+		return packageprofile.Representation{}
+	case nugetGlobalCDNHost:
+		if nugetVersionedReadmePath(path) {
+			return packageprofile.Representation{Class: packageprofile.ClassImmutable}
+		}
+		return packageprofile.Representation{}
 	default:
 		return packageprofile.Representation{}
 	}
@@ -156,6 +174,30 @@ func nugetFlatContainerVersionIndex(path string) bool {
 func nugetVersionedPackagePath(path string) bool {
 	parts := splitNuGetPath(path)
 	return len(parts) == 4 && parts[0] == "v3-flatcontainer" && parts[1] != "" && parts[2] != "" && parts[3] != ""
+}
+
+func nugetVersionedReadmePath(path string) bool {
+	if !strings.HasPrefix(path, "/") || strings.HasSuffix(path, "/") {
+		return false
+	}
+	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	return len(parts) == 4 && parts[0] == "v3-flatcontainer" &&
+		nugetLiteralSegment(parts[1]) && nugetLiteralSegment(parts[2]) && parts[3] == "readme"
+}
+
+func nugetLiteralSegment(segment string) bool {
+	if segment == "" || segment == "." || segment == ".." {
+		return false
+	}
+	for i := range len(segment) {
+		char := segment[i]
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') || char == '.' || char == '-' || char == '_' || char == '+' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func splitNuGetPath(path string) []string {

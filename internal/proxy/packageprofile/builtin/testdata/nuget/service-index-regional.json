@@ -1,0 +1,25 @@
+{
+  "version": "3.0.0",
+  "resources": [
+    {
+      "@id": "https://api.nuget.org/v3/registration5-gz-semver2/",
+      "@type": "RegistrationsBaseUrl/3.6.0"
+    },
+    {
+      "@id": "https://www.nuget.org/api/v2",
+      "@type": "LegacyGallery/2.0.0"
+    },
+    {
+      "@id": "https://azuresearch-ea.nuget.org/query?semVerLevel=2.0.0",
+      "@type": "SearchQueryService/3.5.0"
+    },
+    {
+      "@id": "https://azuresearch-sea.nuget.org/autocomplete?semVerLevel=2.0.0",
+      "@type": "SearchAutocompleteService/3.5.0"
+    },
+    {
+      "@id": "https://globalcdn.nuget.org/v3-flatcontainer/{lower_id}/{lower_version}/readme",
+      "@type": "ReadmeUriTemplate/6.13.0"
+    }
+  ]
+}

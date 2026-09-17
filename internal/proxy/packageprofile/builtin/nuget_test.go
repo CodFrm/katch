@@ -26,7 +26,11 @@ func TestNuGetProfileRegistersDeclaresCompanionsAndClassifies(t *testing.T) {
 
 	wantCompanions := []packageprofile.Companion{
 		{Host: "api.nuget.org", Profile: upstream_entity.PackageProfileNuGet, Transport: upstream_entity.ProtocolStatic},
+		{Host: "nuget.azure.cn", Profile: upstream_entity.PackageProfileNuGet, Transport: upstream_entity.ProtocolStatic},
 		{Host: "azuresearch-usnc.nuget.org", Profile: upstream_entity.PackageProfileNuGet, Transport: upstream_entity.ProtocolStatic},
+		{Host: "azuresearch-ea.nuget.org", Profile: upstream_entity.PackageProfileNuGet, Transport: upstream_entity.ProtocolStatic},
+		{Host: "azuresearch-sea.nuget.org", Profile: upstream_entity.PackageProfileNuGet, Transport: upstream_entity.ProtocolStatic},
+		{Host: "globalcdn.nuget.org", Profile: upstream_entity.PackageProfileNuGet, Transport: upstream_entity.ProtocolStatic},
 		{Host: "www.nuget.org", Profile: upstream_entity.PackageProfileNuGet, Transport: upstream_entity.ProtocolStatic},
 	}
 	if got := profile.Companions(); !reflect.DeepEqual(got, wantCompanions) {
@@ -41,14 +45,28 @@ func TestNuGetProfileRegistersDeclaresCompanionsAndClassifies(t *testing.T) {
 		transform bool
 	}{
 		{name: "service index", host: "api.nuget.org", path: "/v3/index.json", class: packageprofile.ClassMutable, transform: true},
+		{name: "regional service index", host: "nuget.azure.cn", path: "/v3/index.json", class: packageprofile.ClassMutable, transform: true},
+		{name: "regional service index extra path", host: "nuget.azure.cn", path: "/v3/index.json/extra", class: packageprofile.ClassUnknown},
 		{name: "registration index", host: "api.nuget.org", path: "/v3/registration5-gz-semver2/example.package/index.json", class: packageprofile.ClassMutable, transform: true},
 		{name: "registration leaf", host: "api.nuget.org", path: "/v3/registration5-semver1/example.package/1.0.0.json", class: packageprofile.ClassMutable, transform: true},
 		{name: "search", host: "azuresearch-usnc.nuget.org", path: "/query", class: packageprofile.ClassMutable, transform: true},
 		{name: "autocomplete", host: "azuresearch-usnc.nuget.org", path: "/autocomplete", class: packageprofile.ClassMutable, transform: true},
+		{name: "east asia search", host: "azuresearch-ea.nuget.org", path: "/query", class: packageprofile.ClassMutable, transform: true},
+		{name: "east asia autocomplete", host: "azuresearch-ea.nuget.org", path: "/autocomplete/", class: packageprofile.ClassMutable, transform: true},
+		{name: "southeast asia search", host: "azuresearch-sea.nuget.org", path: "/query/", class: packageprofile.ClassMutable, transform: true},
+		{name: "southeast asia autocomplete", host: "azuresearch-sea.nuget.org", path: "/autocomplete", class: packageprofile.ClassMutable, transform: true},
+		{name: "regional search extra path", host: "azuresearch-ea.nuget.org", path: "/query/extra", class: packageprofile.ClassUnknown},
+		{name: "unlisted search region", host: "azuresearch-weu.nuget.org", path: "/query", class: packageprofile.ClassUnknown},
 		{name: "package versions", host: "api.nuget.org", path: "/v3-flatcontainer/example.package/index.json", class: packageprofile.ClassMutable},
 		{name: "package", host: "api.nuget.org", path: "/v3-flatcontainer/example.package/1.0.0/example.package.1.0.0.nupkg", class: packageprofile.ClassImmutable},
 		{name: "package hash", host: "api.nuget.org", path: "/v3-flatcontainer/example.package/1.0.0/example.package.1.0.0.nupkg.sha512", class: packageprofile.ClassImmutable},
 		{name: "nuspec", host: "api.nuget.org", path: "/v3-flatcontainer/example.package/1.0.0/example.package.nuspec", class: packageprofile.ClassImmutable},
+		{name: "versioned readme", host: "globalcdn.nuget.org", path: "/v3-flatcontainer/example.package/1.0.0/readme", class: packageprofile.ClassImmutable},
+		{name: "readme URI template", host: "globalcdn.nuget.org", path: "/v3-flatcontainer/{lower_id}/{lower_version}/readme", class: packageprofile.ClassUnknown},
+		{name: "unversioned readme", host: "globalcdn.nuget.org", path: "/v3-flatcontainer/example.package/readme", class: packageprofile.ClassUnknown},
+		{name: "readme trailing slash", host: "globalcdn.nuget.org", path: "/v3-flatcontainer/example.package/1.0.0/readme/", class: packageprofile.ClassUnknown},
+		{name: "readme extra path", host: "globalcdn.nuget.org", path: "/v3-flatcontainer/example.package/1.0.0/readme/extra", class: packageprofile.ClassUnknown},
+		{name: "readme dot segment", host: "globalcdn.nuget.org", path: "/v3-flatcontainer/example.package/../readme", class: packageprofile.ClassUnknown},
 		{name: "catalog entry", host: "api.nuget.org", path: "/v3/catalog0/data/2026.09.16.00.00.00/example.package.1.0.0.json", class: packageprofile.ClassImmutable, transform: true},
 		{name: "repository signatures", host: "api.nuget.org", path: "/v3-index/repository-signatures/index.json", class: packageprofile.ClassMutable, transform: true},
 		{name: "publish remains unsupported", host: "www.nuget.org", path: "/api/v2/package", class: packageprofile.ClassUnknown},
@@ -77,6 +95,16 @@ func TestNuGetTransformRewritesProtocolNavigationOnly(t *testing.T) {
 		{
 			name: "service index", file: "testdata/nuget/service-index.json", source: "https://api.nuget.org/v3/index.json", wantCalls: 4,
 			wantSuffix: []string{"/api.nuget.org/v3/registration5-gz-semver2/", "/azuresearch-usnc.nuget.org/query?semVerLevel=2.0.0", "/api.nuget.org/v3-flatcontainer/", "/api.nuget.org/v3-index/repository-signatures/index.json"},
+		},
+		{
+			name: "regional service index", file: "testdata/nuget/service-index-regional.json", source: "https://nuget.azure.cn/v3/index.json", wantCalls: 5,
+			wantSuffix: []string{
+				"/api.nuget.org/v3/registration5-gz-semver2/",
+				"/www.nuget.org/api/v2",
+				"/azuresearch-ea.nuget.org/query?semVerLevel=2.0.0",
+				"/azuresearch-sea.nuget.org/autocomplete?semVerLevel=2.0.0",
+				"/globalcdn.nuget.org/v3-flatcontainer/%7Blower_id%7D/%7Blower_version%7D/readme",
+			},
 		},
 		{
 			name: "registration", file: "testdata/nuget/registration.json", source: "https://api.nuget.org/v3/registration5-gz-semver2/example.package/index.json", wantCalls: 5,
@@ -145,6 +173,7 @@ func TestNuGetTransformFailsClosed(t *testing.T) {
 		{name: "missing companion", in: packageprofile.TransformRequest{Body: valid, Source: mustURL(t, "https://api.nuget.org/v3/index.json"), SiteBaseURL: "https://katch.example.com", RewriteURL: unavailableNuGetRewrite}, want: packageprofile.ErrUnavailable},
 		{name: "malformed", in: packageprofile.TransformRequest{Body: []byte(`{`), Source: mustURL(t, "https://api.nuget.org/v3/index.json"), SiteBaseURL: "https://katch.example.com", RewriteURL: successfulNuGetRewrite}, want: packageprofile.ErrInvalidMetadata},
 		{name: "unknown host", in: packageprofile.TransformRequest{Body: []byte(`{"@id":"https://evil.example/v3/index.json"}`), Source: mustURL(t, "https://api.nuget.org/v3/index.json"), SiteBaseURL: "https://katch.example.com", RewriteURL: successfulNuGetRewrite}, want: packageprofile.ErrInvalidMetadata},
+		{name: "unlisted NuGet region", in: packageprofile.TransformRequest{Body: []byte(`{"@id":"https://azuresearch-weu.nuget.org/query"}`), Source: mustURL(t, "https://nuget.azure.cn/v3/index.json"), SiteBaseURL: "https://katch.example.com", RewriteURL: successfulNuGetRewrite}, want: packageprofile.ErrInvalidMetadata},
 		{name: "userinfo", in: packageprofile.TransformRequest{Body: []byte(`{"packageContent":"https://user@api.nuget.org/v3-flatcontainer/p/1.0.0/p.1.0.0.nupkg"}`), Source: mustURL(t, "https://api.nuget.org/v3/index.json"), SiteBaseURL: "https://katch.example.com", RewriteURL: successfulNuGetRewrite}, want: packageprofile.ErrInvalidMetadata},
 		{name: "downgrade", in: packageprofile.TransformRequest{Body: []byte(`{"registration":"http://api.nuget.org/v3/registration5/p/index.json"}`), Source: mustURL(t, "https://api.nuget.org/v3/index.json"), SiteBaseURL: "https://katch.example.com", RewriteURL: successfulNuGetRewrite}, want: packageprofile.ErrInvalidMetadata},
 		{name: "relative without source", in: packageprofile.TransformRequest{Body: []byte(`{"@id":"page.json"}`), SiteBaseURL: "https://katch.example.com", RewriteURL: successfulNuGetRewrite}, want: packageprofile.ErrInvalidMetadata},

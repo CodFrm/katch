@@ -45,7 +45,7 @@ transport、HTTPS 降级和实际拨号地址检查。
 | `goproxy`  | Go modules + sumdb                       | `sum.golang.org`（static / goproxy）                                                  |
 | `maven`    | Maven、Gradle、sbt                       | 无                                                                                    |
 | `cargo`    | Cargo sparse index                       | `static.crates.io`（static / cargo）                                                  |
-| `nuget`    | dotnet/NuGet restore、search             | `api.nuget.org`、`azuresearch-usnc.nuget.org`、`www.nuget.org`（均为 static / nuget） |
+| `nuget`    | dotnet/NuGet restore、search             | `api.nuget.org`、`nuget.azure.cn`、`azuresearch-usnc.nuget.org`、`azuresearch-ea.nuget.org`、`azuresearch-sea.nuget.org`、`globalcdn.nuget.org`、`www.nuget.org`（均为 static / nuget） |
 | `rubygems` | gem、Bundler                             | 无                                                                                    |
 | `apt`      | APT 固定 source                          | 无                                                                                    |
 | `rpm`      | DNF、YUM 固定 baseurl                    | 无                                                                                    |

@@ -67,6 +67,36 @@ func TestPackageProfileReadiness(t *testing.T) {
 		convey.So(readiness.Companions[0].Ready, convey.ShouldBeTrue)
 	})
 
+	convey.Convey("NuGet readiness requires the complete fixed official host set", t, func() {
+		hosts := []string{
+			"api.nuget.org",
+			"nuget.azure.cn",
+			"azuresearch-usnc.nuget.org",
+			"azuresearch-ea.nuget.org",
+			"azuresearch-sea.nuget.org",
+			"globalcdn.nuget.org",
+			"www.nuget.org",
+		}
+		configured := make([]*upstream_entity.Upstream, 0, len(hosts))
+		for _, host := range hosts {
+			configured = append(configured, &upstream_entity.Upstream{
+				Host: host, Enabled: true,
+				Protocols:      upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+				PackageProfile: upstream_entity.PackageProfileNuGet,
+			})
+		}
+
+		readiness := packageReadiness("https://mirror.example.com", configured, configured[0])
+		convey.So(readiness.Ready, convey.ShouldBeTrue)
+		convey.So(readiness.Companions, convey.ShouldHaveLength, len(hosts))
+		for i, host := range hosts {
+			convey.So(readiness.Companions[i], convey.ShouldResemble, admin.PackageCompanion{
+				Host: host, Transport: upstream_entity.ProtocolStatic,
+				PackageProfile: upstream_entity.PackageProfileNuGet, Ready: true,
+			})
+		}
+	})
+
 	for _, tc := range []struct {
 		name   string
 		files  *upstream_entity.Upstream
