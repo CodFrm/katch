@@ -149,6 +149,12 @@ if grep -n -E '(AllowUnauthenticated|AllowInsecureRepositories|AllowDowngradeToI
   fail "Homebrew image disables apt signature verification"
 fi
 
+npm_run=$(jq -r '.run' "$CASES/npm.yaml")
+printf '%s\n' "$npm_run" | grep -Fx '(cd npm && npm install --ignore-scripts --no-audit --registry="$registry" --replace-registry-host=always)' >/dev/null ||
+  fail "npm mirror case does not disable out-of-scope audit requests"
+printf '%s\n' "$npm_run" | grep -Fx '(cd yarn-berry && yarn-berry config set npmRegistryServer "$registry" && yarn-berry install --mode=skip-build)' >/dev/null ||
+  fail "npm mirror case does not use the exact Yarn Berry skip-build mode"
+
 jq -r '.run' "$CASES/homebrew.yaml" | grep -F 'HOMEBREW_ARTIFACT_DOMAIN="${KATCH_URL%/}/v2/ghcr.io"' >/dev/null ||
   fail "Homebrew bottle route changed from the approved /v2/ghcr.io contract"
 jq -r '.run' "$CASES/registry-git-regression.yaml" | grep -F 'git clone --depth=1' >/dev/null ||
