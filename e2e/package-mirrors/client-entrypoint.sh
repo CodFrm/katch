@@ -9,28 +9,46 @@ verify_capture() {
     return 1
   }
   awk -v allowed="$katch_ip" -v allowed_port="${KATCH_PORT:-}" '
-    function reject(destination, line) {
-      if (destination == allowed || destination ~ /^127\./ || destination == "::1") return
+    function reject(line) {
       print "non-katch connection attempt: " line > "/dev/stderr"
       bad = 1
+    }
+    function audit(destination, port, line) {
+      if (destination ~ /^127\./ || destination == "::1" || destination ~ /^::ffff:127\./) return
+      if (destination == allowed || destination == "::ffff:" allowed) {
+        if (port == allowed_port || port == 0) return
+      }
+      reject(line)
     }
     /sa_family=AF_INET,/ {
       line = $0
       if (match(line, /inet_addr\("[0-9.]+"\)/)) {
-        destination = substr(line, RSTART + 11, RLENGTH - 13)
-        reject(destination, line)
+        destination = substr(line, RSTART, RLENGTH)
+        sub(/^inet_addr\("/, "", destination)
+        sub(/"\)$/, "", destination)
+        port = ""
+        if (match(line, /sin_port=htons\([0-9]+\)/)) {
+          port = substr(line, RSTART, RLENGTH)
+          sub(/^sin_port=htons\(/, "", port)
+          sub(/\)$/, "", port)
+        }
+        audit(destination, port, line)
       }
       next
     }
     /sa_family=AF_INET6,/ {
       line = $0
       if (match(line, /inet_pton\(AF_INET6, "[0-9A-Fa-f:.]+"/)) {
-        destination = substr(line, RSTART + 21, RLENGTH - 22)
-        if (destination == "::ffff:" allowed && match(line, /sin6_port=htons\([0-9]+\)/)) {
-          port = substr(line, RSTART + 16, RLENGTH - 17)
-          if (port == allowed_port) next
+        destination = substr(line, RSTART, RLENGTH)
+        sub(/^inet_pton\(AF_INET6, "/, "", destination)
+        sub(/"$/, "", destination)
+        port = ""
+        if (match(line, /sin6_port=htons\([0-9]+\)/)) {
+          port = substr(line, RSTART, RLENGTH)
+          sub(/^sin6_port=htons\(/, "", port)
+          sub(/\)$/, "", port)
         }
-        reject(destination, line)
+        audit(destination, port, line)
       }
       next
     }
@@ -38,10 +56,13 @@ verify_capture() {
     / IP6? / && / > / {
       line = $0
       split(line, halves, / > /)
-      destination = halves[2]
-      sub(/:.*/, "", destination)
+      endpoint = halves[2]
+      sub(/: .*/, "", endpoint)
+      destination = endpoint
       sub(/\.[0-9]+$/, "", destination)
-      reject(destination, line)
+      port = endpoint
+      sub(/^.*\./, "", port)
+      audit(destination, port, line)
     }
     END { exit bad }
   ' "$capture"

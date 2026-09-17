@@ -297,6 +297,75 @@ fi
 [ "$(cat "$nuget_events")" = "$(printf 'run\nshutdown\n')" ] ||
   fail "NuGet case skips build-server cleanup after an assertion failure"
 
+maven_case=$CASES/maven.yaml
+maven_setup=$(jq -r '.setup' "$maven_case")
+maven_run=$(jq -r '.run' "$maven_case")
+maven_assert=$(jq -r '.assert' "$maven_case")
+printf '%s\n' "$maven_setup" | grep -Fx 'root=$PWD/maven-clients' >/dev/null ||
+  fail "JVM setup does not use the phase workdir for client projects"
+printf '%s\n' "$maven_setup" | grep -Fx 'mkdir -p "$PWD/client-home"' >/dev/null ||
+  fail "JVM setup does not create a writable phase-local client home"
+printf '%s\n' "$maven_run" | grep -Fx 'export HOME="$PWD/client-home"' >/dev/null ||
+  fail "JVM run does not export the phase-local client home before invoking tools"
+printf '%s\n' "$maven_run" | grep -Fx 'root=$PWD/maven-clients' >/dev/null ||
+  fail "JVM run does not use the phase workdir for client projects"
+printf '%s\n' "$maven_assert" | grep -Fx 'root=$PWD/maven-clients' >/dev/null ||
+  fail "JVM assertions do not use the phase workdir for client projects"
+if jq -r '[.setup, .run, .assert] | join("\n")' "$maven_case" | grep -E '(/tmp/maven-clients|allowInsecureProtocol|trustAll|disable[^[:space:]]*(TLS|SSL|Certificate)|-D[^[:space:]]*(insecure|trustStore))'; then
+  fail "JVM case uses shared temp state or insecure JVM transport flags"
+fi
+
+maven_setup_script=$workdir/maven-setup.sh
+maven_run_script=$workdir/maven-run.sh
+maven_assert_script=$workdir/maven-assert.sh
+jq -r '.setup' "$maven_case" > "$maven_setup_script"
+jq -r '.run' "$maven_case" > "$maven_run_script"
+jq -r '.assert' "$maven_case" > "$maven_assert_script"
+maven_case_bin=$workdir/maven-case-bin
+maven_events=$workdir/maven-events.log
+mkdir -p "$maven_case_bin"
+: > "$maven_events"
+cat > "$maven_case_bin/fake-jvm-client" <<'EOF'
+#!/bin/sh
+set -eu
+phase_root=${PWD%%/maven-clients/*}
+[ "$HOME" = "$phase_root/client-home" ]
+[ -d "$HOME" ] && [ -w "$HOME" ]
+tool=${0##*/}
+: > "$HOME/$tool.cache"
+printf '%s|%s|%s\n' "$tool" "$PWD" "$HOME" >> "$JVM_EVENT_LOG"
+case $tool in
+  mvn) output=target/classes/example/Example.class ;;
+  gradle) output=build/classes/java/main/example/Example.class ;;
+  sbt) output=target/scala-2.13/classes/example/Example.class ;;
+  *) exit 64 ;;
+esac
+mkdir -p "${output%/*}"
+: > "$output"
+EOF
+chmod 0555 "$maven_case_bin/fake-jvm-client"
+for client in mvn gradle sbt; do
+  ln -s fake-jvm-client "$maven_case_bin/$client"
+done
+for phase in cold warm; do
+  maven_phase_root=$workdir/maven-$phase
+  mkdir -p "$maven_phase_root"
+  (
+    cd "$maven_phase_root"
+    PATH="$maven_case_bin:$PATH" KATCH_URL=https://katch.invalid JVM_EVENT_LOG="$maven_events" \
+      /bin/sh "$maven_setup_script"
+    PATH="$maven_case_bin:$PATH" KATCH_URL=https://katch.invalid JVM_EVENT_LOG="$maven_events" \
+      /bin/sh "$maven_run_script"
+    /bin/sh "$maven_assert_script"
+  ) || fail "JVM $phase phase did not use a writable phase-local home and project root"
+  for client in mvn gradle sbt; do
+    [ -f "$maven_phase_root/client-home/$client.cache" ] ||
+      fail "JVM $phase phase did not give $client a writable phase-local cache"
+  done
+done
+[ "$(wc -l < "$maven_events" | tr -d ' ')" -eq 6 ] ||
+  fail "JVM case did not invoke all three tools in both isolated phases"
+
 npm_run=$(jq -r '.run' "$CASES/npm.yaml")
 printf '%s\n' "$npm_run" | grep -Fx '(cd npm && npm install --ignore-scripts --no-audit --no-update-notifier --registry="$registry" --replace-registry-host=always)' >/dev/null ||
   fail "npm mirror case does not disable audit and the npm update notifier"
@@ -328,30 +397,61 @@ if grep -R -n -E '(^|[;&|[:space:]])eval([;&|[:space:]]|$)' "$ROOT/e2e/package-m
   fail "harness uses eval"
 fi
 
-cat > "$workdir/allowed.log" <<'EOF'
-123 connect(3, {sa_family=AF_INET, sin_port=htons(8080), sin_addr=inet_addr("172.18.0.2")}, 16) = 0
-EOF
-"$ENTRYPOINT" --verify-capture "$workdir/allowed.log" 172.18.0.2
-
 capture_katch_ip=172.17.0.1
 capture_katch_port=38443
+cat > "$workdir/ipv4-katch.log" <<EOF
+123 connect(3, {sa_family=AF_INET, sin_addr=inet_addr("$capture_katch_ip"), sin_port=htons($capture_katch_port)}, 16) = 0
+EOF
+KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/ipv4-katch.log" "$capture_katch_ip" ||
+  fail "exact IPv4 Katch connection on KATCH_PORT was rejected"
+
+cat > "$workdir/ipv4-katch-probe.log" <<EOF
+124 connect(3, {sa_family=AF_INET, sin_port=htons(0), sin_addr=inet_addr("$capture_katch_ip")}, 16) = 0
+EOF
+KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/ipv4-katch-probe.log" "$capture_katch_ip" ||
+  fail "IPv4 JVM route probe to Katch port zero was rejected"
+
 cat > "$workdir/mapped-katch.log" <<EOF
-126 connect(3, {sa_family=AF_INET6, sin6_port=htons($capture_katch_port), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "::ffff:$capture_katch_ip", &sin6_addr), sin6_scope_id=0}, 28) = 0
+125 connect(3, {sa_family=AF_INET6, sin6_port=htons($capture_katch_port), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "::ffff:$capture_katch_ip", &sin6_addr), sin6_scope_id=0}, 28) = 0
 EOF
 KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/mapped-katch.log" "$capture_katch_ip" ||
   fail "exact IPv4-mapped Katch connection was rejected"
 
-cat > "$workdir/mapped-other-ip.log" <<EOF
-127 connect(3, {sa_family=AF_INET6, sin6_port=htons($capture_katch_port), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "::ffff:172.17.0.2", &sin6_addr), sin6_scope_id=0}, 28) = -1 ECONNREFUSED (Connection refused)
+cat > "$workdir/mapped-katch-probe.log" <<EOF
+126 connect(3, {sa_family=AF_INET6, sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "::ffff:$capture_katch_ip", &sin6_addr), sin6_port=htons(0), sin6_scope_id=0}, 28) = 0
 EOF
-if KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/mapped-other-ip.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
-  fail "IPv4-mapped connection to another IP was accepted"
+KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/mapped-katch-probe.log" "$capture_katch_ip" ||
+  fail "IPv4-mapped JVM route probe to Katch port zero was rejected"
+
+cat > "$workdir/loopback.log" <<'EOF'
+127 connect(3, {sa_family=AF_INET, sin_port=htons(49152), sin_addr=inet_addr("127.0.0.1")}, 16) = 0
+128 connect(3, {sa_family=AF_INET, sin_port=htons(49153), sin_addr=inet_addr("127.42.0.9")}, 16) = 0
+129 connect(3, {sa_family=AF_INET6, sin6_port=htons(49154), inet_pton(AF_INET6, "::1", &sin6_addr)}, 28) = 0
+130 connect(3, {sa_family=AF_INET6, inet_pton(AF_INET6, "::ffff:127.0.0.1", &sin6_addr), sin6_port=htons(49155)}, 28) = 0
+EOF
+KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/loopback.log" "$capture_katch_ip" ||
+  fail "loopback connection was rejected"
+
+cat > "$workdir/ipv4-other-port.log" <<EOF
+131 connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("$capture_katch_ip")}, 16) = -1 ECONNREFUSED (Connection refused)
+EOF
+if KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/ipv4-other-port.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "IPv4 Katch connection to another port was accepted"
 fi
-grep -F '::ffff:172.17.0.2' "$workdir/out" >/dev/null ||
-  fail "IPv4-mapped connection to another IP was not reported"
+grep -F 'sin_port=htons(443)' "$workdir/out" >/dev/null ||
+  fail "IPv4 Katch connection to another port was not reported"
+
+cat > "$workdir/katch-missing-port.log" <<EOF
+132 connect(3, {sa_family=AF_INET, sin_addr=inet_addr("$capture_katch_ip")}, 16) = -1 EINVAL (Invalid argument)
+EOF
+if KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/katch-missing-port.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "Katch connection without a parsed IPv4 port was accepted as a route probe"
+fi
+grep -F "$capture_katch_ip" "$workdir/out" >/dev/null ||
+  fail "Katch connection without a parsed IPv4 port was not reported"
 
 cat > "$workdir/mapped-other-port.log" <<EOF
-128 connect(3, {sa_family=AF_INET6, sin6_port=htons(443), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "::ffff:$capture_katch_ip", &sin6_addr), sin6_scope_id=0}, 28) = -1 ECONNREFUSED (Connection refused)
+133 connect(3, {sa_family=AF_INET6, sin6_port=htons(443), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "::ffff:$capture_katch_ip", &sin6_addr), sin6_scope_id=0}, 28) = -1 ECONNREFUSED (Connection refused)
 EOF
 if KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/mapped-other-port.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
   fail "IPv4-mapped Katch connection to another port was accepted"
@@ -359,18 +459,54 @@ fi
 grep -F 'sin6_port=htons(443)' "$workdir/out" >/dev/null ||
   fail "IPv4-mapped Katch connection to another port was not reported"
 
+cat > "$workdir/other-port-zero.log" <<'EOF'
+133 connect(3, {sa_family=AF_INET, sin_port=htons(0), sin_addr=inet_addr("192.0.2.10")}, 16) = 0
+134 connect(3, {sa_family=AF_INET6, sin6_port=htons(0), inet_pton(AF_INET6, "::ffff:192.0.2.11", &sin6_addr)}, 28) = 0
+EOF
+if KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/other-port-zero.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "port-zero route probe to a non-Katch destination was accepted"
+fi
+grep -F '192.0.2.10' "$workdir/out" >/dev/null ||
+  fail "IPv4 port-zero route probe to another IP was not reported"
+grep -F '::ffff:192.0.2.11' "$workdir/out" >/dev/null ||
+  fail "IPv4-mapped port-zero route probe to another IP was not reported"
+
+cat > "$workdir/mapped-other-ip.log" <<EOF
+135 connect(3, {sa_family=AF_INET6, sin6_port=htons($capture_katch_port), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "::ffff:172.17.0.2", &sin6_addr), sin6_scope_id=0}, 28) = -1 ECONNREFUSED (Connection refused)
+EOF
+if KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/mapped-other-ip.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "IPv4-mapped connection to another IP was accepted"
+fi
+grep -F '::ffff:172.17.0.2' "$workdir/out" >/dev/null ||
+  fail "IPv4-mapped connection to another IP was not reported"
+
 cat > "$workdir/ipv6-leak.log" <<EOF
-129 connect(3, {sa_family=AF_INET6, sin6_port=htons($capture_katch_port), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "2001:db8::1", &sin6_addr), sin6_scope_id=0}, 28) = -1 ENETUNREACH (Network unreachable)
+136 connect(3, {sa_family=AF_INET6, sin6_port=htons($capture_katch_port), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "2001:db8::1", &sin6_addr), sin6_scope_id=0}, 28) = -1 ENETUNREACH (Network unreachable)
 EOF
 if KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/ipv6-leak.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
   fail "ordinary IPv6 connection was accepted"
 fi
 grep -F '2001:db8::1' "$workdir/out" >/dev/null || fail "ordinary IPv6 connection was not reported"
 
-cat > "$workdir/dns-leak.log" <<'EOF'
-124 sendto(3, "query", 5, MSG_NOSIGNAL, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, 16) = -1 EACCES (Permission denied)
+cat > "$workdir/tcpdump-allowed.log" <<EOF
+12:00:00.000000 IP 192.0.2.20.50000 > $capture_katch_ip.$capture_katch_port: Flags [S]
+12:00:00.000001 IP 192.0.2.20.50001 > 127.0.0.1.49152: Flags [S]
 EOF
-if "$ENTRYPOINT" --verify-capture "$workdir/dns-leak.log" 172.18.0.2 >"$workdir/out" 2>&1; then
+KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/tcpdump-allowed.log" "$capture_katch_ip" ||
+  fail "deterministic tcpdump Katch or loopback record was rejected"
+cat > "$workdir/tcpdump-leak.log" <<'EOF'
+12:00:00.000002 IP 192.0.2.20.50002 > 198.51.100.10.443: Flags [S]
+EOF
+if KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/tcpdump-leak.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "deterministic tcpdump external connection was accepted"
+fi
+grep -F '198.51.100.10.443' "$workdir/out" >/dev/null ||
+  fail "deterministic tcpdump external connection was not reported"
+
+cat > "$workdir/dns-leak.log" <<'EOF'
+137 sendto(3, "query", 5, MSG_NOSIGNAL, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, 16) = -1 EACCES (Permission denied)
+EOF
+if KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/dns-leak.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
   fail "external DNS attempt was accepted"
 fi
 grep -q '8.8.8.8' "$workdir/out" || fail "external DNS attempt was not reported"
