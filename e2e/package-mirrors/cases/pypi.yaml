@@ -1,0 +1,8 @@
+{
+  "name": "pypi-family",
+  "image": "katch/package-client-tools:2026-09-16",
+  "setup": "set -eu\nmkdir -p pip uv poetry\npython -m venv pip/.venv\nuv venv uv/.venv\nprintf '%s\\n' '[tool.poetry]' 'name = \"katch-pypi-e2e\"' 'version = \"0.1.0\"' 'description = \"\"' 'authors = []' 'package-mode = false' '' '[tool.poetry.dependencies]' 'python = \">=3.11,<4.0\"' 'idna = \"3.10\"' > poetry/pyproject.toml",
+  "run": "set -eu\nindex=\"${KATCH_URL%/}/pypi.org/simple/\"\npip/.venv/bin/python -m pip install --disable-pip-version-check --no-cache-dir --index-url \"$index\" idna==3.10\nuv pip install --no-cache --python uv/.venv/bin/python --index-url \"$index\" idna==3.10\n(cd poetry\npoetry source remove katch >/dev/null 2>&1 || true\npoetry source add --priority=primary katch \"$index\"\npoetry install --no-interaction --no-root)\npip/.venv/bin/python -m pip --version\nuv --version\npoetry --version",
+  "assert": "set -eu\npip/.venv/bin/python -c 'import idna; assert idna.__version__ == \"3.10\"'\nuv/.venv/bin/python -c 'import idna; assert idna.__version__ == \"3.10\"'\n(cd poetry && poetry run python -c 'import idna; assert idna.__version__ == \"3.10\"')\nif grep -R -n -F 'https://pypi.org/' poetry/poetry.lock poetry/pyproject.toml 2>/dev/null; then\n  echo 'generated Poetry metadata leaked the public index' >&2\n  exit 1\nfi",
+  "required_upstreams": ["pypi.org", "files.pythonhosted.org"]
+}

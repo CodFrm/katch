@@ -1,0 +1,22 @@
+{
+  "meta": {"api-version": "1.1", "_last-serial": 42},
+  "name": "demo-pkg",
+  "files": [
+    {
+      "filename": "demo_pkg-1.0-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/ab/cd/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/demo_pkg-1.0-py3-none-any.whl#sha256=wheelhash",
+      "hashes": {"sha256": "wheelhash"},
+      "requires-python": ">=3.8",
+      "yanked": "broken build",
+      "dist-info-metadata": {"sha256": "metadatahash"}
+    },
+    {
+      "filename": "demo_pkg-1.0.tar.gz",
+      "url": "https://files.pythonhosted.org/packages/fe/dc/fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210/demo_pkg-1.0.tar.gz#sha256=sdisthash",
+      "hashes": {"sha256": "sdisthash"},
+      "requires-python": null,
+      "yanked": false,
+      "core-metadata": {"sha256": "corehash"}
+    }
+  ]
+}
