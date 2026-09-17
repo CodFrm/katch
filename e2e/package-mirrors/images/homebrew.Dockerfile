@@ -18,7 +18,7 @@ COPY e2e/package-mirrors/images/client-smoke.sh /usr/local/bin/katch-client-smok
 ENV KATCH_CLIENT_FLAVOR=homebrew KATCH_CLIENT_USER=linuxbrew
 
 RUN chmod 0555 /usr/local/bin/katch-client-entrypoint /usr/local/bin/katch-client-smoke \
-    && /usr/local/bin/katch-client-smoke
+    && runuser -u linuxbrew -- env HOME=/home/linuxbrew USER=linuxbrew LOGNAME=linuxbrew /usr/local/bin/katch-client-smoke
 
 USER root
 
