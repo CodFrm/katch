@@ -1,0 +1,23 @@
+{
+  "version": "3.0.0",
+  "resources": [
+    {
+      "@id": "https://api.nuget.org/v3/registration5-gz-semver2/",
+      "@type": "RegistrationsBaseUrl/3.6.0",
+      "comment": "registration"
+    },
+    {
+      "@id": "https://azuresearch-usnc.nuget.org/query?semVerLevel=2.0.0",
+      "@type": "SearchQueryService/3.5.0"
+    },
+    {
+      "@id": "https://api.nuget.org/v3-flatcontainer/",
+      "@type": "PackageBaseAddress/3.0.0"
+    },
+    {
+      "@id": "https://api.nuget.org/v3-index/repository-signatures/index.json",
+      "@type": "RepositorySignatures/5.0.0"
+    }
+  ],
+  "documentation": "https://learn.microsoft.com/nuget/api/service-index"
+}
