@@ -665,10 +665,10 @@ printf '%s\n' "$homebrew_assert" | grep -Fx "grep -Eqx 'jq [0-9]+([.][0-9]+)+([.
   fail "Homebrew does not require one exact native formula version line"
 printf '%s\n' "$homebrew_assert" | grep -Fx 'test -s "$(cat results/jq-cellar)/$jq_version/INSTALL_RECEIPT.json"' >/dev/null ||
   fail "Homebrew does not require a nonempty receipt for the listed Cellar version"
-printf '%s\n' "$homebrew_assert" | grep -F '.installed | length > 0' >/dev/null ||
-  fail "Homebrew no longer asserts the installed JSON entry"
+[ "$(printf '%s\n' "$homebrew_assert" | grep -Ec "^ruby -rjson -e '")" -eq 1 ] ||
+  fail "Homebrew does not assert installed metadata with Ruby stdlib JSON"
 homebrew_commands=$(jq -r '[.setup, .run, .assert] | join("\n")' "$homebrew_case")
-if printf '%s\n' "$homebrew_commands" | grep -E '(brew --prefix jq|[/]bin[/]jq|jq-version)'; then
+if printf '%s\n' "$homebrew_commands" | grep -E '(^|[;&|()][[:space:]]*)jq([[:space:]]|$)|(brew --prefix jq|[/]bin[/]jq|jq-version)'; then
   fail "Homebrew mirror case executes the installed Bottle binary"
 fi
 if printf '%s\n' "$homebrew_commands" | grep -i -E 'https?://([^/]*[.])?ghcr[.]io([/:]|$)'; then
@@ -714,9 +714,11 @@ EOF
 cat > "$homebrew_prefix/bin/jq" <<'EOF'
 #!/bin/sh
 set -eu
+: > "${JQ_EXECUTION_LOG:?JQ_EXECUTION_LOG is required}"
 printf '%s\n' 'installed Bottle binary was executed' >&2
 exit 86
 EOF
+homebrew_jq_execution_log=$workdir/homebrew-jq-execution.log
 homebrew_cellar=$workdir/homebrew-cellar
 mkdir -p "$homebrew_cellar/jq/1.8.2"
 printf '%s\n' '{"source":{"path":"/home/linuxbrew/.linuxbrew/Homebrew/Library/Taps/homebrew/homebrew-core/Formula/j/jq.rb"}}' > "$homebrew_cellar/jq/1.8.2/INSTALL_RECEIPT.json"
@@ -727,15 +729,30 @@ homebrew_phase_root=$(CDPATH= cd -- "$homebrew_phase_root" && pwd)
 for phase in cold warm; do
   (
     cd "$homebrew_phase_root/$phase"
-    PATH="$homebrew_case_bin:$PATH" KATCH_PHASE=$phase KATCH_URL=https://katch.test \
+    PATH="$homebrew_case_bin:$homebrew_prefix/bin:$PATH" KATCH_PHASE=$phase KATCH_URL=https://katch.test \
       HOMEBREW_EVENT_LOG="$homebrew_events" HOMEBREW_TEST_PREFIX="$homebrew_prefix" \
-      HOMEBREW_TEST_CELLAR="$homebrew_cellar" /bin/sh "$homebrew_setup_script"
-    PATH="$homebrew_case_bin:$PATH" KATCH_PHASE=$phase KATCH_URL=https://katch.test \
+      HOMEBREW_TEST_CELLAR="$homebrew_cellar" JQ_EXECUTION_LOG="$homebrew_jq_execution_log" \
+      /bin/sh "$homebrew_setup_script"
+    PATH="$homebrew_case_bin:$homebrew_prefix/bin:$PATH" KATCH_PHASE=$phase KATCH_URL=https://katch.test \
       HOMEBREW_EVENT_LOG="$homebrew_events" HOMEBREW_TEST_PREFIX="$homebrew_prefix" \
-      HOMEBREW_TEST_CELLAR="$homebrew_cellar" /bin/sh "$homebrew_run_script"
-    /bin/sh "$homebrew_assert_script"
+      HOMEBREW_TEST_CELLAR="$homebrew_cellar" JQ_EXECUTION_LOG="$homebrew_jq_execution_log" \
+      /bin/sh "$homebrew_run_script"
+    PATH="$homebrew_prefix/bin:$PATH" JQ_EXECUTION_LOG="$homebrew_jq_execution_log" \
+      /bin/sh "$homebrew_assert_script"
   ) || fail "Homebrew $phase phase does not satisfy the isolated runtime contract"
 done
+[ ! -e "$homebrew_jq_execution_log" ] || fail "Homebrew assertion executed the installed jq command"
+for invalid_homebrew_json in \
+  '{"formulae":[{"name":"not-jq","installed":[{"version":"1.8.2"}]}]}' \
+  '{"formulae":[{"name":"jq","installed":[]}]}' \
+  '{"formulae":[{"name":"jq","installed":[{"version":"1.8.1"}]}]}'; do
+  printf '%s\n' "$invalid_homebrew_json" > "$homebrew_phase_root/cold/results/jq.json"
+  if (cd "$homebrew_phase_root/cold" && PATH="$homebrew_prefix/bin:$PATH" \
+    JQ_EXECUTION_LOG="$homebrew_jq_execution_log" /bin/sh "$homebrew_assert_script"); then
+    fail "Homebrew assertion accepted invalid installed formula metadata: $invalid_homebrew_json"
+  fi
+done
+[ ! -e "$homebrew_jq_execution_log" ] || fail "Homebrew assertion executed the installed jq command"
 [ "$(grep -c '^git|' "$homebrew_events")" -eq 2 ] ||
   fail "Homebrew does not execute mirrored git ls-remote in both phases"
 grep -F "brew|cold|$homebrew_phase_root/cold/client-home|https://katch.test/formulae.brew.sh/api|https://katch.test/registry/ghcr.io|1|unset|install jq" "$homebrew_events" >/dev/null ||
