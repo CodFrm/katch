@@ -88,14 +88,8 @@ docker:
 	  --build-arg VERSION=$(VERSION) \
 	  --build-arg COMMIT=$(COMMIT) .
 
-PACKAGE_MIRROR_CLIENT_IMAGE ?= katch/package-client-tools:2026-09-16
-PACKAGE_MIRROR_HOMEBREW_IMAGE ?= katch/package-client-homebrew:4.6.20
-
 package-mirror-image:
-	docker build -f e2e/package-mirrors/images/client-tools.Dockerfile \
-	  -t $(PACKAGE_MIRROR_CLIENT_IMAGE) .
-	docker build -f e2e/package-mirrors/images/homebrew.Dockerfile \
-	  -t $(PACKAGE_MIRROR_HOMEBREW_IMAGE) .
+	./e2e/package-mirrors/images/build.sh
 
 test-package-mirror-harness:
 	./e2e/package-mirrors/tests/harness_test.sh

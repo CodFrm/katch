@@ -20,7 +20,7 @@ permissions:
   contents: read
 
 env:
-  CLIENT_IMAGE: katch/package-client-tools:2026-09-16
+  NODE_CLIENT_IMAGE: katch/package-client-node:22.20.0
 
 jobs:
   adapter-and-harness:
@@ -35,7 +35,7 @@ jobs:
         run: go test ./internal/proxy/packageprofile/builtin
       - name: Deterministic harness tests
         run: make test-package-mirror-harness
-      - name: Build pinned client tools
+      - name: Build and offline-smoke pinned client matrix
         run: make package-mirror-image
       - name: Verify rejected connects are recorded in a real namespace
         shell: bash
@@ -53,8 +53,10 @@ jobs:
             --add-host katch.invalid:host-gateway \
             --mount "type=bind,src=$workdir/case,dst=/case,readonly" \
             --mount "type=bind,src=$workdir/artifacts,dst=/artifacts" \
+            -e KATCH_URL=http://katch.invalid:8080 \
+            -e KATCH_BASE_URL=http://katch.invalid:8080 \
             -e KATCH_HOST=katch.invalid -e KATCH_PORT=8080 -e KATCH_ARTIFACTS=/artifacts \
-            "$CLIENT_IMAGE"; then
+            "$NODE_CLIENT_IMAGE"; then
             echo "external connect unexpectedly passed" >&2
             exit 1
           fi

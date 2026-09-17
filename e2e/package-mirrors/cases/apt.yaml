@@ -1,6 +1,6 @@
 {
   "name": "apt-update-install-signature",
-  "image": "debian:bookworm-slim",
+  "image": "katch/package-client-debian:12.11",
   "setup": "set -eu\nmirror=\"${KATCH_BASE_URL:-${KATCH_URL:-}}\"\ntest -n \"${mirror}\"\nrm -f /etc/apt/sources.list\nrm -f /etc/apt/sources.list.d/*\nprintf 'deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] %s/deb.debian.org/debian bookworm main\\n' \"${mirror%/}\" > /etc/apt/sources.list\nrm -rf /var/lib/apt/lists/*\n",
   "run": "set -eu\napt-get -o Acquire::Retries=0 update 2>&1 | tee /tmp/apt-update.log\ninrelease=\"$(find /var/lib/apt/lists -type f -name '*_InRelease' -print -quit)\"\ntest -n \"${inrelease}\"\ngpgv --keyring /usr/share/keyrings/debian-archive-keyring.gpg \"${inrelease}\" > /tmp/apt-signature.log 2>&1\napt-get -o Acquire::Retries=0 install -y --no-install-recommends hello\n",
   "assert": "set -eu\ndpkg-query -W -f='${Status}\\n' hello | grep -qx 'install ok installed'\ngrep -q 'Good signature' /tmp/apt-signature.log\n! grep -Eq 'NO_PUBKEY|BADSIG|EXPKEYSIG|The repository .* is not signed' /tmp/apt-update.log\n",

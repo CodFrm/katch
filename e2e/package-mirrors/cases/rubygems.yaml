@@ -1,6 +1,6 @@
 {
   "name": "rubygems-bundler",
-  "image": "katch/package-client-tools:2026-09-16",
+  "image": "katch/package-client-ruby:3.4.5",
   "setup": "set -eu\nmkdir -p gem-home bundler/vendor/bundle",
   "run": "set -eu\nmirror=\"${KATCH_URL%/}/rubygems.org/\"\nGEM_HOME=\"$PWD/gem-home\" GEM_PATH= gem install rake --version 13.2.1 --no-document --clear-sources --source \"$mirror\"\nprintf \"source '%s'\\ngem 'rake', '13.2.1'\\n\" \"$mirror\" > bundler/Gemfile\nBUNDLE_GEMFILE=\"$PWD/bundler/Gemfile\" BUNDLE_PATH=\"$PWD/bundler/vendor/bundle\" BUNDLE_DISABLE_SHARED_GEMS=true bundle install",
   "assert": "set -eu\nGEM_HOME=\"$PWD/gem-home\" GEM_PATH= \"$PWD/gem-home/bin/rake\" --version\nBUNDLE_GEMFILE=\"$PWD/bundler/Gemfile\" BUNDLE_PATH=\"$PWD/bundler/vendor/bundle\" BUNDLE_DISABLE_SHARED_GEMS=true bundle exec ruby -e 'abort unless Gem.loaded_specs.fetch(\"rake\").version.to_s == \"13.2.1\"'",

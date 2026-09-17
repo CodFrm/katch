@@ -111,9 +111,22 @@ ip6tables -A OUTPUT -o lo -j ACCEPT
 ip6tables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 ip6tables -A OUTPUT -j REJECT --reject-with icmp6-port-unreachable
 
+client_home=$(awk -F: -v user="$KATCH_CLIENT_USER" '
+  $1 == user {
+    print $6
+    exit
+  }
+' /etc/passwd)
+[ -n "$client_home" ] || {
+  printf '%s\n' "runtime user has no passwd entry: $KATCH_CLIENT_USER" >&2
+  exit 69
+}
+
 status=0
 strace -f -qq -e trace=connect,sendto -s 256 -o "$connect_log" \
-  runuser -u "$KATCH_CLIENT_USER" --preserve-environment -- /bin/sh -eu -c '
+  runuser -u "$KATCH_CLIENT_USER" --preserve-environment -- \
+  env HOME="$client_home" USER="$KATCH_CLIENT_USER" LOGNAME="$KATCH_CLIENT_USER" \
+  /bin/sh -eu -c '
     /bin/sh -eu /case/setup
     /bin/sh -eu /case/run
     /bin/sh -eu /case/assert

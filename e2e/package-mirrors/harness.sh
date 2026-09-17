@@ -129,6 +129,7 @@ run_phase() {
     --mount "type=bind,src=$scripts,dst=/case,readonly" \
     --mount "type=bind,src=$artifacts,dst=/artifacts" \
     --env "KATCH_URL=$KATCH_URL" \
+    --env "KATCH_BASE_URL=$KATCH_URL" \
     --env "KATCH_HOST=$KATCH_HOST" \
     --env "KATCH_PORT=$KATCH_PORT" \
     --env "KATCH_PHASE=$phase" \
