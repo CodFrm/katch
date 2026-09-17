@@ -31,14 +31,20 @@ type CacheObject struct {
 	// LastModified 上游成功响应里的 Last-Modified，原样保存、命中时原样回放。
 	LastModified string `gorm:"column:last_modified" json:"last_modified"`
 	// Safe response metadata is persisted explicitly; arbitrary origin headers never reach disk.
-	CacheControl         string `gorm:"column:cache_control" json:"cache_control"`
-	OriginDate           string `gorm:"column:origin_date" json:"origin_date"`
-	OriginAge            int64  `gorm:"column:origin_age" json:"origin_age"`
-	OriginExpires        string `gorm:"column:origin_expires" json:"origin_expires"`
-	Vary                 string `gorm:"column:vary" json:"vary"`
-	AcceptRanges         string `gorm:"column:accept_ranges" json:"accept_ranges"`
-	ContentDisposition   string `gorm:"column:content_disposition" json:"content_disposition"`
-	DockerContentDigest  string `gorm:"column:docker_content_digest" json:"docker_content_digest"`
+	CacheControl        string `gorm:"column:cache_control" json:"cache_control"`
+	OriginDate          string `gorm:"column:origin_date" json:"origin_date"`
+	OriginAge           int64  `gorm:"column:origin_age" json:"origin_age"`
+	OriginExpires       string `gorm:"column:origin_expires" json:"origin_expires"`
+	Vary                string `gorm:"column:vary" json:"vary"`
+	AcceptRanges        string `gorm:"column:accept_ranges" json:"accept_ranges"`
+	ContentDisposition  string `gorm:"column:content_disposition" json:"content_disposition"`
+	DockerContentDigest string `gorm:"column:docker_content_digest" json:"docker_content_digest"`
+	// Maven-compatible checksum headers are opaque origin metadata. They are replayed as-is
+	// on hits, never derived from or used to validate the cached body.
+	XChecksumMD5         string `gorm:"column:x_checksum_md5" json:"x_checksum_md5"`
+	XChecksumSHA1        string `gorm:"column:x_checksum_sha1" json:"x_checksum_sha1"`
+	XChecksumSHA256      string `gorm:"column:x_checksum_sha256" json:"x_checksum_sha256"`
+	XChecksumSHA512      string `gorm:"column:x_checksum_sha512" json:"x_checksum_sha512"`
 	StoredAt             int64  `gorm:"column:stored_at" json:"stored_at"`
 	RequiresRevalidation bool   `gorm:"column:requires_revalidation" json:"requires_revalidation"`
 	// Immutable 内容寻址的对象：内容永不改写，长期缓存，只由 LRU 淘汰（决策 7）。

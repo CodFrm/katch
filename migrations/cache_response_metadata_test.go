@@ -54,8 +54,19 @@ func TestCacheResponseMetadataMigration(t *testing.T) {
 		convey.So(got.RequiresRevalidation, convey.ShouldBeFalse)
 	})
 
-	convey.Convey("response metadata migration is appended after package profiles", t, func() {
+	convey.Convey("response metadata migration remains after package profiles", t, func() {
 		list := migrationList()
-		convey.So(list[len(list)-1].ID, convey.ShouldEqual, cacheResponseMetadata().ID)
+		packageProfileIndex := -1
+		responseMetadataIndex := -1
+		for i, migration := range list {
+			switch migration.ID {
+			case packageProfile().ID:
+				packageProfileIndex = i
+			case cacheResponseMetadata().ID:
+				responseMetadataIndex = i
+			}
+		}
+		convey.So(packageProfileIndex, convey.ShouldBeGreaterThanOrEqualTo, 0)
+		convey.So(responseMetadataIndex, convey.ShouldBeGreaterThan, packageProfileIndex)
 	})
 }

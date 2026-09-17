@@ -116,6 +116,43 @@ func TestGet_StaticHitReplaysUpstreamValidators(t *testing.T) {
 	})
 }
 
+// TestGet_MavenHitReplaysChecksumHeaders covers Maven clients that use checksum response
+// metadata instead of fetching checksum sidecars. A cache hit must expose the exact values
+// seen on the cold response, or a warm dependency resolution returns to the origin for them.
+func TestGet_MavenHitReplaysChecksumHeaders(t *testing.T) {
+	convey.Convey("Maven checksum headers survive a cache miss followed by a hit", t, func() {
+		checksums := map[string]string{
+			"X-Checksum-MD5":    "42F7E9AC3C79F7BA5B3A2E81D2D52A92",
+			"X-Checksum-SHA1":   "8f4e3c42b6d9c76e8797c60d345320ef4cf54f39",
+			"X-Checksum-SHA256": "8EA44E1F012D62EEB020CD8BE16F9C602EE7AC28E46026D136A29AB80D34F4D2",
+			"X-Checksum-SHA512": "1a2b3c4d5e6f77889900aabbccddeeff00112233445566778899aabbccddeeff" +
+				"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		}
+		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/java-archive")
+			for name, value := range checksums {
+				w.Header().Set(name, value)
+			}
+			_, _ = io.WriteString(w, "maven artifact")
+		})
+		svc, _, _ := setupSvc(t, o, staticUpstream("repo.maven.apache.org"), Options{})
+		const path = "/maven2/org/example/demo/1.0/demo-1.0.jar"
+
+		_, missMeta := pullWith(t, svc, target("repo.maven.apache.org", path))
+		convey.So(missMeta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusMiss)
+		for name, value := range checksums {
+			convey.So(missMeta.Header.Get(name), convey.ShouldEqual, value)
+		}
+
+		_, hitMeta := pullWith(t, svc, target("repo.maven.apache.org", path))
+		convey.So(hitMeta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
+		for name, value := range checksums {
+			convey.So(hitMeta.Header.Get(name), convey.ShouldEqual, value)
+		}
+		convey.So(o.hits.Load(), convey.ShouldEqual, 1)
+	})
+}
+
 // TestGet_StaticNotModifiedKeepsValidators 本地 304 复用 200 的 validator 与归因，
 // 但摘掉实体相关的字段。
 //

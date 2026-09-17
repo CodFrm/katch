@@ -432,15 +432,25 @@ func TestGet_OriginFailureIsNotCached(t *testing.T) {
 // 标识」，而我们的命中却回放它，等于替上游背书了一份它从未声明过的事实。
 func TestGet_RewriteDropsStaleValidators(t *testing.T) {
 	convey.Convey("重写内容时上一份的 validator 不能留下", t, func() {
+		checksumHeaders := map[string]string{
+			"X-Checksum-MD5":    "42f7e9ac3c79f7ba5b3a2e81d2d52a92",
+			"X-Checksum-SHA1":   "8f4e3c42b6d9c76e8797c60d345320ef4cf54f39",
+			"X-Checksum-SHA256": "8ea44e1f012d62eeb020cd8be16f9c602ee7ac28e46026d136a29ab80d34f4d2",
+			"X-Checksum-SHA512": "1a2b3c4d5e6f77889900aabbccddeeff00112233445566778899aabbccddeeff" +
+				"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		}
 		var served atomic.Int64
 		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
 			if served.Add(1) == 1 {
 				w.Header().Set("Etag", `"v1"`)
 				w.Header().Set("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+				for name, value := range checksumHeaders {
+					w.Header().Set(name, value)
+				}
 				_, _ = io.WriteString(w, "v1")
 				return
 			}
-			// 第二份没有 validator：旧的必须被清掉。
+			// 第二份没有 validator 或 checksum：旧的必须被清掉。
 			_, _ = io.WriteString(w, "v2")
 		})
 		svc, repo, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
@@ -454,6 +464,9 @@ func TestGet_RewriteDropsStaleValidators(t *testing.T) {
 		convey.So(r.Close(), convey.ShouldBeNil)
 		_, firstHit := pullWith(t, svc, target("deb.debian.org", key))
 		convey.So(firstHit.Header.Get("Etag"), convey.ShouldEqual, `"v1"`)
+		for name, value := range checksumHeaders {
+			convey.So(firstHit.Header.Get(name), convey.ShouldEqual, value)
+		}
 		first := repo.byKey(key)
 		convey.So(first, convey.ShouldNotBeNil)
 		convey.So(first.ETag, convey.ShouldEqual, `"v1"`)
@@ -475,6 +488,9 @@ func TestGet_RewriteDropsStaleValidators(t *testing.T) {
 		convey.So(secondHit.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
 		convey.So(secondHit.Header.Get("Etag"), convey.ShouldBeEmpty)
 		convey.So(secondHit.Header.Get("Last-Modified"), convey.ShouldBeEmpty)
+		for name := range checksumHeaders {
+			convey.So(secondHit.Header.Get(name), convey.ShouldBeEmpty)
+		}
 		// 库里也不能留着上一份的校验值。
 		rewritten := repo.byKey(key)
 		convey.So(rewritten.ETag, convey.ShouldBeEmpty)
