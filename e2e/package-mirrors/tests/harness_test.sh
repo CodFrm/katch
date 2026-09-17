@@ -305,14 +305,22 @@ printf '%s\n' "$maven_setup" | grep -Fx 'root=$PWD/maven-clients' >/dev/null ||
   fail "JVM setup does not use the phase workdir for client projects"
 printf '%s\n' "$maven_setup" | grep -Fx 'mkdir -p "$PWD/client-home"' >/dev/null ||
   fail "JVM setup does not create a writable phase-local client home"
+printf '%s\n' "$maven_setup" | grep -Fx 'mkdir -p "$PWD/client-tmp"' >/dev/null ||
+  fail "JVM setup does not create a writable phase-local client temp directory"
 printf '%s\n' "$maven_run" | grep -Fx 'export HOME="$PWD/client-home"' >/dev/null ||
   fail "JVM run does not export the phase-local client home before invoking tools"
+printf '%s\n' "$maven_run" | grep -Fx 'client_tmp=$PWD/client-tmp' >/dev/null ||
+  fail "JVM run does not preserve the phase-local client temp path before changing directories"
 printf '%s\n' "$maven_run" | grep -Fx 'root=$PWD/maven-clients' >/dev/null ||
   fail "JVM run does not use the phase workdir for client projects"
+printf '%s\n' "$maven_run" | grep -Fx '(cd "$root/sbt" && sbt -batch -Djava.io.tmpdir="$client_tmp" -Dsbt.override.build.repos=true -Dsbt.repository.config="$root/sbt/repositories" compile)' >/dev/null ||
+  fail "sbt does not pass the writable phase-local temp directory as a JVM property before the compile command"
 printf '%s\n' "$maven_assert" | grep -Fx 'root=$PWD/maven-clients' >/dev/null ||
   fail "JVM assertions do not use the phase workdir for client projects"
-if jq -r '[.setup, .run, .assert] | join("\n")' "$maven_case" | grep -E '(/tmp/maven-clients|allowInsecureProtocol|trustAll|disable[^[:space:]]*(TLS|SSL|Certificate)|-D[^[:space:]]*(insecure|trustStore))'; then
-  fail "JVM case uses shared temp state or insecure JVM transport flags"
+printf '%s\n' "$maven_assert" | grep -Fx 'test -d "$PWD/client-tmp" && test -w "$PWD/client-tmp"' >/dev/null ||
+  fail "JVM assertions do not verify the phase-local client temp directory remains writable"
+if jq -r '[.setup, .run, .assert] | join("\n")' "$maven_case" | grep -E '(^|[[:space:];|&])chmod([[:space:]]|$)|(^|[[:space:]="'"'"'])/tmp(/|[[:space:]="'"'"']|$)|allowInsecureProtocol|trustAll|disable[^[:space:]]*(TLS|SSL|Certificate)|-D[^[:space:]]*(insecure|trustStore)'; then
+  fail "JVM case uses root temp state, broad permission changes, or insecure JVM transport flags"
 fi
 
 maven_setup_script=$workdir/maven-setup.sh
@@ -332,6 +340,15 @@ phase_root=${PWD%%/maven-clients/*}
 [ "$HOME" = "$phase_root/client-home" ]
 [ -d "$HOME" ] && [ -w "$HOME" ]
 tool=${0##*/}
+if [ "$tool" = sbt ]; then
+  expected_tmp=$phase_root/client-tmp
+  [ -d "$expected_tmp" ] && [ -w "$expected_tmp" ]
+  found_tmp=false
+  for argument in "$@"; do
+    [ "$argument" = "-Djava.io.tmpdir=$expected_tmp" ] && found_tmp=true
+  done
+  [ "$found_tmp" = true ]
+fi
 : > "$HOME/$tool.cache"
 printf '%s|%s|%s\n' "$tool" "$PWD" "$HOME" >> "$JVM_EVENT_LOG"
 case $tool in
