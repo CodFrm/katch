@@ -179,6 +179,14 @@ printf '%s\n' 'Newtonsoft.Json' > "$nuget_assert_root/search.json"
 cat > "$nuget_bin/dotnet" <<'EOF'
 #!/bin/sh
 set -eu
+[ "${DOTNET_CLI_TELEMETRY_OPTOUT:-}" = 1 ] || {
+  printf '%s\n' 'dotnet invocation lacks DOTNET_CLI_TELEMETRY_OPTOUT=1' >&2
+  exit 65
+}
+[ "${NUGET_CERT_REVOCATION_MODE:-}" = offline ] || {
+  printf '%s\n' 'dotnet invocation lacks NUGET_CERT_REVOCATION_MODE=offline' >&2
+  exit 65
+}
 case "$*" in
   'run --project app/app.csproj --no-restore')
     printf '%s\n' run >> "$NUGET_EVENT_LOG"
@@ -195,11 +203,13 @@ chmod 0555 "$nuget_bin/dotnet"
 run_nuget_assert() {
   shutdown_status=$1
   : > "$nuget_events"
-  (cd "$nuget_assert_root" && env PATH="$nuget_bin:$PATH" NUGET_EVENT_LOG="$nuget_events" \
+  (cd "$nuget_assert_root" && env -u DOTNET_CLI_TELEMETRY_OPTOUT -u NUGET_CERT_REVOCATION_MODE \
+    PATH="$nuget_bin:$PATH" NUGET_EVENT_LOG="$nuget_events" \
     NUGET_SHUTDOWN_STATUS="$shutdown_status" /bin/sh "$nuget_assert_script")
 }
 
-run_nuget_assert 0 >"$workdir/out" 2>&1 || fail "NuGet assertions or build-server shutdown failed"
+run_nuget_assert 0 >"$workdir/out" 2>&1 ||
+  fail "NuGet assertions or build-server shutdown failed: $(cat "$workdir/out")"
 [ "$(cat "$nuget_events")" = "$(printf 'run\nshutdown\n')" ] ||
   fail "NuGet case does not shut down build servers after the final program assertion"
 if run_nuget_assert 42 >"$workdir/out" 2>&1; then
