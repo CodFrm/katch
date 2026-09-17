@@ -449,6 +449,36 @@ case ${0##*/} in
   update-ca-certificates|update-ca-trust)
     printf '%s\n' "${0##*/} $*" >> "$ENTRYPOINT_EVENT_LOG"
     ;;
+  keytool)
+    printf '%s\n' "keytool $*" >> "$ENTRYPOINT_EVENT_LOG"
+    operation=
+    ca_file=
+    alias=
+    while [ "$#" -gt 0 ]; do
+      case $1 in
+        -list) operation=list; shift ;;
+        -importcert) operation=import; shift ;;
+        -file) ca_file=$2; shift 2 ;;
+        -alias) alias=$2; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    case $operation in
+      list)
+        [ -f "$KEYTOOL_ALIAS_STATE" ] && [ "$(cat "$KEYTOOL_ALIAS_STATE")" = "$alias" ]
+        ;;
+      import)
+        [ "${KEYTOOL_IMPORT_FAIL:-0}" -eq 0 ] || {
+          printf '%s\n' 'fake keytool import failure' >&2
+          exit 42
+        }
+        [ -n "$ca_file" ] && [ -n "$alias" ] || exit 64
+        cat "$ca_file" > "$KEYTOOL_CERT_LOG"
+        printf '%s\n' "$alias" > "$KEYTOOL_ALIAS_STATE"
+        ;;
+      *) exit 64 ;;
+    esac
+    ;;
   strace)
     capture=
     while [ "$#" -gt 0 ]; do
@@ -481,12 +511,16 @@ chmod 0555 "$fake_bin/fake-command"
 for command in awk id install iptables ip6tables iptables-save iptables-restore ip6tables-save ip6tables-restore strace runuser tee; do
   ln -s fake-command "$fake_bin/$command"
 done
+for command in cat cksum env mkdir; do
+  ln -s "$(command -v "$command")" "$fake_bin/$command"
+done
 
 run_entrypoint() {
   artifacts=$1
   shift
-  env PATH="$fake_bin:$PATH" RUNUSER_LOG="$workdir/runuser.log" ENTRYPOINT_EVENT_LOG="$workdir/entrypoint-events.log" \
-    HOST_MAPPING_STATE="$workdir/host-mapping.state" \
+  env PATH="$fake_bin" RUNUSER_LOG="$workdir/runuser.log" ENTRYPOINT_EVENT_LOG="$workdir/entrypoint-events.log" \
+    HOST_MAPPING_STATE="$workdir/host-mapping.state" KEYTOOL_ALIAS_STATE="$workdir/keytool-alias.state" \
+    KEYTOOL_CERT_LOG="$workdir/keytool-cert.log" \
     KATCH_HOST=katch.invalid KATCH_PORT=8080 KATCH_ARTIFACTS="$artifacts" \
     "$@" "$ENTRYPOINT"
 }
@@ -535,11 +569,55 @@ grep -Fx "install -m 0644 $trusted_ca /usr/local/share/ca-certificates/katch-tes
   fail "entrypoint did not install the trusted CA into the update-ca-certificates anchor directory"
 grep -Fx 'update-ca-certificates ' "$workdir/entrypoint-events.log" >/dev/null ||
   fail "entrypoint did not refresh Debian/Ubuntu/Alpine system trust"
+if grep -F 'keytool ' "$workdir/entrypoint-events.log"; then
+  fail "entrypoint invoked Java trust tooling when keytool was absent"
+fi
 ca_update_line=$(grep -n -F 'update-ca-certificates ' "$workdir/entrypoint-events.log" | cut -d: -f1)
 firewall_line=$(grep -n -m1 -E '^iptables (-F|-P|-A)' "$workdir/entrypoint-events.log" | cut -d: -f1)
 user_drop_line=$(grep -n -F 'runuser -u client ' "$workdir/entrypoint-events.log" | cut -d: -f1)
 [ "$ca_update_line" -lt "$firewall_line" ] || fail "entrypoint installs the trusted CA after firewall setup"
 [ "$ca_update_line" -lt "$user_drop_line" ] || fail "entrypoint installs the trusted CA after the user drop"
+
+ln -s fake-command "$fake_bin/keytool"
+rm -f "$workdir/keytool-alias.state" "$workdir/keytool-cert.log"
+: > "$workdir/runuser.log"
+: > "$workdir/entrypoint-events.log"
+run_entrypoint "$workdir/java-ca-artifacts" env KATCH_CLIENT_CA_CERT="$trusted_ca"
+expected_alias=katch-test-ca-$(cksum < "$trusted_ca" | awk '{ print $1 "-" $2 }')
+grep -Fx "keytool -cacerts -storepass changeit -list -alias $expected_alias" "$workdir/entrypoint-events.log" >/dev/null ||
+  fail "entrypoint did not inspect the deterministic Java cacerts alias"
+grep -Fx "keytool -cacerts -storepass changeit -noprompt -trustcacerts -importcert -alias $expected_alias -file $trusted_ca" "$workdir/entrypoint-events.log" >/dev/null ||
+  fail "entrypoint did not import the trusted CA with native Java trust verification"
+cmp -s "$trusted_ca" "$workdir/keytool-cert.log" ||
+  fail "entrypoint did not pass the exact trusted CA certificate to keytool"
+ca_update_line=$(grep -n -F 'update-ca-certificates ' "$workdir/entrypoint-events.log" | cut -d: -f1)
+java_import_line=$(grep -n -F 'keytool -cacerts -storepass changeit -noprompt -trustcacerts -importcert ' "$workdir/entrypoint-events.log" | cut -d: -f1)
+firewall_line=$(grep -n -m1 -E '^iptables (-F|-P|-A)' "$workdir/entrypoint-events.log" | cut -d: -f1)
+user_drop_line=$(grep -n -F 'runuser -u client ' "$workdir/entrypoint-events.log" | cut -d: -f1)
+[ "$ca_update_line" -lt "$java_import_line" ] || fail "entrypoint imports Java trust before system trust"
+[ "$java_import_line" -lt "$firewall_line" ] || fail "entrypoint imports Java trust after firewall setup"
+[ "$java_import_line" -lt "$user_drop_line" ] || fail "entrypoint imports Java trust after the client started"
+
+: > "$workdir/entrypoint-events.log"
+run_entrypoint "$workdir/java-ca-rerun-artifacts" env KATCH_CLIENT_CA_CERT="$trusted_ca"
+[ "$(grep -Fc "keytool -cacerts -storepass changeit -list -alias $expected_alias" "$workdir/entrypoint-events.log")" -eq 1 ] ||
+  fail "entrypoint did not check the existing Java cacerts alias on rerun"
+if grep -F 'keytool -cacerts -storepass changeit -noprompt -trustcacerts -importcert ' "$workdir/entrypoint-events.log"; then
+  fail "entrypoint re-imported an existing Java cacerts alias"
+fi
+
+rm -f "$workdir/keytool-alias.state"
+: > "$workdir/runuser.log"
+: > "$workdir/entrypoint-events.log"
+if run_entrypoint "$workdir/java-ca-failure-artifacts" env KATCH_CLIENT_CA_CERT="$trusted_ca" KEYTOOL_IMPORT_FAIL=1 >"$workdir/out" 2>&1; then
+  fail "entrypoint continued when Java cacerts import failed"
+fi
+grep -F 'failed to install trusted client CA in Java cacerts' "$workdir/out" >/dev/null ||
+  fail "entrypoint did not report the Java cacerts import failure"
+if grep -E '^(iptables |ip6tables |runuser )' "$workdir/entrypoint-events.log"; then
+  fail "entrypoint configured the firewall or started the client after Java cacerts import failure"
+fi
+rm "$fake_bin/keytool"
 rm "$fake_bin/update-ca-certificates"
 
 ln -s fake-command "$fake_bin/update-ca-trust"

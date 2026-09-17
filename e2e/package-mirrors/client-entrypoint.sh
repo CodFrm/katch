@@ -105,6 +105,35 @@ fi
   exit 77
 }
 
+install_java_trusted_ca() {
+  ca_cert=$1
+  command -v keytool >/dev/null 2>&1 || return 0
+  command -v cksum >/dev/null 2>&1 || {
+    printf '%s\n' "cannot derive Java cacerts alias: cksum is unavailable" >&2
+    return 69
+  }
+
+  ca_identity=$(cksum < "$ca_cert") || {
+    printf '%s\n' "cannot derive Java cacerts alias from trusted client CA" >&2
+    return 69
+  }
+  set -- $ca_identity
+  [ "$#" -eq 2 ] || {
+    printf '%s\n' "cannot derive Java cacerts alias from trusted client CA" >&2
+    return 69
+  }
+  ca_alias=katch-test-ca-$1-$2
+
+  if keytool -cacerts -storepass changeit -list -alias "$ca_alias" >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! keytool -cacerts -storepass changeit -noprompt -trustcacerts \
+    -importcert -alias "$ca_alias" -file "$ca_cert"; then
+    printf '%s\n' "failed to install trusted client CA in Java cacerts" >&2
+    return 69
+  fi
+}
+
 install_trusted_ca() {
   ca_cert=${KATCH_CLIENT_CA_CERT:-}
   [ -n "$ca_cert" ] || return 0
@@ -116,16 +145,15 @@ install_trusted_ca() {
   if command -v update-ca-certificates >/dev/null 2>&1; then
     install -m 0644 "$ca_cert" /usr/local/share/ca-certificates/katch-test-ca.crt
     update-ca-certificates
-    return
-  fi
-  if command -v update-ca-trust >/dev/null 2>&1; then
+  elif command -v update-ca-trust >/dev/null 2>&1; then
     install -m 0644 "$ca_cert" /etc/pki/ca-trust/source/anchors/katch-test-ca.crt
     update-ca-trust extract
-    return
+  else
+    printf '%s\n' "no supported system CA trust mechanism is available" >&2
+    return 69
   fi
 
-  printf '%s\n' "no supported system CA trust mechanism is available" >&2
-  return 69
+  install_java_trusted_ca "$ca_cert"
 }
 
 install_trusted_ca
