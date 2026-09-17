@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"strings"
 
+	"golang.org/x/mod/semver"
+
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
 	"github.com/CodFrm/katch/internal/proxy/packageprofile"
 )
@@ -156,11 +158,29 @@ func cargoSparseMetadataPath(path string) bool {
 
 func cargoCratePath(path string) bool {
 	parts := cargoPathParts(path)
-	if len(parts) != 3 || parts[0] != "crates" || !cargoName(parts[1]) {
+	if len(parts) < 3 || parts[0] != "crates" || !cargoName(parts[1]) {
+		return false
+	}
+	if len(parts) == 4 {
+		return parts[3] == "download" && cargoVersion(parts[2])
+	}
+	if len(parts) != 3 {
 		return false
 	}
 	prefix := parts[1] + "-"
-	return strings.HasPrefix(parts[2], prefix) && strings.HasSuffix(parts[2], ".crate") && len(parts[2]) > len(prefix)+len(".crate")
+	if !strings.HasPrefix(parts[2], prefix) || !strings.HasSuffix(parts[2], ".crate") {
+		return false
+	}
+	version := strings.TrimSuffix(strings.TrimPrefix(parts[2], prefix), ".crate")
+	return cargoVersion(version)
+}
+
+func cargoVersion(version string) bool {
+	core := version
+	if suffix := strings.IndexAny(core, "-+"); suffix >= 0 {
+		core = core[:suffix]
+	}
+	return strings.Count(core, ".") == 2 && semver.IsValid("v"+version)
 }
 
 func cargoPathParts(path string) []string {
