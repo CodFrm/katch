@@ -657,8 +657,18 @@ printf '%s\n' "$homebrew_run" | grep -F 'require "api/internal"' >/dev/null ||
   fail "Homebrew cold phase does not load the native internal API"
 printf '%s\n' "$homebrew_run" | grep -F 'Homebrew::API.fetch_json_api_file(Homebrew::API::Internal.formula_endpoint)' >/dev/null ||
   fail "Homebrew cold phase does not fetch the system-specific formula JWS through the native API helper"
-printf '%s\n' "$homebrew_run" | grep -F 'JSON.generate({"name" => "jq", "version" => version})' >/dev/null ||
-  fail "Homebrew cold phase does not emit compact jq API evidence"
+printf '%s\n' "$homebrew_run" | grep -F 'entry = data.fetch("formulae").fetch("jq")' >/dev/null ||
+  fail "Homebrew cold phase does not select jq from the internal formula Hash"
+printf '%s\n' "$homebrew_run" | grep -F 'entry.is_a?(Hash)' >/dev/null ||
+  fail "Homebrew cold phase does not require jq formula metadata to be a Hash"
+printf '%s\n' "$homebrew_run" | grep -F 'entry.fetch("stable_version")' >/dev/null ||
+  fail "Homebrew cold phase does not extract stable_version"
+printf '%s\n' "$homebrew_run" | grep -F 'entry.fetch("stable_checksum")' >/dev/null ||
+  fail "Homebrew cold phase does not extract stable_checksum"
+printf '%s\n' "$homebrew_run" | grep -F 'entry.fetch("bottle_checksum")' >/dev/null ||
+  fail "Homebrew cold phase does not extract bottle_checksum"
+printf '%s\n' "$homebrew_run" | grep -F 'JSON.generate({"name" => "jq", "version" => version, "source_sha256" => source_sha256, "bottle_sha256" => bottle_sha256})' >/dev/null ||
+  fail "Homebrew cold phase does not emit compact jq version and checksum evidence"
 printf '%s\n' "$homebrew_run" | grep -F '> results/api-jq.json' >/dev/null ||
   fail "Homebrew cold phase does not preserve formula API evidence"
 [ "$(printf '%s\n' "$homebrew_run" | grep -Fxc 'export HOMEBREW_NO_INSTALL_FROM_API=1')" -eq 1 ] ||
@@ -737,8 +747,20 @@ if [ "$#" -eq 4 ] && [ "$1" = ruby ] && [ "$2" = -rjson ] && [ "$3" = -e ]; then
   script=$4
   case $script in *'require "api/internal"'*) ;; *) exit 66 ;; esac
   case $script in *'Homebrew::API.fetch_json_api_file(Homebrew::API::Internal.formula_endpoint)'*) ;; *) exit 66 ;; esac
-  case $script in *'data.fetch("formulae")'*'formulae.fetch("jq")'*'JSON.generate({"name" => "jq", "version" => version})'*) ;; *) exit 66 ;; esac
-  printf '%s\n' '{"name":"jq","version":"10.0.0"}'
+  case $script in *'entry = data.fetch("formulae").fetch("jq")'*'entry.is_a?(Hash)'*) ;; *) exit 66 ;; esac
+  case $script in *'entry.fetch("stable_version")'*'entry.fetch("stable_checksum")'*'entry.fetch("bottle_checksum")'*) ;; *) exit 66 ;; esac
+  case $script in *'JSON.generate({"name" => "jq", "version" => version, "source_sha256" => source_sha256, "bottle_sha256" => bottle_sha256})'*) ;; *) exit 66 ;; esac
+  "$HOMEBREW_TEST_JQ" -ce '
+    .formulae as $formulae |
+    select(($formulae | type) == "object") |
+    $formulae.jq as $entry |
+    select(($entry | type) == "object") |
+    $entry.stable_version as $version |
+    $entry.stable_checksum as $source_sha256 |
+    $entry.bottle_checksum as $bottle_sha256 |
+    select([$version, $source_sha256, $bottle_sha256] | all(type == "string" and length > 0)) |
+    {name: "jq", version: $version, source_sha256: $source_sha256, bottle_sha256: $bottle_sha256}
+  ' "${HOMEBREW_TEST_FORMULA_API_JSON:?HOMEBREW_TEST_FORMULA_API_JSON is required}"
   exit 0
 fi
 case "$*" in
@@ -773,6 +795,10 @@ set -eu
 printf '%s\n' 'PATH Ruby was executed' >&2
 exit 87
 EOF
+homebrew_formula_api_fixture=$workdir/homebrew-formula-api.json
+cat > "$homebrew_formula_api_fixture" <<'EOF'
+{"formulae":{"jq":{"stable_version":"10.0.0","stable_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bottle_checksum":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}
+EOF
 homebrew_jq_execution_log=$workdir/homebrew-jq-execution.log
 homebrew_path_ruby_execution_log=$workdir/homebrew-path-ruby-execution.log
 homebrew_portable_ruby_execution_log=$workdir/homebrew-portable-ruby-execution.log
@@ -793,12 +819,14 @@ file=$4
 printf '%s\n' "$file" >> "${PORTABLE_RUBY_EXECUTION_LOG:?PORTABLE_RUBY_EXECUTION_LOG is required}"
 case $file in
   results/api-jq.json)
-    case $script in *'data.keys.sort == ["name", "version"]'*'data["name"] == "jq"'*'version.empty?'*) ;; *) exit 88 ;; esac
+    case $script in *'data.keys.sort == ["bottle_sha256", "name", "source_sha256", "version"]'*'data["name"] == "jq"'*'version.empty?'*'\A[0-9a-f]{64}\z'*) ;; *) exit 88 ;; esac
     "$HOMEBREW_TEST_JQ" -e '
       type == "object" and
-      (keys == ["name", "version"]) and
+      (keys == ["bottle_sha256", "name", "source_sha256", "version"]) and
       .name == "jq" and
-      (.version | type == "string" and length > 0 and (contains("\n") | not))
+      (.version | type == "string" and length > 0 and (contains("\n") | not)) and
+      (.source_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+      (.bottle_sha256 | type == "string" and test("^[0-9a-f]{64}$"))
     ' "$file" >/dev/null
     ;;
   results/jq.json)
@@ -837,7 +865,7 @@ for phase in cold warm; do
     PATH="$homebrew_case_bin:$homebrew_prefix/bin:$PATH" KATCH_PHASE=$phase KATCH_URL=https://katch.test \
       HOMEBREW_EVENT_LOG="$homebrew_events" HOMEBREW_TEST_PREFIX="$homebrew_prefix" \
       HOMEBREW_TEST_CELLAR="$homebrew_cellar" HOMEBREW_TEST_REPOSITORY="$homebrew_repository" \
-      HOMEBREW_TEST_JQ="$homebrew_system_jq" \
+      HOMEBREW_TEST_JQ="$homebrew_system_jq" HOMEBREW_TEST_FORMULA_API_JSON="$homebrew_formula_api_fixture" \
       JQ_EXECUTION_LOG="$homebrew_jq_execution_log" PATH_RUBY_EXECUTION_LOG="$homebrew_path_ruby_execution_log" \
       /bin/sh "$homebrew_run_script"
     PATH="$homebrew_case_bin:$homebrew_prefix/bin:$PATH" KATCH_PHASE=$phase HOMEBREW_TEST_REPOSITORY="$homebrew_repository" \
@@ -853,6 +881,35 @@ done
 [ ! -e "$homebrew_phase_root/warm/results/core-head" ] || fail "Homebrew warm phase queried mutable Tap Git state"
 [ ! -e "$homebrew_jq_execution_log" ] || fail "Homebrew assertion executed the installed jq command"
 [ ! -e "$homebrew_path_ruby_execution_log" ] || fail "Homebrew assertion executed Ruby from PATH"
+
+homebrew_invalid_formula_events=$workdir/homebrew-invalid-formula-events.log
+for invalid_homebrew_formula_api in \
+  'not-json' \
+  '{}' \
+  '{"formulae":[]}' \
+  '{"formulae":{}}' \
+  '{"formulae":{"jq":[]}}' \
+  '{"formulae":{"jq":{"stable_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bottle_checksum":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}' \
+  '{"formulae":{"jq":{"stable_version":"","stable_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bottle_checksum":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}' \
+  '{"formulae":{"jq":{"stable_version":"10.0.0","stable_checksum":7,"bottle_checksum":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}' \
+  '{"formulae":{"jq":{"stable_version":"10.0.0","stable_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bottle_checksum":""}}}'; do
+  printf '%s\n' "$invalid_homebrew_formula_api" > "$homebrew_formula_api_fixture"
+  homebrew_invalid_formula_root=$workdir/homebrew-invalid-formula
+  rm -rf "$homebrew_invalid_formula_root"
+  mkdir -p "$homebrew_invalid_formula_root"
+  if (cd "$homebrew_invalid_formula_root" && PATH="$homebrew_case_bin:$homebrew_prefix/bin:$PATH" KATCH_PHASE=cold KATCH_URL=https://katch.test \
+    HOMEBREW_EVENT_LOG="$homebrew_invalid_formula_events" HOMEBREW_TEST_PREFIX="$homebrew_prefix" \
+    HOMEBREW_TEST_CELLAR="$homebrew_cellar" HOMEBREW_TEST_REPOSITORY="$homebrew_repository" \
+    HOMEBREW_TEST_JQ="$homebrew_system_jq" HOMEBREW_TEST_FORMULA_API_JSON="$homebrew_formula_api_fixture" \
+    JQ_EXECUTION_LOG="$homebrew_jq_execution_log" PATH_RUBY_EXECUTION_LOG="$homebrew_path_ruby_execution_log" \
+    /bin/sh "$homebrew_setup_script" && /bin/sh "$homebrew_run_script" >/dev/null 2>&1); then
+    fail "Homebrew cold extraction accepted invalid internal formula metadata: $invalid_homebrew_formula_api"
+  fi
+done
+cat > "$homebrew_formula_api_fixture" <<'EOF'
+{"formulae":{"jq":{"stable_version":"10.0.0","stable_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bottle_checksum":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}
+EOF
+
 for invalid_homebrew_json in \
   'not-json' \
   '{"formulae":[{"name":"not-jq","installed":[{"version":"9.7.6"}]}]}' \
@@ -873,11 +930,14 @@ printf '%s\n' '{"formulae":[{"name":"jq","installed":[{"version":"9.7.6"}]}]}' >
 for invalid_homebrew_api_json in \
   'not-json' \
   '{}' \
-  '{"name":"jq"}' \
-  '{"name":"not-jq","version":"10.0.0"}' \
-  '{"name":"jq","version":""}' \
-  '{"name":"jq","version":"10.0.0","extra":true}' \
-  '[{"name":"jq","version":"10.0.0"}]'; do
+  '{"name":"jq","version":"10.0.0","source_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}' \
+  '{"name":"not-jq","version":"10.0.0","source_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bottle_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}' \
+  '{"name":"jq","version":"","source_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bottle_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}' \
+  '{"name":"jq","version":"10.0.0","source_sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","bottle_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}' \
+  '{"name":"jq","version":"10.0.0","source_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bottle_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}' \
+  '{"name":"jq","version":"10.0.0","source_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bottle_sha256":"gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg"}' \
+  '{"name":"jq","version":"10.0.0","source_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bottle_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","extra":true}' \
+  '[{"name":"jq","version":"10.0.0","source_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bottle_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]'; do
   printf '%s\n' "$invalid_homebrew_api_json" > "$homebrew_phase_root/cold/results/api-jq.json"
   if (cd "$homebrew_phase_root/cold" && PATH="$homebrew_case_bin:$homebrew_prefix/bin:$PATH" KATCH_PHASE=cold \
     HOMEBREW_TEST_REPOSITORY="$homebrew_repository" HOMEBREW_TEST_JQ="$homebrew_system_jq" \
@@ -886,7 +946,7 @@ for invalid_homebrew_api_json in \
     fail "Homebrew assertion accepted invalid formula API evidence: $invalid_homebrew_api_json"
   fi
 done
-printf '%s\n' '{"name":"jq","version":"10.0.0"}' > "$homebrew_phase_root/cold/results/api-jq.json"
+printf '%s\n' '{"name":"jq","version":"10.0.0","source_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bottle_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}' > "$homebrew_phase_root/cold/results/api-jq.json"
 printf '%s\n' '{"poured_from_bottle":false}' > "$homebrew_cellar/cold/jq/9.7.6/INSTALL_RECEIPT.json"
 if (cd "$homebrew_phase_root/cold" && PATH="$homebrew_case_bin:$homebrew_prefix/bin:$PATH" KATCH_PHASE=cold \
   HOMEBREW_TEST_REPOSITORY="$homebrew_repository" HOMEBREW_TEST_JQ="$homebrew_system_jq" \
@@ -896,7 +956,7 @@ if (cd "$homebrew_phase_root/cold" && PATH="$homebrew_case_bin:$homebrew_prefix/
 fi
 [ ! -e "$homebrew_jq_execution_log" ] || fail "Homebrew assertion executed the installed jq command"
 [ ! -e "$homebrew_path_ruby_execution_log" ] || fail "Homebrew assertion executed Ruby from PATH"
-homebrew_api_ruby_script='require "api/internal"; data, = Homebrew::API.fetch_json_api_file(Homebrew::API::Internal.formula_endpoint); formulae = data.fetch("formulae"); formula = formulae.fetch("jq"); version = formula.fetch(0); raise "invalid jq version" unless version.is_a?(String) && !version.empty?; puts JSON.generate({"name" => "jq", "version" => version})'
+homebrew_api_ruby_script='require "api/internal"; data, = Homebrew::API.fetch_json_api_file(Homebrew::API::Internal.formula_endpoint); entry = data.fetch("formulae").fetch("jq"); raise "invalid jq formula metadata" unless entry.is_a?(Hash); version = entry.fetch("stable_version"); source_sha256 = entry.fetch("stable_checksum"); bottle_sha256 = entry.fetch("bottle_checksum"); raise "invalid jq formula metadata" unless [version, source_sha256, bottle_sha256].all? { |value| value.is_a?(String) && !value.empty? }; puts JSON.generate({"name" => "jq", "version" => version, "source_sha256" => source_sha256, "bottle_sha256" => bottle_sha256})'
 expected_homebrew_events=$(printf '%s\n' \
   "brew|cold|$homebrew_phase_root/cold/client-home|https://katch.test/formulae.brew.sh/api|https://katch.test/registry/ghcr.io|1|1|ruby -rjson -e $homebrew_api_ruby_script" \
   "git|cold|$homebrew_phase_root/cold/client-home|ls-remote https://katch.test/github.com/Homebrew/homebrew-core.git HEAD" \
