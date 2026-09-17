@@ -47,6 +47,48 @@ verify_capture() {
   ' "$capture"
 }
 
+install_host_mapping() {
+  hosts_file=$1
+  host=$2
+  ip=$3
+  mapped_ip=::ffff:$ip
+
+  if awk -v mapped="$mapped_ip" -v host="$host" '
+    $1 == mapped {
+      for (field = 2; field <= NF; field++) {
+        if ($field ~ /^#/) break
+        if ($field == host) found = 1
+      }
+    }
+    END { exit found ? 0 : 1 }
+  ' "$hosts_file"; then
+    return 0
+  fi
+
+  if ! printf '%s %s\n' "$mapped_ip" "$host" | tee -a "$hosts_file" >/dev/null; then
+    printf '%s\n' "failed to install IPv4-mapped hosts entry for $host" >&2
+    return 73
+  fi
+  awk -v mapped="$mapped_ip" -v host="$host" '
+    $1 == mapped {
+      for (field = 2; field <= NF; field++) {
+        if ($field ~ /^#/) break
+        if ($field == host) found = 1
+      }
+    }
+    END { exit found ? 0 : 1 }
+  ' "$hosts_file" || {
+    printf '%s\n' "failed to verify IPv4-mapped hosts entry for $host" >&2
+    return 73
+  }
+}
+
+if [ "${1:-}" = "--install-host-mapping" ]; then
+  [ "$#" -eq 4 ] || exit 64
+  install_host_mapping "$2" "$3" "$4"
+  exit
+fi
+
 if [ "${1:-}" = "--verify-capture" ]; then
   [ "$#" -eq 3 ] || exit 64
   verify_capture "$2" "$3"
@@ -88,7 +130,7 @@ install_trusted_ca() {
 
 install_trusted_ca
 
-for command in iptables ip6tables iptables-save iptables-restore ip6tables-save ip6tables-restore strace runuser; do
+for command in awk iptables ip6tables iptables-save iptables-restore ip6tables-save ip6tables-restore strace runuser tee; do
   command -v "$command" >/dev/null 2>&1 || {
     printf '%s\n' "required isolation command unavailable: $command" >&2
     exit 69
@@ -111,6 +153,7 @@ case "$katch_ip" in
     exit 69
     ;;
 esac
+install_host_mapping /etc/hosts "$KATCH_HOST" "$katch_ip"
 
 mkdir -p "$KATCH_ARTIFACTS"
 connect_log=$KATCH_ARTIFACTS/connect.log

@@ -375,6 +375,27 @@ if "$ENTRYPOINT" --verify-capture "$workdir/dns-leak.log" 172.18.0.2 >"$workdir/
 fi
 grep -q '8.8.8.8' "$workdir/out" || fail "external DNS attempt was not reported"
 
+hosts_file=$workdir/hosts
+cat > "$hosts_file" <<'EOF'
+127.0.0.1 localhost
+192.0.2.10 katch.invalid
+::ffff:192.0.2.11 katch.invalid
+::ffff:192.0.2.10 other.invalid katch.invalid.example
+EOF
+"$ENTRYPOINT" --install-host-mapping "$hosts_file" katch.invalid 192.0.2.10
+[ "$(grep -Fxc '::ffff:192.0.2.10 katch.invalid' "$hosts_file")" -eq 1 ] ||
+  fail "host mapping helper did not install the exact IPv4-mapped Katch address"
+if grep -Eq '^::[[:space:]]+katch\.invalid([[:space:]]|$)' "$hosts_file"; then
+  fail "host mapping helper installed a broad IPv6 Katch address"
+fi
+"$ENTRYPOINT" --install-host-mapping "$hosts_file" katch.invalid 192.0.2.10
+[ "$(grep -Fxc '::ffff:192.0.2.10 katch.invalid' "$hosts_file")" -eq 1 ] ||
+  fail "host mapping helper duplicated an existing exact mapping"
+mkdir "$workdir/hosts-directory"
+if "$ENTRYPOINT" --install-host-mapping "$workdir/hosts-directory" katch.invalid 192.0.2.10 >"$workdir/out" 2>&1; then
+  fail "host mapping helper accepted a hosts target that cannot be updated"
+fi
+
 cat > "$workdir/connect-leak.log" <<'EOF'
 125 connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("104.16.30.34")}, 16) = -1 ECONNREFUSED (Connection refused)
 EOF
@@ -391,11 +412,17 @@ set -eu
 case ${0##*/} in
   awk)
     last=
+    mapping_check=0
     for argument do
       last=$argument
+      case $argument in mapped=::ffff:*) mapping_check=1 ;; esac
     done
     if [ "$last" = /etc/hosts ]; then
-      printf '%s\n' 172.18.0.2
+      if [ "$mapping_check" -eq 1 ]; then
+        [ -f "$HOST_MAPPING_STATE" ]
+      else
+        printf '%s\n' 172.18.0.2
+      fi
     elif [ "$last" = /etc/passwd ]; then
       user=client
       for argument do
@@ -436,6 +463,13 @@ case ${0##*/} in
     : > "$capture"
     "$@"
     ;;
+  tee)
+    mapping=$(cat)
+    printf '%s\n' "hosts-write $mapping $*" >> "$ENTRYPOINT_EVENT_LOG"
+    [ "${TEE_FAIL:-0}" -eq 0 ] || exit 1
+    : > "$HOST_MAPPING_STATE"
+    printf '%s\n' "$mapping"
+    ;;
   runuser)
     printf '%s\n' "runuser $*" >> "$ENTRYPOINT_EVENT_LOG"
     printf '%s\n' "$*" >> "$RUNUSER_LOG"
@@ -444,7 +478,7 @@ case ${0##*/} in
 esac
 EOF
 chmod 0555 "$fake_bin/fake-command"
-for command in awk id install iptables ip6tables iptables-save iptables-restore ip6tables-save ip6tables-restore strace runuser; do
+for command in awk id install iptables ip6tables iptables-save iptables-restore ip6tables-save ip6tables-restore strace runuser tee; do
   ln -s fake-command "$fake_bin/$command"
 done
 
@@ -452,13 +486,30 @@ run_entrypoint() {
   artifacts=$1
   shift
   env PATH="$fake_bin:$PATH" RUNUSER_LOG="$workdir/runuser.log" ENTRYPOINT_EVENT_LOG="$workdir/entrypoint-events.log" \
+    HOST_MAPPING_STATE="$workdir/host-mapping.state" \
     KATCH_HOST=katch.invalid KATCH_PORT=8080 KATCH_ARTIFACTS="$artifacts" \
     "$@" "$ENTRYPOINT"
 }
 
+rm -f "$workdir/host-mapping.state"
+: > "$workdir/runuser.log"
+: > "$workdir/entrypoint-events.log"
+if run_entrypoint "$workdir/hosts-failure-artifacts" env TEE_FAIL=1 >"$workdir/out" 2>&1; then
+  fail "entrypoint continued when the IPv4-mapped hosts entry could not be installed"
+fi
+if grep -E '^(iptables |ip6tables |runuser )' "$workdir/entrypoint-events.log"; then
+  fail "entrypoint configured the firewall or started the client after hosts update failure"
+fi
+
 : > "$workdir/runuser.log"
 : > "$workdir/entrypoint-events.log"
 run_entrypoint "$workdir/default-artifacts" env -u KATCH_CLIENT_USER -u KATCH_CLIENT_CA_CERT
+mapping_line=$(grep -n -F 'hosts-write ::ffff:172.18.0.2 katch.invalid -a /etc/hosts' "$workdir/entrypoint-events.log" | cut -d: -f1)
+firewall_line=$(grep -n -m1 -E '^iptables (-F|-P|-A)' "$workdir/entrypoint-events.log" | cut -d: -f1)
+user_drop_line=$(grep -n -F 'runuser -u client ' "$workdir/entrypoint-events.log" | cut -d: -f1)
+[ -n "$mapping_line" ] || fail "entrypoint did not install the IPv4-mapped Katch hosts entry"
+[ "$mapping_line" -lt "$firewall_line" ] || fail "entrypoint installed the Katch hosts mapping after firewall setup"
+[ "$mapping_line" -lt "$user_drop_line" ] || fail "entrypoint installed the Katch hosts mapping after the client started"
 grep -q '^-u client --preserve-environment -- env HOME=/home/client USER=client LOGNAME=client /bin/sh -eu -c ' "$workdir/runuser.log" ||
   fail "entrypoint did not retain the default client user and identity environment"
 if grep -E '^(install|update-ca-certificates|update-ca-trust) ' "$workdir/entrypoint-events.log"; then
@@ -468,6 +519,9 @@ fi
 : > "$workdir/runuser.log"
 : > "$workdir/entrypoint-events.log"
 run_entrypoint "$workdir/homebrew-artifacts" env -u KATCH_CLIENT_CA_CERT KATCH_CLIENT_USER=linuxbrew
+if grep -F 'hosts-write ' "$workdir/entrypoint-events.log"; then
+  fail "entrypoint duplicated an existing exact IPv4-mapped Katch hosts entry"
+fi
 grep -q '^-u linuxbrew --preserve-environment -- env HOME=/home/linuxbrew USER=linuxbrew LOGNAME=linuxbrew /bin/sh -eu -c ' "$workdir/runuser.log" ||
   fail "entrypoint did not switch to the requested client identity environment"
 
