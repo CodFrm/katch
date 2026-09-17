@@ -5,6 +5,8 @@ expect_version() {
   client=$1
   expected=$2
   actual=$3
+  actual=${actual#"${actual%%[![:space:]]*}"}
+  actual=${actual%"${actual##*[![:space:]]}"}
   if [ "$actual" != "$expected" ]; then
     printf '%s\n' "$client version mismatch: expected $expected, got $actual" >&2
     exit 1

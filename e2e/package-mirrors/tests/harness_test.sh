@@ -22,6 +22,37 @@ for script in "$HARNESS" "$ENTRYPOINT" "$IMAGE_SMOKE" "$IMAGE_BUILD"; do
   sh -n "$script" || fail "invalid shell syntax: $script"
 done
 
+smoke_bin=$workdir/smoke-bin
+mkdir -p "$smoke_bin"
+cat > "$smoke_bin/fake-client" <<'EOF'
+#!/bin/sh
+set -eu
+case ${0##*/} in
+  java) printf '%s\n' 'openjdk version "21.0.8" 2025-07-15 LTS' >&2 ;;
+  mvn) printf '%s\n' 'Apache Maven 3.9.11' ;;
+  gradle) printf '%s\n' 'Gradle 9.0.0' ;;
+  sbt) printf '%b\n' "${SBT_VERSION_OUTPUT:?SBT_VERSION_OUTPUT is required}" ;;
+  *) exit 64 ;;
+esac
+EOF
+chmod 0555 "$smoke_bin/fake-client"
+for client in java mvn gradle sbt; do
+  ln -s fake-client "$smoke_bin/$client"
+done
+
+SBT_VERSION_OUTPUT=' \t1.11.6 \t' KATCH_CLIENT_FLAVOR=jvm PATH="$smoke_bin:$PATH" \
+  "$IMAGE_SMOKE" >"$workdir/smoke.out" 2>"$workdir/smoke.err" ||
+  fail "client smoke rejected an exact sbt version surrounded by whitespace: $(cat "$workdir/smoke.err")"
+grep -Fx 'sbt=1.11.6' "$workdir/smoke.out" >/dev/null ||
+  fail "client smoke did not normalize surrounding sbt version whitespace"
+
+if SBT_VERSION_OUTPUT=prefix1.11.6suffix KATCH_CLIENT_FLAVOR=jvm PATH="$smoke_bin:$PATH" \
+  "$IMAGE_SMOKE" >"$workdir/smoke.out" 2>"$workdir/smoke.err"; then
+  fail "client smoke accepted a non-exact sbt version"
+fi
+grep -F 'sbt version mismatch: expected 1.11.6, got prefix1.11.6suffix' "$workdir/smoke.err" >/dev/null ||
+  fail "client smoke did not report the non-exact sbt version"
+
 jq -e '
   type == "array" and length == 12 and
   all(.[];
