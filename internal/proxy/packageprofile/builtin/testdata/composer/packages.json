@@ -1,0 +1,6 @@
+{
+  "packages": [],
+  "metadata-url": "https://repo.packagist.org/p2/%package%.json",
+  "notify-batch": "https://packagist.org/downloads/",
+  "providers-url": "https://repo.packagist.org/p/%package%$%hash%.json"
+}

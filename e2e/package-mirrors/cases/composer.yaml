@@ -1,0 +1,12 @@
+{
+  "name": "composer-dist",
+  "image": "composer:2.9.5",
+  "setup": "mkdir -p /tmp/katch-composer\ncd /tmp/katch-composer\ncat > composer.json <<'JSON'\n{\n  \"require\": {\n    \"psr/log\": \"3.0.2\"\n  },\n  \"config\": {\n    \"preferred-install\": \"dist\",\n    \"secure-http\": false\n  }\n}\nJSON",
+  "run": "cd /tmp/katch-composer\ncomposer config --global repos.packagist composer \"${KATCH_BASE_URL}/repo.packagist.org\"\ncomposer install --prefer-dist --no-dev --no-interaction --no-progress",
+  "assert": "cd /tmp/katch-composer\ntest -f vendor/psr/log/src/LoggerInterface.php\ncomposer show --locked psr/log | grep -F 'versions' | grep -F '3.0.2'",
+  "required_upstreams": [
+    "repo.packagist.org",
+    "api.github.com",
+    "codeload.github.com"
+  ]
+}

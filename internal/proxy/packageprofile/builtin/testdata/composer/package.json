@@ -1,0 +1,29 @@
+{
+  "packages": {
+    "acme/widget": [
+      {
+        "name": "acme/widget",
+        "version": "1.2.3",
+        "require": {
+          "php": ">=8.2",
+          "psr/log": "^3.0"
+        },
+        "dist": {
+          "type": "zip",
+          "url": "https://api.github.com/repos/acme/widget/zipball/0123456789abcdef",
+          "reference": "0123456789abcdef",
+          "shasum": "7f83b1657ff1fc53b92dc18148a1d65dfa13514c"
+        },
+        "source": {
+          "type": "git",
+          "url": "https://github.com/acme/widget.git",
+          "reference": "0123456789abcdef"
+        },
+        "support": {
+          "source": "https://github.com/acme/widget/tree/1.2.3",
+          "issues": "https://github.com/acme/widget/issues"
+        }
+      }
+    ]
+  }
+}
