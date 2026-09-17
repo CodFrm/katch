@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"mime"
 	"net/url"
+	"regexp"
 	"strings"
 
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
@@ -17,6 +18,8 @@ const (
 	composerPackageToken       = "%package%"
 	composerPackagePlaceholder = "__KATCH_COMPOSER_PACKAGE__"
 )
+
+var composerFullCommitSHA = regexp.MustCompile(`^[0-9A-Fa-f]{40}$`)
 
 type composerProfile struct{}
 
@@ -32,15 +35,44 @@ func (composerProfile) Describe() packageprofile.Description {
 }
 
 func (composerProfile) Classify(request packageprofile.Request) packageprofile.Representation {
-	if request.Path != "/packages.json" &&
-		(!strings.HasPrefix(request.Path, "/p2/") || !strings.HasSuffix(request.Path, ".json")) {
-		return packageprofile.Representation{}
+	if request.Path == "/packages.json" ||
+		(strings.HasPrefix(request.Path, "/p2/") && strings.HasSuffix(request.Path, ".json")) {
+		return packageprofile.Representation{
+			Class:      packageprofile.ClassMutable,
+			Transform:  true,
+			MediaTypes: []string{"application/json"},
+		}
 	}
-	return packageprofile.Representation{
-		Class:      packageprofile.ClassMutable,
-		Transform:  true,
-		MediaTypes: []string{"application/json"},
+	if isComposerGitHubFullSHADist(request.Host, request.Path) {
+		return packageprofile.Representation{
+			Class:    packageprofile.ClassImmutable,
+			Variants: []string{"Authorization"},
+		}
 	}
+	return packageprofile.Representation{}
+}
+
+func isComposerGitHubFullSHADist(host, path string) bool {
+	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	switch host {
+	case "api.github.com":
+		return len(parts) == 5 && parts[0] == "repos" && validComposerGitHubName(parts[1]) &&
+			validComposerGitHubName(parts[2]) && parts[3] == "zipball" && composerFullCommitSHA.MatchString(parts[4])
+	case "codeload.github.com":
+		return len(parts) == 4 && validComposerGitHubName(parts[0]) && validComposerGitHubName(parts[1]) &&
+			parts[2] == "legacy.zip" && composerFullCommitSHA.MatchString(parts[3])
+	default:
+		return false
+	}
+}
+
+func validComposerGitHubName(value string) bool {
+	if value == "" || value == "." || value == ".." || strings.Contains(value, `\`) {
+		return false
+	}
+	decoded, err := url.PathUnescape(value)
+	return err == nil && decoded != "." && decoded != ".." && !strings.ContainsAny(decoded, `/\`)
 }
 
 func (composerProfile) Transform(
@@ -70,7 +102,12 @@ func (composerProfile) Transform(
 	return &packageprofile.TransformResult{Body: body, ContentType: "application/json"}, nil
 }
 
-func (composerProfile) Companions() []packageprofile.Companion { return nil }
+func (composerProfile) Companions() []packageprofile.Companion {
+	return []packageprofile.Companion{
+		composerCompanion("api.github.com", upstream_entity.PackageProfileComposer),
+		composerCompanion("codeload.github.com", upstream_entity.PackageProfileComposer),
+	}
+}
 
 func (composerProfile) Guidance() packageprofile.Guidance {
 	return packageprofile.Guidance{
@@ -195,7 +232,7 @@ func rewriteComposerVersion(
 		return nil, packageprofile.ErrInvalidMetadata
 	}
 	rewritten, err := rewrite(ctx, parsed, composerCompanion(
-		parsed.Hostname(), upstream_entity.PackageProfileNone,
+		parsed.Hostname(), upstream_entity.PackageProfileComposer,
 	))
 	if err != nil {
 		if errors.Is(err, packageprofile.ErrUnavailable) {

@@ -621,6 +621,18 @@ if printf '%s\n' "$pypi_run" | grep -E -- '(^|[[:space:]])(--trusted-host|--allo
   fail "PyPI mirror case broadens HTTP or TLS trust beyond the configured Katch host"
 fi
 
+composer_setup=$(jq -r '.setup' "$CASES/composer.yaml")
+composer_run=$(jq -r '.run' "$CASES/composer.yaml")
+printf '%s\n' "$composer_run" | grep -Fx 'composer config --global notify-on-install false' >/dev/null ||
+  fail "Composer mirror case does not disable the out-of-scope install notification"
+printf '%s\n' "$composer_run" | grep -Fx 'test "$(composer config --global notify-on-install)" = false' >/dev/null ||
+  fail "Composer mirror case does not assert that install notifications are disabled"
+printf '%s\n' "$composer_run" | grep -F 'composer install --prefer-dist --no-dev --no-interaction --no-progress --no-audit --no-security-blocking' >/dev/null ||
+  fail "Composer mirror case does not disable optional audit/security-list egress"
+if printf '%s\n%s\n' "$composer_setup" "$composer_run" | grep -E -- '("secure-http"[[:space:]]*:[[:space:]]*false|secure-http[[:space:]]+false|--disable-tls|COMPOSER_DISABLE_TLS)'; then
+  fail "Composer mirror case disables HTTPS/TLS verification"
+fi
+
 jq -r '.run' "$CASES/homebrew.yaml" | grep -F 'HOMEBREW_ARTIFACT_DOMAIN="${KATCH_URL%/}/v2/ghcr.io"' >/dev/null ||
   fail "Homebrew bottle route changed from the approved /v2/ghcr.io contract"
 jq -r '.run' "$CASES/registry-git-regression.yaml" | grep -F 'git clone --depth=1' >/dev/null ||

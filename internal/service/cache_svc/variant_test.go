@@ -320,6 +320,62 @@ func TestGet_APKOriginVariantsCacheAndDoNotCross(t *testing.T) {
 	}
 }
 
+func TestGet_ComposerGitHubFullSHAAuthorizationVariantsCacheAndDoNotCross(t *testing.T) {
+	profile, ok := packageprofile.Lookup(upstream_entity.PackageProfileComposer)
+	if !ok {
+		t.Fatal("Composer profile is not registered")
+	}
+	profiles := packageprofile.NewRegistry()
+	if err := profiles.Register(profile); err != nil {
+		t.Fatal(err)
+	}
+
+	var o *originStub
+	o = newOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/zip")
+		w.Header().Set("Vary", "Authorization, Accept-Encoding")
+		_, _ = io.WriteString(w, fmt.Sprintf("dist-%s-%d", r.Header.Get("Authorization"), o.hits.Load()))
+	})
+	up := staticUpstream("api.github.com")
+	up.PackageProfile = upstream_entity.PackageProfileComposer
+	svc, repo, _ := setupSvc(t, o, up, Options{Profiles: profiles})
+	const path = "/repos/acme/widget/zipball/0123456789abcdef0123456789abcdef01234567"
+
+	pull := func(authorization string) (string, *proxy_svc.Meta) {
+		t.Helper()
+		tg := target(up.Host, path)
+		tg.Header.Set("Authorization", authorization)
+		return pullWith(t, svc, tg)
+	}
+	assertColdWarm := func(authorization, wantBody string, wantHits int64) {
+		t.Helper()
+		coldBody, coldMeta := pull(authorization)
+		warmBody, warmMeta := pull(authorization)
+		if coldBody != wantBody || warmBody != wantBody {
+			t.Fatalf("Authorization %q bodies = %q, %q, want %q", authorization, coldBody, warmBody, wantBody)
+		}
+		if coldMeta.Header.Get(cacheStatusHeader) != cacheStatusMiss ||
+			warmMeta.Header.Get(cacheStatusHeader) != cacheStatusHit {
+			t.Fatalf("Authorization %q cache statuses = %q, %q", authorization,
+				coldMeta.Header.Get(cacheStatusHeader), warmMeta.Header.Get(cacheStatusHeader))
+		}
+		if coldMeta.Header.Get("Vary") != "Authorization" || warmMeta.Header.Get("Vary") != "Authorization" {
+			t.Fatalf("Authorization %q Vary headers = %q, %q", authorization,
+				coldMeta.Header.Get("Vary"), warmMeta.Header.Get("Vary"))
+		}
+		if got := o.hits.Load(); got != wantHits {
+			t.Fatalf("Authorization %q origin hits = %d, want %d", authorization, got, wantHits)
+		}
+	}
+
+	assertColdWarm("Bearer first", "dist-Bearer first-1", 1)
+	assertColdWarm("Bearer second", "dist-Bearer second-2", 2)
+	rows := repo.all()
+	if len(rows) != 2 || !rows[0].Immutable || !rows[1].Immutable || rows[0].Key == rows[1].Key {
+		t.Fatalf("Composer cache rows = %+v, want two immutable Authorization variants", rows)
+	}
+}
+
 // TestGet_ManifestAcceptVariantsDoNotShareOneCopy 同一个 tag，两种客户端两份副本。
 //
 // Accept 决定 registry 返回哪个版本的 manifest，而缓存键里没有它的话，先拉的那个

@@ -50,7 +50,7 @@ transport、HTTPS 降级和实际拨号地址检查。
 | `apt`      | APT 固定 source                          | 无                                                                                    |
 | `rpm`      | DNF、YUM 固定 baseurl                    | 无                                                                                    |
 | `apk`      | Alpine apk 固定 repository               | 无                                                                                    |
-| `composer` | Composer 2 dist 安装                     | 无固定 companion；元数据里的 dist host 仍必须已注册且符合目的地址策略                 |
+| `composer` | Composer 2 dist 安装                     | `api.github.com`、`codeload.github.com`（均为 static / composer）                      |
 | `homebrew` | Homebrew 标准 Bottle 安装                | `ghcr.io`（registry / none）、`github.com`（git / none）                              |
 
 后端对每条 profile 上游返回 `package_readiness`，后台还能用未保存草稿请求同一套 preview。
@@ -66,10 +66,13 @@ transport、HTTPS 降级和实际拨号地址检查。
 
 客户端配置由后端根据 profile、当前 host 与 `site_domain` 生成，包含尾斜杠、npm 旧
 lockfile/registry-host 约束、Go 与 Homebrew no-fallback、DNF/YUM 固定 `baseurl` 并关闭
-`mirrorlist`/`metalink`、Composer dist-only 等边界。前端只翻译和展示这些 DTO，不复制
-兼容规则。**可复制配置还有第二道门：对应真实客户端必须在阻断公网的 runtime matrix
-中通过。最终矩阵仍待 `coding.local` 执行，当前所有 profile 的 `runtime_verified` 都是
-`false`，因此公开页和后台只显示待验证状态，不显示可复制片段，也不宣称完整支持。**
+`mirrorlist`/`metalink`、Composer dist-only 等边界。Composer 的 Packagist 根元数据、
+`api.github.com` dist 入口和重定向后的 `codeload.github.com` 下载都必须显式注册为
+`static / composer`；GitHub 完整 commit SHA dist 才按不可变对象缓存，tag/ref 仍按可变或
+未知路径处理。前端只翻译和展示这些 DTO，不复制兼容规则。**可复制配置还有第二道门：
+对应真实客户端必须在阻断公网的 runtime matrix 中通过。最终矩阵仍待 `coding.local`
+执行，当前所有 profile 的 `runtime_verified` 都是 `false`，因此公开页和后台只显示待验证
+状态，不显示可复制片段，也不宣称完整支持。**
 
 ## 2026-09-16 真实客户端调研（实现前基线）
 

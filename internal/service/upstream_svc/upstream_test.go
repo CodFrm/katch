@@ -97,6 +97,32 @@ func TestPackageProfileReadiness(t *testing.T) {
 		}
 	})
 
+	convey.Convey("Composer readiness requires GitHub API and codeload with the composer profile", t, func() {
+		hosts := []string{"repo.packagist.org", "api.github.com", "codeload.github.com"}
+		configured := make([]*upstream_entity.Upstream, 0, len(hosts))
+		for _, host := range hosts {
+			configured = append(configured, &upstream_entity.Upstream{
+				Host: host, Enabled: true,
+				Protocols:      upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+				PackageProfile: upstream_entity.PackageProfileComposer,
+			})
+		}
+
+		readiness := packageReadiness("https://mirror.example.com", configured, configured[0])
+		convey.So(readiness.Ready, convey.ShouldBeTrue)
+		convey.So(readiness.Companions, convey.ShouldResemble, []admin.PackageCompanion{
+			{Host: "api.github.com", Transport: upstream_entity.ProtocolStatic,
+				PackageProfile: upstream_entity.PackageProfileComposer, Ready: true},
+			{Host: "codeload.github.com", Transport: upstream_entity.ProtocolStatic,
+				PackageProfile: upstream_entity.PackageProfileComposer, Ready: true},
+		})
+
+		configured[2].PackageProfile = upstream_entity.PackageProfileNone
+		blocked := packageReadiness("https://mirror.example.com", configured, configured[0])
+		convey.So(blocked.Ready, convey.ShouldBeFalse)
+		convey.So(blocked.Companions[1].Reason, convey.ShouldEqual, "profile")
+	})
+
 	for _, tc := range []struct {
 		name   string
 		files  *upstream_entity.Upstream

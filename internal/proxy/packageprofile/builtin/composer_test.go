@@ -28,6 +28,41 @@ func TestComposerProfileClassifiesOnlyComposer2Metadata(t *testing.T) {
 	}
 }
 
+func TestComposerProfileClassifiesOnlyGitHubFullSHADistPaths(t *testing.T) {
+	profile := composerProfile{}
+	sha := "0123456789abcdef0123456789ABCDEF01234567"
+
+	for _, request := range []packageprofile.Request{
+		{Host: "api.github.com", Path: "/repos/acme/widget/zipball/" + sha},
+		{Host: "codeload.github.com", Path: "/acme/widget/legacy.zip/" + sha},
+	} {
+		representation := profile.Classify(request)
+		assertComposerEqual(t, packageprofile.ClassImmutable, representation.Class, request.Path)
+		assertComposerTrue(t, !representation.Transform, request.Path)
+		assertComposerEqual(t, []string{"Authorization"}, representation.Variants, request.Path)
+		assertComposerEqual(t, 0, len(representation.MediaTypes), request.Path)
+	}
+
+	for _, request := range []packageprofile.Request{
+		{Host: "api.github.com", Path: "/repos/acme/widget/zipball/v1.2.3"},
+		{Host: "api.github.com", Path: "/repos/acme/widget/zipball/0123456789abcdef0123456789abcdef0123456"},
+		{Host: "api.github.com", Path: "/repos/acme/widget/zipball/0123456789abcdef0123456789abcdef012345678"},
+		{Host: "api.github.com", Path: "/repos/acme/widget/zipball/0123456789abcdef0123456789abcdef0123456g"},
+		{Host: "api.github.com", Path: "/repos/acme/../zipball/" + sha},
+		{Host: "api.github.com", Path: "/repos/acme/%2e%2e/zipball/" + sha},
+		{Host: "api.github.com", Path: "/repos/acme%2fescape/widget/zipball/" + sha},
+		{Host: "api.github.com", Path: "/repos/acme/widget/zipball/" + sha + "/extra"},
+		{Host: "codeload.github.com", Path: "/acme/widget/legacy.zip/main"},
+		{Host: "codeload.github.com", Path: "/acme/../legacy.zip/" + sha},
+		{Host: "codeload.github.com", Path: "/acme/%2E%2E/legacy.zip/" + sha},
+		{Host: "codeload.github.com", Path: "/acme/widget/legacy.zip/" + sha + "/extra"},
+		{Host: "example.com", Path: "/repos/acme/widget/zipball/" + sha},
+		{Host: "example.com", Path: "/acme/widget/legacy.zip/" + sha},
+	} {
+		assertComposerTrue(t, !profile.Classify(request).Recognized(), request.Host+request.Path)
+	}
+}
+
 func TestComposerProfileRewritesRootMetadataTemplateLiterally(t *testing.T) {
 	body := readComposerFixture(t, "packages.json")
 	profile := composerProfile{}
@@ -74,7 +109,7 @@ func TestComposerProfileRewritesOnlyDistURLAndPreservesPackageData(t *testing.T)
 	resolver := composerTestResolver("https://mirror.example", map[string]packageprofile.Companion{
 		"api.github.com": {
 			Host:      "api.github.com",
-			Profile:   upstream_entity.PackageProfileNone,
+			Profile:   upstream_entity.PackageProfileComposer,
 			Transport: upstream_entity.ProtocolStatic,
 		},
 	})
@@ -91,7 +126,7 @@ func TestComposerProfileRewritesOnlyDistURLAndPreservesPackageData(t *testing.T)
 	requireComposerNoError(t, err)
 	assertComposerEqual(t, packageprofile.Companion{
 		Host:      "api.github.com",
-		Profile:   upstream_entity.PackageProfileNone,
+		Profile:   upstream_entity.PackageProfileComposer,
 		Transport: upstream_entity.ProtocolStatic,
 	}, gotCompanion)
 
@@ -132,13 +167,13 @@ func TestComposerProfileFailsClosedOnCompanionProfileMismatch(t *testing.T) {
 			},
 		},
 		{
-			name:   "dist requires generic static profile",
+			name:   "dist requires composer profile",
 			body:   readComposerFixture(t, "package.json"),
 			source: "https://repo.packagist.org/p2/acme/widget.json",
 			registered: map[string]packageprofile.Companion{
 				"api.github.com": {
 					Host:      "api.github.com",
-					Profile:   upstream_entity.PackageProfileComposer,
+					Profile:   upstream_entity.PackageProfileNone,
 					Transport: upstream_entity.ProtocolStatic,
 				},
 			},
@@ -183,7 +218,10 @@ func TestComposerProfileDescription(t *testing.T) {
 	profile := composerProfile{}
 
 	assertComposerEqual(t, upstream_entity.PackageProfileComposer, profile.Describe().Profile)
-	assertComposerEqual(t, 0, len(profile.Companions()))
+	assertComposerEqual(t, []packageprofile.Companion{
+		{Host: "api.github.com", Profile: upstream_entity.PackageProfileComposer, Transport: upstream_entity.ProtocolStatic},
+		{Host: "codeload.github.com", Profile: upstream_entity.PackageProfileComposer, Transport: upstream_entity.ProtocolStatic},
+	}, profile.Companions())
 	assertComposerEqual(t, "composer", profile.Guidance().Client)
 }
 
