@@ -158,6 +158,11 @@ printf '%s\n' "$nuget_setup" | grep -Fx '    <NuGetAudit>false</NuGetAudit>' >/d
   fail "NuGet test project does not disable only the out-of-scope vulnerability audit"
 printf '%s\n' "$nuget_setup" | grep -F "'using System;'" >/dev/null ||
   fail "NuGet generated source does not import System for Console"
+nuget_run=$(jq -r '.run' "$CASES/nuget.yaml")
+[ "$(printf '%s\n' "$nuget_run" | grep -Fxc 'export DOTNET_CLI_TELEMETRY_OPTOUT=1')" -eq 1 ] ||
+  fail "NuGet run does not opt out of .NET CLI telemetry with the exact documented environment setting"
+[ "$(printf '%s\n' "$nuget_run" | grep -Fxc 'export NUGET_CERT_REVOCATION_MODE=offline')" -eq 1 ] ||
+  fail "NuGet run does not use the exact documented offline certificate revocation mode"
 nuget_case=$(jq -r '[.setup, .run, .assert] | join("\n")' "$CASES/nuget.yaml")
 if printf '%s\n' "$nuget_case" | grep -i -E '(signatureValidationMode|allowUntrusted|allowInsecureConnections|disableTLSCertificateValidation|--allow-insecure-connections)'; then
   fail "NuGet mirror case disables package signatures, repository signatures, or TLS certificate validation"
