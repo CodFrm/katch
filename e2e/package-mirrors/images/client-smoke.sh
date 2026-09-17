@@ -14,7 +14,34 @@ expect_version() {
   printf '%s=%s\n' "$client" "$actual"
 }
 
-case ${KATCH_CLIENT_FLAVOR:?KATCH_CLIENT_FLAVOR is required} in
+client_flavor=${KATCH_CLIENT_FLAVOR:?KATCH_CLIENT_FLAVOR is required}
+if [ "$client_flavor" = homebrew ] && [ "$(id -u)" = 0 ]; then
+  client_user=${KATCH_CLIENT_USER:-}
+  if [ -z "$client_user" ]; then
+    printf '%s\n' 'KATCH_CLIENT_USER is required for root Homebrew smoke' >&2
+    exit 64
+  fi
+  if ! passwd_entry=$(getent passwd "$client_user"); then
+    printf '%s\n' "Homebrew smoke user does not exist: $client_user" >&2
+    exit 67
+  fi
+  client_uid=$(printf '%s\n' "$passwd_entry" | awk -F: 'NR == 1 && NF >= 7 { print $3 }')
+  client_home=$(printf '%s\n' "$passwd_entry" | awk -F: 'NR == 1 && NF >= 7 { print $6 }')
+  case $client_uid in
+    ''|*[!0-9]*|0)
+      printf '%s\n' "Homebrew smoke user must be an existing nonroot user: $client_user" >&2
+      exit 67
+      ;;
+  esac
+  if [ -z "$client_home" ]; then
+    printf '%s\n' "Homebrew smoke user has no home directory: $client_user" >&2
+    exit 67
+  fi
+  exec runuser -u "$client_user" -- env \
+    HOME="$client_home" USER="$client_user" LOGNAME="$client_user" "$0" "$@"
+fi
+
+case $client_flavor in
   node)
     expect_version node 22.20.0 "$(node --version | sed 's/^v//')"
     expect_version npm 11.12.1 "$(npm --version)"

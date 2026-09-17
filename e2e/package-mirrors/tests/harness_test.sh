@@ -53,6 +53,106 @@ fi
 grep -F 'sbt version mismatch: expected 1.11.6, got prefix1.11.6suffix' "$workdir/smoke.err" >/dev/null ||
   fail "client smoke did not report the non-exact sbt version"
 
+homebrew_smoke_bin=$workdir/homebrew-smoke-bin
+homebrew_runuser_log=$workdir/homebrew-runuser.log
+homebrew_identity_log=$workdir/homebrew-identity.log
+homebrew_id_log=$workdir/homebrew-id.log
+mkdir -p "$homebrew_smoke_bin"
+cat > "$homebrew_smoke_bin/id" <<'EOF'
+#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${ID_LOG:?ID_LOG is required}"
+[ "$#" -eq 1 ] && [ "$1" = -u ] || exit 64
+printf '%s\n' "${FAKE_UID:?FAKE_UID is required}"
+EOF
+cat > "$homebrew_smoke_bin/getent" <<'EOF'
+#!/bin/sh
+set -eu
+[ "$#" -eq 2 ] && [ "$1" = passwd ] && [ "$2" = linuxbrew ] || exit 64
+[ "${FAKE_USER_EXISTS:-1}" = 1 ] || exit 2
+printf '%s\n' 'linuxbrew:x:1000:1000:Linuxbrew:/home/linuxbrew:/bin/bash'
+EOF
+cat > "$homebrew_smoke_bin/runuser" <<'EOF'
+#!/bin/sh
+set -eu
+: > "${RUNUSER_LOG:?RUNUSER_LOG is required}"
+for argument do
+  printf '<%s>\n' "$argument" >> "$RUNUSER_LOG"
+done
+[ "$#" -eq 8 ] && [ "$1" = -u ] && [ "$2" = linuxbrew ] && [ "$3" = -- ] && [ "$4" = env ] || exit 64
+shift 3
+FAKE_UID=1000 "$@"
+EOF
+cat > "$homebrew_smoke_bin/brew" <<'EOF'
+#!/bin/sh
+set -eu
+printf '%s|%s|%s\n' "$HOME" "$USER" "$LOGNAME" > "${BREW_IDENTITY_LOG:?BREW_IDENTITY_LOG is required}"
+printf '%s\n' 'Homebrew 4.6.20'
+EOF
+cat > "$homebrew_smoke_bin/go" <<'EOF'
+#!/bin/sh
+set -eu
+printf '%s\n' 'go version go1.26.0 linux/amd64'
+EOF
+chmod 0555 "$homebrew_smoke_bin"/*
+
+: > "$homebrew_id_log"
+FAKE_UID=0 ID_LOG="$homebrew_id_log" RUNUSER_LOG="$homebrew_runuser_log" \
+  BREW_IDENTITY_LOG="$homebrew_identity_log" KATCH_CLIENT_FLAVOR=homebrew \
+  KATCH_CLIENT_USER=linuxbrew HOME=/root USER=root LOGNAME=root \
+  PATH="$homebrew_smoke_bin:$PATH" "$IMAGE_SMOKE" >"$workdir/homebrew-smoke.out" 2>"$workdir/homebrew-smoke.err" ||
+  fail "root Homebrew smoke was not demoted: $(cat "$workdir/homebrew-smoke.err")"
+[ "$(cat "$workdir/homebrew-smoke.out")" = 'brew=4.6.20' ] ||
+  fail "demoted Homebrew smoke did not preserve the exact version check"
+expected_runuser=$(printf '%s\n' '<-u>' '<linuxbrew>' '<-->' '<env>' '<HOME=/home/linuxbrew>' '<USER=linuxbrew>' '<LOGNAME=linuxbrew>' "<$IMAGE_SMOKE>")
+[ "$(cat "$homebrew_runuser_log")" = "$expected_runuser" ] ||
+  fail "root Homebrew smoke did not re-exec itself through the exact runuser contract"
+[ "$(cat "$homebrew_identity_log")" = '/home/linuxbrew|linuxbrew|linuxbrew' ] ||
+  fail "demoted Homebrew smoke did not use the passwd identity environment"
+[ "$(wc -l < "$homebrew_id_log" | tr -d ' ')" -eq 2 ] ||
+  fail "demoted Homebrew smoke recursed or skipped the nonroot execution"
+
+rm -f "$homebrew_runuser_log"
+FAKE_UID=1000 ID_LOG="$homebrew_id_log" RUNUSER_LOG="$homebrew_runuser_log" \
+  BREW_IDENTITY_LOG="$homebrew_identity_log" KATCH_CLIENT_FLAVOR=homebrew \
+  KATCH_CLIENT_USER=linuxbrew HOME=/tmp/caller-home USER=caller LOGNAME=caller \
+  PATH="$homebrew_smoke_bin:$PATH" "$IMAGE_SMOKE" >"$workdir/homebrew-smoke.out" 2>"$workdir/homebrew-smoke.err" ||
+  fail "nonroot Homebrew smoke changed behavior: $(cat "$workdir/homebrew-smoke.err")"
+[ ! -e "$homebrew_runuser_log" ] || fail "nonroot Homebrew smoke invoked runuser"
+[ "$(cat "$homebrew_identity_log")" = '/tmp/caller-home|caller|caller' ] ||
+  fail "nonroot Homebrew smoke replaced the caller identity environment"
+
+rm -f "$homebrew_runuser_log"
+: > "$homebrew_id_log"
+ID_LOG="$homebrew_id_log" RUNUSER_LOG="$homebrew_runuser_log" KATCH_CLIENT_FLAVOR=go \
+  PATH="$homebrew_smoke_bin:$PATH" "$IMAGE_SMOKE" >"$workdir/homebrew-smoke.out" 2>"$workdir/homebrew-smoke.err" ||
+  fail "non-Homebrew smoke changed behavior: $(cat "$workdir/homebrew-smoke.err")"
+[ "$(cat "$workdir/homebrew-smoke.out")" = 'go=1.26.0' ] ||
+  fail "non-Homebrew smoke did not preserve the exact version check"
+[ ! -s "$homebrew_id_log" ] || fail "non-Homebrew smoke inspected or changed its user"
+[ ! -e "$homebrew_runuser_log" ] || fail "non-Homebrew smoke invoked runuser"
+
+rm -f "$homebrew_runuser_log"
+if env -u KATCH_CLIENT_USER FAKE_UID=0 ID_LOG="$homebrew_id_log" RUNUSER_LOG="$homebrew_runuser_log" \
+  BREW_IDENTITY_LOG="$homebrew_identity_log" KATCH_CLIENT_FLAVOR=homebrew \
+  PATH="$homebrew_smoke_bin:$PATH" "$IMAGE_SMOKE" >"$workdir/homebrew-smoke.out" 2>"$workdir/homebrew-smoke.err"; then
+  fail "root Homebrew smoke accepted an empty client user"
+fi
+[ ! -e "$homebrew_runuser_log" ] || fail "root Homebrew smoke invoked runuser with an empty client user"
+
+rm -f "$homebrew_runuser_log"
+if FAKE_UID=0 FAKE_USER_EXISTS=0 ID_LOG="$homebrew_id_log" RUNUSER_LOG="$homebrew_runuser_log" \
+  BREW_IDENTITY_LOG="$homebrew_identity_log" KATCH_CLIENT_FLAVOR=homebrew \
+  KATCH_CLIENT_USER=linuxbrew PATH="$homebrew_smoke_bin:$PATH" \
+  "$IMAGE_SMOKE" >"$workdir/homebrew-smoke.out" 2>"$workdir/homebrew-smoke.err"; then
+  fail "root Homebrew smoke accepted a nonexistent client user"
+fi
+[ ! -e "$homebrew_runuser_log" ] || fail "root Homebrew smoke invoked runuser with a nonexistent client user"
+
+if grep -n -E '(safe[.]directory|(^|[[:space:]])(chmod|chown)([[:space:]]|$))' "$IMAGE_SMOKE"; then
+  fail "client smoke bypasses Git ownership checks or changes filesystem ownership/modes"
+fi
+
 jq -e '
   type == "array" and length == 12 and
   all(.[];
