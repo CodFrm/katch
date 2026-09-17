@@ -27,6 +27,7 @@ import (
 	"github.com/CodFrm/katch/internal/cache"
 	"github.com/CodFrm/katch/internal/metrics"
 	"github.com/CodFrm/katch/internal/proxy/backoff"
+	_ "github.com/CodFrm/katch/internal/proxy/packageprofile/builtin"
 	"github.com/CodFrm/katch/internal/repository/cache_repo"
 	"github.com/CodFrm/katch/internal/repository/event_repo"
 	"github.com/CodFrm/katch/internal/repository/git_repo"
