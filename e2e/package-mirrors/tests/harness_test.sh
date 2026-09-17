@@ -661,6 +661,37 @@ EOF
 KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/mapped-katch-probe.log" "$capture_katch_ip" ||
   fail "IPv4-mapped JVM route probe to Katch port zero was rejected"
 
+cat > "$workdir/katch-musl-route-probe-success.log" <<EOF
+127 connect(3, {sa_family=AF_INET, sin_port=htons(65535), sin_addr=inet_addr("$capture_katch_ip")}, 16) = 0
+128 connect(3, {sa_family=AF_INET6, sin6_port=htons(65535), inet_pton(AF_INET6, "::ffff:$capture_katch_ip", &sin6_addr), sin6_scope_id=0}, 28) = 0
+EOF
+KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/katch-musl-route-probe-success.log" "$capture_katch_ip" ||
+  fail "successful musl route probe to exact IPv4 or IPv4-mapped Katch IP was rejected"
+
+cat > "$workdir/katch-musl-route-probe-failure.log" <<EOF
+129 connect(3, {sa_family=AF_INET, sin_port=htons(65535), sin_addr=inet_addr("$capture_katch_ip")}, 16) = -1 EPERM (Operation not permitted)
+130 connect(3, {sa_family=AF_INET6, sin6_port=htons(65535), inet_pton(AF_INET6, "::ffff:$capture_katch_ip", &sin6_addr), sin6_scope_id=0}, 28) = -1 EINPROGRESS (Operation now in progress)
+EOF
+if KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/katch-musl-route-probe-failure.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "failed musl route probe to exact IPv4 or IPv4-mapped Katch IP was accepted"
+fi
+grep -F 'sa_family=AF_INET, sin_port=htons(65535)' "$workdir/out" >/dev/null ||
+  fail "failed IPv4 musl route probe was not reported"
+grep -F 'sa_family=AF_INET6, sin6_port=htons(65535)' "$workdir/out" >/dev/null ||
+  fail "failed IPv4-mapped musl route probe was not reported"
+
+cat > "$workdir/other-musl-route-probe.log" <<'EOF'
+131 connect(3, {sa_family=AF_INET, sin_port=htons(65535), sin_addr=inet_addr("192.0.2.10")}, 16) = 0
+132 connect(3, {sa_family=AF_INET6, sin6_port=htons(65535), inet_pton(AF_INET6, "::ffff:192.0.2.11", &sin6_addr), sin6_scope_id=0}, 28) = 0
+EOF
+if KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/other-musl-route-probe.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "musl route probe to a non-Katch IPv4 or IPv4-mapped destination was accepted"
+fi
+grep -F '192.0.2.10' "$workdir/out" >/dev/null ||
+  fail "IPv4 musl route probe to another IP was not reported"
+grep -F '::ffff:192.0.2.11' "$workdir/out" >/dev/null ||
+  fail "IPv4-mapped musl route probe to another IP was not reported"
+
 cat > "$workdir/loopback.log" <<'EOF'
 127 connect(3, {sa_family=AF_INET, sin_port=htons(49152), sin_addr=inet_addr("127.0.0.1")}, 16) = 0
 128 connect(3, {sa_family=AF_INET, sin_port=htons(49153), sin_addr=inet_addr("127.42.0.9")}, 16) = 0

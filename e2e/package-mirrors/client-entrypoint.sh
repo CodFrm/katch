@@ -17,6 +17,7 @@ verify_capture() {
       if (destination ~ /^127\./ || destination == "::1" || destination ~ /^::ffff:127\./) return
       if (destination == allowed || destination == "::ffff:" allowed) {
         if (port == allowed_port || port == 0) return
+        if (port == 65535 && line ~ /(^|[[:space:]])connect\(/ && line ~ /[[:space:]]=[[:space:]]0[[:space:]]*$/) return
       }
       reject(line)
     }
