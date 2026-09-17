@@ -157,6 +157,15 @@ printf '%s\n' "$npm_run" | grep -Fx '(cd pnpm && PNPM_CONFIG_UPDATE_NOTIFIER=fal
 printf '%s\n' "$npm_run" | grep -Fx '(cd yarn-berry && yarn-berry config set npmRegistryServer "$registry" && yarn-berry config set unsafeHttpWhitelist --json "[\"$KATCH_HOST\"]" && yarn-berry install --mode=skip-build)' >/dev/null ||
   fail "npm mirror case does not allow HTTP only for the configured Katch host before Yarn Berry install"
 
+pypi_run=$(jq -r '.run' "$CASES/pypi.yaml")
+printf '%s\n' "$pypi_run" | grep -Fx 'pip/.venv/bin/python -m pip install --disable-pip-version-check --no-cache-dir --trusted-host "$KATCH_HOST" --index-url "$index" idna==3.10' >/dev/null ||
+  fail "pip mirror case does not trust HTTP only for the configured Katch host"
+printf '%s\n' "$pypi_run" | grep -Fx 'uv pip install --no-cache --python uv/.venv/bin/python --allow-insecure-host "$KATCH_HOST" --index-url "$index" idna==3.10' >/dev/null ||
+  fail "uv mirror case does not allow HTTP only for the configured Katch host"
+if printf '%s\n' "$pypi_run" | grep -E -- '(^|[[:space:]])(--trusted-host|--allow-insecure-host)(=|[[:space:]])[^[:space:]]*(\*|pypi[.]org|files[.]pythonhosted[.]org)|(^|[[:space:]])(PIP_TRUSTED_HOST|UV_INSECURE_HOST|UV_ALLOW_INSECURE_HOST|PYTHONHTTPSVERIFY|CURL_CA_BUNDLE|REQUESTS_CA_BUNDLE)='; then
+  fail "PyPI mirror case broadens HTTP or TLS trust beyond the configured Katch host"
+fi
+
 jq -r '.run' "$CASES/homebrew.yaml" | grep -F 'HOMEBREW_ARTIFACT_DOMAIN="${KATCH_URL%/}/v2/ghcr.io"' >/dev/null ||
   fail "Homebrew bottle route changed from the approved /v2/ghcr.io contract"
 jq -r '.run' "$CASES/registry-git-regression.yaml" | grep -F 'git clone --depth=1' >/dev/null ||
