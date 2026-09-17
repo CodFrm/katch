@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/url"
 	"os"
+	"slices"
 	"testing"
 
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
@@ -56,8 +57,11 @@ func TestCargoProfileClassifiesSparseMetadataAndVersionedCrates(t *testing.T) {
 			if got.Class != tc.class || got.Transform != tc.transform {
 				t.Fatalf("Classify(%q, %q) = %+v, want class %v transform %v", tc.host, tc.path, got, tc.class, tc.transform)
 			}
-			if tc.transform && (len(got.MediaTypes) != 1 || got.MediaTypes[0] != "application/json") {
-				t.Fatalf("transform media types = %v", got.MediaTypes)
+			if tc.transform {
+				wantMediaTypes := []string{"application/json", "application/octet-stream"}
+				if !slices.Equal(got.MediaTypes, wantMediaTypes) {
+					t.Fatalf("transform media types = %v, want %v", got.MediaTypes, wantMediaTypes)
+				}
 			}
 		})
 	}
@@ -74,7 +78,7 @@ func TestCargoTransformRewritesPlainDownloadBaseAndPreservesConfig(t *testing.T)
 	}
 	calls := 0
 	result, err := profile.Transform(context.Background(), packageprofile.TransformRequest{
-		Body: body, ContentType: "application/json; charset=utf-8",
+		Body: body, ContentType: "application/octet-stream",
 		Source:      cargoTestURL(t, "https://index.crates.io/config.json"),
 		SiteBaseURL: "https://katch.example.com",
 		RewriteURL: func(_ context.Context, source *url.URL, companion packageprofile.Companion) (*url.URL, error) {
@@ -108,7 +112,7 @@ func TestCargoTransformRewritesPlainDownloadBaseAndPreservesConfig(t *testing.T)
 	if got.API != "https://crates.io" || got.AuthRequired {
 		t.Fatalf("trailing config fields changed: %+v", got)
 	}
-	if result.ContentType != "application/json; charset=utf-8" {
+	if result.ContentType != "application/octet-stream" {
 		t.Fatalf("content type = %q", result.ContentType)
 	}
 }

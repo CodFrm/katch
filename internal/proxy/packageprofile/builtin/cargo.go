@@ -44,7 +44,7 @@ func (cargoProfile) Classify(request packageprofile.Request) packageprofile.Repr
 			return packageprofile.Representation{
 				Class:      packageprofile.ClassMutable,
 				Transform:  true,
-				MediaTypes: []string{"application/json"},
+				MediaTypes: []string{"application/json", "application/octet-stream"},
 			}
 		}
 		if cargoSparseMetadataPath(path) {
