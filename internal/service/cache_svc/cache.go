@@ -1252,8 +1252,7 @@ func (c *cacheSvc) saveRecord(ctx context.Context, in *recordInput) error {
 		object.OriginAge = correctedInitialAge(in.Header, nowTime)
 		directives := parseCacheControl(object.CacheControl)
 		_, noCache := directives["no-cache"]
-		_, mustRevalidate := directives["must-revalidate"]
-		object.RequiresRevalidation = noCache || mustRevalidate
+		object.RequiresRevalidation = noCache
 	}
 	ttl := in.TTLSeconds
 	if !in.Immutable && ttl <= 0 {

@@ -1249,6 +1249,69 @@ func TestGet_FreshnessAgeAndSafeHeaderReplay(t *testing.T) {
 	}
 }
 
+func TestGet_MustRevalidateAllowsFreshReuseAndRejectsStale(t *testing.T) {
+	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	clock := now
+	var o *originStub
+	o = newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Cache-Control", "public, max-age=60, must-revalidate")
+		w.Header().Set("Date", now.Format(http.TimeFormat))
+		w.Header().Set("Age", "10")
+		_, _ = io.WriteString(w, "body-"+strconv.FormatInt(o.hits.Load(), 10))
+	})
+	opt := Options{Now: func() time.Time { return clock }}
+	svc, repo, _ := setupSvc(t, o, staticUpstream("files.example.com"), opt)
+	tg := target("files.example.com", "/service-index.json")
+
+	first, _ := pullWith(t, svc, tg)
+	clock = clock.Add(49 * time.Second)
+	second, hit := pullWith(t, svc, tg)
+	if first != "body-1" || second != first {
+		t.Fatalf("fresh bodies = %q, %q", first, second)
+	}
+	if got := o.hits.Load(); got != 1 {
+		t.Fatalf("fresh origin hits = %d, want 1", got)
+	}
+	if got := hit.Header.Get("Cache-Control"); got != "public, max-age=60, must-revalidate" {
+		t.Fatalf("Cache-Control = %q", got)
+	}
+	if row := repo.byKey("/service-index.json"); row == nil || row.RequiresRevalidation {
+		t.Fatalf("fresh must-revalidate row = %+v", row)
+	}
+
+	clock = clock.Add(time.Second)
+	stale, _ := pullWith(t, svc, tg)
+	if stale != "body-2" {
+		t.Fatalf("stale response body = %q, want revalidated body", stale)
+	}
+	if got := o.hits.Load(); got != 2 {
+		t.Fatalf("stale origin hits = %d, want 2", got)
+	}
+}
+
+func TestGet_NoCacheStillRevalidatesEveryReuse(t *testing.T) {
+	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Cache-Control", "public, max-age=60, no-cache")
+		w.Header().Set("Date", now.Format(http.TimeFormat))
+		_, _ = io.WriteString(w, "body")
+	})
+	svc, repo, _ := setupSvc(t, o, staticUpstream("files.example.com"), Options{
+		Now: func() time.Time { return now },
+	})
+	tg := target("files.example.com", "/service-index.json")
+
+	pullWith(t, svc, tg)
+	pullWith(t, svc, tg)
+	pullWith(t, svc, tg)
+	if got := o.hits.Load(); got != 3 {
+		t.Fatalf("origin hits = %d, want 3", got)
+	}
+	if row := repo.byKey("/service-index.json"); row == nil || !row.RequiresRevalidation {
+		t.Fatalf("no-cache row = %+v", row)
+	}
+}
+
 func TestGet_CacheControlStoragePolicyAndAgeOverflow(t *testing.T) {
 	for _, directive := range []string{"no-store", "private"} {
 		t.Run(directive, func(t *testing.T) {
@@ -1264,21 +1327,19 @@ func TestGet_CacheControlStoragePolicyAndAgeOverflow(t *testing.T) {
 			}
 		})
 	}
-	for _, directive := range []string{"no-cache", "must-revalidate"} {
-		t.Run(directive, func(t *testing.T) {
-			o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
-				w.Header().Set("Cache-Control", directive)
-				w.Header().Set("Age", strconv.FormatInt(math.MaxInt64, 10))
-				_, _ = io.WriteString(w, "body")
-			})
-			svc, repo, _ := setupSvc(t, o, staticUpstream("files.example.com"), Options{})
-			pullWith(t, svc, target("files.example.com", "/x"))
-			pullWith(t, svc, target("files.example.com", "/x"))
-			if len(repo.all()) != 1 || o.hits.Load() != 2 {
-				t.Fatalf("rows=%d hits=%d", len(repo.all()), o.hits.Load())
-			}
+	t.Run("origin age overflow is stale", func(t *testing.T) {
+		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Cache-Control", "public, max-age=60")
+			w.Header().Set("Age", strconv.FormatInt(math.MaxInt64, 10))
+			_, _ = io.WriteString(w, "body")
 		})
-	}
+		svc, repo, _ := setupSvc(t, o, staticUpstream("files.example.com"), Options{})
+		pullWith(t, svc, target("files.example.com", "/x"))
+		pullWith(t, svc, target("files.example.com", "/x"))
+		if len(repo.all()) != 1 || o.hits.Load() != 2 {
+			t.Fatalf("rows=%d hits=%d", len(repo.all()), o.hits.Load())
+		}
+	})
 }
 
 func waitForKey(repo *fakeRepo, key string, timeout time.Duration) *cache_entity.CacheObject {
