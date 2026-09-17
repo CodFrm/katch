@@ -32,16 +32,30 @@ func TestComposerProfileRewritesRootMetadataTemplateLiterally(t *testing.T) {
 	body := readComposerFixture(t, "packages.json")
 	profile := composerProfile{}
 
+	var gotCompanion packageprofile.Companion
+	resolver := composerTestResolver("https://mirror.example", map[string]packageprofile.Companion{
+		"repo.packagist.org": {
+			Host:      "repo.packagist.org",
+			Profile:   upstream_entity.PackageProfileComposer,
+			Transport: upstream_entity.ProtocolStatic,
+		},
+	})
 	result, err := profile.Transform(context.Background(), packageprofile.TransformRequest{
 		Body:        body,
 		ContentType: "application/json",
 		Source:      mustComposerURL(t, "https://repo.packagist.org/packages.json"),
 		SiteBaseURL: "https://mirror.example",
-		RewriteURL: composerTestRewriter(map[string]bool{
-			"repo.packagist.org": true,
-		}),
+		RewriteURL: func(ctx context.Context, source *url.URL, companion packageprofile.Companion) (*url.URL, error) {
+			gotCompanion = companion
+			return resolver(ctx, source, companion)
+		},
 	})
 	requireComposerNoError(t, err)
+	assertComposerEqual(t, packageprofile.Companion{
+		Host:      "repo.packagist.org",
+		Profile:   upstream_entity.PackageProfileComposer,
+		Transport: upstream_entity.ProtocolStatic,
+	}, gotCompanion)
 	assertComposerTrue(t, strings.Contains(string(result.Body), `"metadata-url":"https://mirror.example/repo.packagist.org/p2/%package%.json"`))
 	assertComposerTrue(t, !strings.Contains(string(result.Body), "%25package%"))
 
@@ -56,16 +70,30 @@ func TestComposerProfileRewritesOnlyDistURLAndPreservesPackageData(t *testing.T)
 	body := readComposerFixture(t, "package.json")
 	profile := composerProfile{}
 
+	var gotCompanion packageprofile.Companion
+	resolver := composerTestResolver("https://mirror.example", map[string]packageprofile.Companion{
+		"api.github.com": {
+			Host:      "api.github.com",
+			Profile:   upstream_entity.PackageProfileNone,
+			Transport: upstream_entity.ProtocolStatic,
+		},
+	})
 	result, err := profile.Transform(context.Background(), packageprofile.TransformRequest{
 		Body:        body,
 		ContentType: "application/json; charset=utf-8",
 		Source:      mustComposerURL(t, "https://repo.packagist.org/p2/acme/widget.json"),
 		SiteBaseURL: "https://mirror.example",
-		RewriteURL: composerTestRewriter(map[string]bool{
-			"api.github.com": true,
-		}),
+		RewriteURL: func(ctx context.Context, source *url.URL, companion packageprofile.Companion) (*url.URL, error) {
+			gotCompanion = companion
+			return resolver(ctx, source, companion)
+		},
 	})
 	requireComposerNoError(t, err)
+	assertComposerEqual(t, packageprofile.Companion{
+		Host:      "api.github.com",
+		Profile:   upstream_entity.PackageProfileNone,
+		Transport: upstream_entity.ProtocolStatic,
+	}, gotCompanion)
 
 	var got, original map[string]any
 	requireComposerNoError(t, json.Unmarshal(result.Body, &got))
@@ -83,6 +111,56 @@ func TestComposerProfileRewritesOnlyDistURLAndPreservesPackageData(t *testing.T)
 	assertComposerEqual(t, "application/json", result.ContentType)
 }
 
+func TestComposerProfileFailsClosedOnCompanionProfileMismatch(t *testing.T) {
+	profile := composerProfile{}
+	tests := []struct {
+		name       string
+		body       []byte
+		source     string
+		registered map[string]packageprofile.Companion
+	}{
+		{
+			name:   "root metadata requires composer profile",
+			body:   readComposerFixture(t, "packages.json"),
+			source: "https://repo.packagist.org/packages.json",
+			registered: map[string]packageprofile.Companion{
+				"repo.packagist.org": {
+					Host:      "repo.packagist.org",
+					Profile:   upstream_entity.PackageProfileNone,
+					Transport: upstream_entity.ProtocolStatic,
+				},
+			},
+		},
+		{
+			name:   "dist requires generic static profile",
+			body:   readComposerFixture(t, "package.json"),
+			source: "https://repo.packagist.org/p2/acme/widget.json",
+			registered: map[string]packageprofile.Companion{
+				"api.github.com": {
+					Host:      "api.github.com",
+					Profile:   upstream_entity.PackageProfileComposer,
+					Transport: upstream_entity.ProtocolStatic,
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := profile.Transform(context.Background(), packageprofile.TransformRequest{
+				Body:        test.body,
+				ContentType: "application/json",
+				Source:      mustComposerURL(t, test.source),
+				SiteBaseURL: "https://mirror.example",
+				RewriteURL:  composerTestResolver("https://mirror.example", test.registered),
+			})
+			if !errors.Is(err, packageprofile.ErrUnavailable) {
+				t.Fatalf("Transform() error = %v, want ErrUnavailable", err)
+			}
+		})
+	}
+}
+
 func TestComposerProfileFailsClosedWithoutDistCompanion(t *testing.T) {
 	profile := composerProfile{}
 
@@ -91,7 +169,7 @@ func TestComposerProfileFailsClosedWithoutDistCompanion(t *testing.T) {
 		ContentType: "application/json",
 		Source:      mustComposerURL(t, "https://repo.packagist.org/p2/acme/widget.json"),
 		SiteBaseURL: "https://mirror.example",
-		RewriteURL:  composerTestRewriter(nil),
+		RewriteURL:  composerTestResolver("https://mirror.example", nil),
 	})
 	if err == nil {
 		t.Fatal("Transform() error = nil, want unavailable")
@@ -123,17 +201,27 @@ func mustComposerURL(t *testing.T, raw string) *url.URL {
 	return parsed
 }
 
-func composerTestRewriter(registered map[string]bool) packageprofile.RewriteURL {
+func composerTestResolver(
+	siteBaseURL string,
+	registered map[string]packageprofile.Companion,
+) packageprofile.RewriteURL {
 	return func(_ context.Context, source *url.URL, companion packageprofile.Companion) (*url.URL, error) {
-		if companion.Host != source.Hostname() || companion.Transport != "static" || !registered[source.Hostname()] {
+		host := strings.ToLower(strings.TrimSuffix(source.Hostname(), "."))
+		if companion.Host != host {
+			return nil, packageprofile.ErrInvalidMetadata
+		}
+		configured, ok := registered[host]
+		if !ok || (companion.Transport != "" && configured.Transport != companion.Transport) ||
+			(companion.Profile != "" && upstream_entity.NormalizePackageProfile(configured.Profile) != companion.Profile) {
 			return nil, packageprofile.ErrUnavailable
 		}
-		rewritten := *source
-		rewritten.Scheme = "https"
-		rewritten.Host = "mirror.example"
-		rewritten.Path = "/" + source.Host + source.Path
-		rewritten.RawPath = ""
-		return &rewritten, nil
+		rewritten, err := url.Parse(strings.TrimSuffix(siteBaseURL, "/") + "/" + host + source.EscapedPath())
+		if err != nil {
+			return nil, packageprofile.ErrUnavailable
+		}
+		rewritten.RawQuery = source.RawQuery
+		rewritten.Fragment = source.Fragment
+		return rewritten, nil
 	}
 }
 

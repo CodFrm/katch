@@ -118,7 +118,9 @@ func rewriteComposerTemplate(
 	if err != nil || parsed.Hostname() == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 		return "", packageprofile.ErrInvalidMetadata
 	}
-	rewritten, err := rewrite(ctx, parsed, composerCompanion(parsed.Hostname()))
+	rewritten, err := rewrite(ctx, parsed, composerCompanion(
+		parsed.Hostname(), upstream_entity.PackageProfileComposer,
+	))
 	if err != nil {
 		return "", err
 	}
@@ -192,7 +194,9 @@ func rewriteComposerVersion(
 	if err != nil || parsed.Hostname() == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 		return nil, packageprofile.ErrInvalidMetadata
 	}
-	rewritten, err := rewrite(ctx, parsed, composerCompanion(parsed.Hostname()))
+	rewritten, err := rewrite(ctx, parsed, composerCompanion(
+		parsed.Hostname(), upstream_entity.PackageProfileNone,
+	))
 	if err != nil {
 		if errors.Is(err, packageprofile.ErrUnavailable) {
 			return nil, packageprofile.ErrUnavailable
@@ -213,11 +217,14 @@ func rewriteComposerVersion(
 	return json.Marshal(version)
 }
 
-func composerCompanion(host string) packageprofile.Companion {
+func composerCompanion(
+	host string,
+	profile upstream_entity.PackageProfile,
+) packageprofile.Companion {
 	return packageprofile.Companion{
 		Host:      host,
-		Profile:   upstream_entity.PackageProfileNone,
-		Transport: "static",
+		Profile:   profile,
+		Transport: upstream_entity.ProtocolStatic,
 	}
 }
 
