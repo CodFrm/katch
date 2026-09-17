@@ -268,7 +268,7 @@ type resolverCall struct {
 
 type mappedResolver struct {
 	dials      map[string]string
-	registered map[string]bool
+	registered map[string]destination.RewriteUpstream
 	calls      []resolverCall
 }
 
@@ -276,8 +276,13 @@ func (r *mappedResolver) Resolve(
 	_ context.Context, target *url.URL, requirement destination.DestinationRequirement,
 ) (*destination.ResolvedTarget, error) {
 	r.calls = append(r.calls, resolverCall{target: target.String(), requirement: requirement})
-	if requirement.RequireRegistered && !r.registered[target.Hostname()] {
-		return nil, destination.ErrDestinationNotAllowed
+	if requirement.RequireRegistered {
+		upstream, ok := r.registered[target.Hostname()]
+		if !ok || (requirement.Transport != "" && !upstream.Transports.Has(requirement.Transport)) ||
+			(requirement.Profile != "" &&
+				upstream_entity.NormalizePackageProfile(upstream.Profile) != requirement.Profile) {
+			return nil, destination.ErrDestinationNotAllowed
+		}
 	}
 	dial, ok := r.dials[target.Host]
 	if !ok {
@@ -342,7 +347,12 @@ func TestDo_RedirectDestinationSafety(t *testing.T) {
 				parseTarget(t, originURL).Host: serverAddress(t, originServer.URL),
 				parseTarget(t, targetURL).Host: serverAddress(t, targetServer.URL),
 			},
-			registered: map[string]bool{"cdn.example.com": true},
+			registered: map[string]destination.RewriteUpstream{
+				"cdn.example.com": {
+					Profile:    upstream_entity.PackageProfileNPM,
+					Transports: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+				},
+			},
 		}
 		resp, err := New(Options{Resolver: resolver}).Do(context.Background(), &Request{
 			Method: http.MethodGet, Origin: originURL, Path: "/metadata",
@@ -372,6 +382,111 @@ func TestDo_RedirectDestinationSafety(t *testing.T) {
 		}
 	})
 
+	t.Run("registry cross-host redirect uses a registered byte-serving CDN", func(t *testing.T) {
+		var targetHits atomic.Int64
+		var gotURI, gotAuthorization, gotCookie string
+		targetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			targetHits.Add(1)
+			gotURI = r.URL.RequestURI()
+			gotAuthorization = r.Header.Get("Authorization")
+			gotCookie = r.Header.Get("Cookie")
+			_, _ = io.WriteString(w, "registry-blob")
+		}))
+		defer targetServer.Close()
+		targetURL := mappedURL(t, targetServer.URL, "pkg-containers.githubusercontent.com")
+
+		originServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Location", targetURL+"/ghcr1/blobs/sha256:abc?se=2030-01-01&sig=signed%2Bvalue")
+			w.WriteHeader(http.StatusTemporaryRedirect)
+		}))
+		defer originServer.Close()
+		originURL := mappedURL(t, originServer.URL, "ghcr.io")
+
+		resolver := &mappedResolver{
+			dials: map[string]string{
+				parseTarget(t, originURL).Host: serverAddress(t, originServer.URL),
+				parseTarget(t, targetURL).Host: serverAddress(t, targetServer.URL),
+			},
+			registered: map[string]destination.RewriteUpstream{
+				"pkg-containers.githubusercontent.com": {
+					Profile:    upstream_entity.PackageProfileNone,
+					Transports: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+				},
+			},
+		}
+		resp, err := New(Options{Resolver: resolver}).Do(context.Background(), &Request{
+			Method: http.MethodGet, Origin: originURL, Path: "/v2/homebrew/core/jq/blobs/sha256:abc",
+			Authorization: "Bearer registry-token",
+			Requirement: destination.DestinationRequirement{
+				Transport:     upstream_entity.ProtocolRegistry,
+				AddressPolicy: destination.PublicAddressesOnly,
+			},
+		})
+		if err != nil {
+			t.Fatalf("Do() error = %v", err)
+		}
+		if got := readBody(t, resp); got != "registry-blob" {
+			t.Fatalf("body = %q", got)
+		}
+		if targetHits.Load() != 1 || gotURI != "/ghcr1/blobs/sha256:abc?se=2030-01-01&sig=signed%2Bvalue" {
+			t.Fatalf("target hits/URI = %d/%q", targetHits.Load(), gotURI)
+		}
+		if gotAuthorization != "" || gotCookie != "" {
+			t.Fatalf("cross-host credentials = Authorization %q, Cookie %q", gotAuthorization, gotCookie)
+		}
+		last := resolver.calls[len(resolver.calls)-1].requirement
+		if !last.RequireRegistered || last.AddressPolicy != destination.PublicAddressesOnly ||
+			last.Transport != upstream_entity.ProtocolStatic || last.Profile != upstream_entity.PackageProfileNone {
+			t.Fatalf("registry CDN requirement = %+v", last)
+		}
+	})
+
+	for name, registered := range map[string]map[string]destination.RewriteUpstream{
+		"unregistered CDN": {},
+		"registry-only CDN": {
+			"pkg-containers.githubusercontent.com": {
+				Profile:    upstream_entity.PackageProfileNone,
+				Transports: upstream_entity.ProtocolSet{upstream_entity.ProtocolRegistry},
+			},
+		},
+		"profiled static CDN": {
+			"pkg-containers.githubusercontent.com": {
+				Profile:    upstream_entity.PackageProfileComposer,
+				Transports: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+			},
+		},
+	} {
+		t.Run(name+" is rejected for a registry redirect", func(t *testing.T) {
+			var targetHits atomic.Int64
+			targetServer := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				targetHits.Add(1)
+			}))
+			defer targetServer.Close()
+			targetURL := mappedURL(t, targetServer.URL, "pkg-containers.githubusercontent.com")
+			originServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Location", targetURL+"/blob?sig=secret")
+				w.WriteHeader(http.StatusTemporaryRedirect)
+			}))
+			defer originServer.Close()
+			originURL := mappedURL(t, originServer.URL, "ghcr.io")
+			resolver := &mappedResolver{dials: map[string]string{
+				parseTarget(t, originURL).Host: serverAddress(t, originServer.URL),
+				parseTarget(t, targetURL).Host: serverAddress(t, targetServer.URL),
+			}, registered: registered}
+
+			resp, err := New(Options{Resolver: resolver}).Do(context.Background(), &Request{
+				Method: http.MethodGet, Origin: originURL, Path: "/v2/o/r/blobs/sha256:abc",
+				Requirement: destination.DestinationRequirement{Transport: upstream_entity.ProtocolRegistry},
+			})
+			if resp != nil || !errors.Is(err, destination.ErrDestinationNotAllowed) {
+				t.Fatalf("response/error = %#v/%v", resp, err)
+			}
+			if targetHits.Load() != 0 {
+				t.Fatalf("blocked CDN was dialed %d times", targetHits.Load())
+			}
+		})
+	}
+
 	t.Run("unregistered cross-host redirect is rejected before dial", func(t *testing.T) {
 		var targetHits atomic.Int64
 		targetServer := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
@@ -387,7 +502,7 @@ func TestDo_RedirectDestinationSafety(t *testing.T) {
 		resolver := &mappedResolver{dials: map[string]string{
 			parseTarget(t, originURL).Host: serverAddress(t, originServer.URL),
 			parseTarget(t, targetURL).Host: serverAddress(t, targetServer.URL),
-		}, registered: map[string]bool{}}
+		}, registered: map[string]destination.RewriteUpstream{}}
 
 		resp, err := New(Options{Resolver: resolver}).Do(context.Background(), &Request{
 			Method: http.MethodGet, Origin: originURL, Path: "/metadata",
@@ -430,12 +545,20 @@ func TestDo_RedirectDestinationSafety(t *testing.T) {
 			resolver := &mappedResolver{dials: map[string]string{
 				parseTarget(t, originURL).Host: serverAddress(t, originServer.URL),
 				parseTarget(t, targetURL).Host: serverAddress(t, targetServer.URL),
-			}, registered: map[string]bool{"cdn.example.com": true}}
+			}, registered: map[string]destination.RewriteUpstream{
+				"cdn.example.com": {
+					Profile:    upstream_entity.PackageProfileNone,
+					Transports: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+				},
+			}}
 
 			resp, err := New(Options{
 				Resolver:        resolver,
 				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // test server certificate
-			}).Do(context.Background(), &Request{Method: http.MethodGet, Origin: originURL, Path: "/x"})
+			}).Do(context.Background(), &Request{
+				Method: http.MethodGet, Origin: originURL, Path: "/x",
+				Requirement: destination.DestinationRequirement{Transport: upstream_entity.ProtocolRegistry},
+			})
 			if resp != nil || !errors.Is(err, destination.ErrDestinationNotAllowed) {
 				t.Fatalf("response/error = %#v/%v", resp, err)
 			}
@@ -444,6 +567,85 @@ func TestDo_RedirectDestinationSafety(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCheckRedirectPreservesTransportSemantics(t *testing.T) {
+	t.Run("registry cross-host redirect becomes static none and strips credentials", func(t *testing.T) {
+		previous := &http.Request{
+			Method: http.MethodGet,
+			URL:    parseTarget(t, "https://ghcr.io/v2/homebrew/core/jq/blobs/sha256:abc"),
+		}
+		previous = previous.WithContext(context.WithValue(previous.Context(), requirementKey{},
+			destination.DestinationRequirement{
+				Transport:     upstream_entity.ProtocolRegistry,
+				AddressPolicy: destination.AllowPrivateAddresses,
+			}))
+		next := &http.Request{
+			Method: http.MethodGet,
+			URL: parseTarget(t,
+				"https://pkg-containers.githubusercontent.com/ghcr1/blob?se=2030-01-01&sig=signed%2Bvalue"),
+			Header: http.Header{
+				"Authorization":       {"Bearer secret"},
+				"Proxy-Authorization": {"Basic secret"},
+				"Cookie":              {"session=secret"},
+			},
+		}
+
+		if err := checkRedirect(next, []*http.Request{previous}); err != nil {
+			t.Fatalf("checkRedirect() error = %v", err)
+		}
+		got, _ := next.Context().Value(requirementKey{}).(destination.DestinationRequirement)
+		if !got.RequireRegistered || got.Transport != upstream_entity.ProtocolStatic ||
+			got.Profile != upstream_entity.PackageProfileNone || got.AddressPolicy != destination.PublicAddressesOnly {
+			t.Fatalf("requirement = %+v", got)
+		}
+		if next.Header.Get("Authorization") != "" || next.Header.Get("Proxy-Authorization") != "" ||
+			next.Header.Get("Cookie") != "" {
+			t.Fatalf("credentials were not stripped: %+v", next.Header)
+		}
+		if next.URL.RawQuery != "se=2030-01-01&sig=signed%2Bvalue" {
+			t.Fatalf("signed query = %q", next.URL.RawQuery)
+		}
+	})
+
+	t.Run("same-host registry redirect keeps registry requirement", func(t *testing.T) {
+		previous := &http.Request{Method: http.MethodHead, URL: parseTarget(t, "https://ghcr.io/v2/o/r/blobs/x")}
+		previous = previous.WithContext(context.WithValue(previous.Context(), requirementKey{},
+			destination.DestinationRequirement{
+				Transport:     upstream_entity.ProtocolRegistry,
+				AddressPolicy: destination.AllowPrivateAddresses,
+			}))
+		next := &http.Request{Method: http.MethodHead, URL: parseTarget(t, "https://ghcr.io/v2/o/r/blobs/y")}
+
+		if err := checkRedirect(next, []*http.Request{previous}); err != nil {
+			t.Fatalf("checkRedirect() error = %v", err)
+		}
+		got, _ := next.Context().Value(requirementKey{}).(destination.DestinationRequirement)
+		if got.RequireRegistered || got.Transport != upstream_entity.ProtocolRegistry ||
+			got.AddressPolicy != destination.AllowPrivateAddresses {
+			t.Fatalf("requirement = %+v", got)
+		}
+	})
+
+	t.Run("static package redirect keeps its profile", func(t *testing.T) {
+		previous := &http.Request{Method: http.MethodGet, URL: parseTarget(t, "https://api.github.com/repos/o/r/zipball/x")}
+		previous = previous.WithContext(context.WithValue(previous.Context(), requirementKey{},
+			destination.DestinationRequirement{
+				Transport: upstream_entity.ProtocolStatic,
+				Profile:   upstream_entity.PackageProfileComposer,
+			}))
+		next := &http.Request{Method: http.MethodGet, URL: parseTarget(t, "https://codeload.github.com/o/r/legacy.zip/x")}
+
+		if err := checkRedirect(next, []*http.Request{previous}); err != nil {
+			t.Fatalf("checkRedirect() error = %v", err)
+		}
+		got, _ := next.Context().Value(requirementKey{}).(destination.DestinationRequirement)
+		if !got.RequireRegistered || got.Transport != upstream_entity.ProtocolStatic ||
+			got.Profile != upstream_entity.PackageProfileComposer ||
+			got.AddressPolicy != destination.PublicAddressesOnly {
+			t.Fatalf("requirement = %+v", got)
+		}
+	})
 }
 
 func TestDo_PinnedDialBypassesProxyAndKeepsHostAndSNI(t *testing.T) {

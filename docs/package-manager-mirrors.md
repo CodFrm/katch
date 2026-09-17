@@ -51,7 +51,7 @@ transport、HTTPS 降级和实际拨号地址检查。
 | `rpm`      | DNF、YUM 固定 baseurl                    | 无                                                                                    |
 | `apk`      | Alpine apk 固定 repository               | 无                                                                                    |
 | `composer` | Composer 2 dist 安装                     | `api.github.com`、`codeload.github.com`（均为 static / composer）                      |
-| `homebrew` | Homebrew 标准 Bottle 安装                | `ghcr.io`（registry / none）、`github.com`（git / none）                              |
+| `homebrew` | Homebrew 标准 Bottle 安装                | `ghcr.io`（registry / none）、`pkg-containers.githubusercontent.com`（static / none）、`github.com`（git / none） |
 
 后端对每条 profile 上游返回 `package_readiness`，后台还能用未保存草稿请求同一套 preview。
 只有以下条件全部满足时 `ready=true`：
@@ -69,7 +69,9 @@ lockfile/registry-host 约束、Go 与 Homebrew no-fallback、DNF/YUM 固定 `ba
 `mirrorlist`/`metalink`、Composer dist-only 等边界。Composer 的 Packagist 根元数据、
 `api.github.com` dist 入口和重定向后的 `codeload.github.com` 下载都必须显式注册为
 `static / composer`；GitHub 完整 commit SHA dist 才按不可变对象缓存，tag/ref 仍按可变或
-未知路径处理。前端只翻译和展示这些 DTO，不复制兼容规则。**可复制配置还有第二道门：
+未知路径处理。Homebrew 的 GHCR blob 会重定向到签名 CDN URL，因此必须显式注册精确主机
+`pkg-containers.githubusercontent.com` 为 `static / none`；不会自动新增该记录，也不接受
+通配的 `githubusercontent.com` 主机。前端只翻译和展示这些 DTO，不复制兼容规则。**可复制配置还有第二道门：
 对应真实客户端必须在阻断公网的 runtime matrix 中通过。最终矩阵仍待 `coding.local`
 执行，当前所有 profile 的 `runtime_verified` 都是 `false`，因此公开页和后台只显示待验证
 状态，不显示可复制片段，也不宣称完整支持。**

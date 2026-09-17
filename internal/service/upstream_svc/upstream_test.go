@@ -123,6 +123,47 @@ func TestPackageProfileReadiness(t *testing.T) {
 		convey.So(blocked.Companions[1].Reason, convey.ShouldEqual, "profile")
 	})
 
+	convey.Convey("Homebrew readiness requires the registry, its exact static CDN, and Git", t, func() {
+		configured := []*upstream_entity.Upstream{
+			{
+				Host: "formulae.brew.sh", Enabled: true,
+				Protocols:      upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+				PackageProfile: upstream_entity.PackageProfileHomebrew,
+			},
+			{
+				Host: "ghcr.io", Enabled: true,
+				Protocols:      upstream_entity.ProtocolSet{upstream_entity.ProtocolRegistry},
+				PackageProfile: upstream_entity.PackageProfileNone,
+			},
+			{
+				Host: "pkg-containers.githubusercontent.com", Enabled: true,
+				Protocols:      upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+				PackageProfile: upstream_entity.PackageProfileNone,
+			},
+			{
+				Host: "github.com", Enabled: true,
+				Protocols:      upstream_entity.ProtocolSet{upstream_entity.ProtocolGit},
+				PackageProfile: upstream_entity.PackageProfileNone,
+			},
+		}
+
+		readiness := packageReadiness("https://mirror.example.com", configured, configured[0])
+		convey.So(readiness.Ready, convey.ShouldBeTrue)
+		convey.So(readiness.Companions, convey.ShouldResemble, []admin.PackageCompanion{
+			{Host: "ghcr.io", Transport: upstream_entity.ProtocolRegistry,
+				PackageProfile: upstream_entity.PackageProfileNone, Ready: true},
+			{Host: "pkg-containers.githubusercontent.com", Transport: upstream_entity.ProtocolStatic,
+				PackageProfile: upstream_entity.PackageProfileNone, Ready: true},
+			{Host: "github.com", Transport: upstream_entity.ProtocolGit,
+				PackageProfile: upstream_entity.PackageProfileNone, Ready: true},
+		})
+
+		configured[2].PackageProfile = upstream_entity.PackageProfileHomebrew
+		blocked := packageReadiness("https://mirror.example.com", configured, configured[0])
+		convey.So(blocked.Ready, convey.ShouldBeFalse)
+		convey.So(blocked.Companions[1].Reason, convey.ShouldEqual, "profile")
+	})
+
 	for _, tc := range []struct {
 		name   string
 		files  *upstream_entity.Upstream

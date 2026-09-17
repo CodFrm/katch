@@ -43,6 +43,11 @@ func (homebrewProfile) Companions() []packageprofile.Companion {
 			Transport: upstream_entity.ProtocolRegistry,
 		},
 		{
+			Host:      "pkg-containers.githubusercontent.com",
+			Profile:   upstream_entity.PackageProfileNone,
+			Transport: upstream_entity.ProtocolStatic,
+		},
+		{
 			Host:      "github.com",
 			Profile:   upstream_entity.PackageProfileNone,
 			Transport: upstream_entity.ProtocolGit,

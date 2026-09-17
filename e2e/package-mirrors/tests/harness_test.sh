@@ -637,6 +637,9 @@ if printf '%s\n%s\n' "$composer_setup" "$composer_run" | grep -E -- '("secure-ht
 fi
 
 homebrew_case=$CASES/homebrew.yaml
+homebrew_required_upstreams=$(jq -c '.required_upstreams' "$homebrew_case")
+[ "$homebrew_required_upstreams" = '["formulae.brew.sh","ghcr.io","pkg-containers.githubusercontent.com","github.com"]' ] ||
+  fail "Homebrew required_upstreams does not include the exact registered GHCR CDN host"
 homebrew_setup=$(jq -r '.setup' "$homebrew_case")
 homebrew_run=$(jq -r '.run' "$homebrew_case")
 homebrew_assert=$(jq -r '.assert' "$homebrew_case")

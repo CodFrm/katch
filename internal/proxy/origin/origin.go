@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
 	"github.com/CodFrm/katch/internal/proxy/destination"
 )
 
@@ -42,7 +43,8 @@ type Request struct {
 	// 原样抄客户端那一侧的值：git 客户端自己会在小请求上给长度、大请求上分块，
 	// 由 katch 改写这件事没有任何好处。
 	ContentLength int64
-	// Requirement 描述初始目标的地址策略；跨主机重定向会自动收紧为注册且公网可达。
+	// Requirement 描述初始目标的地址策略；跨主机重定向会自动收紧为注册且公网可达，
+	// registry 的跨主机字节下载还会改用 static / none 的目标要求。
 	Requirement destination.DestinationRequirement
 	// Authorization katch **自己**换来的上游凭据，空串表示匿名请求。
 	//
@@ -196,6 +198,10 @@ func checkRedirect(req *http.Request, via []*http.Request) error {
 	if !sameHostname(previous.URL, req.URL) {
 		requirement.RequireRegistered = true
 		requirement.AddressPolicy = destination.PublicAddressesOnly
+		if requirement.Transport == upstream_entity.ProtocolRegistry {
+			requirement.Transport = upstream_entity.ProtocolStatic
+			requirement.Profile = upstream_entity.PackageProfileNone
+		}
 	}
 	if !sameAuthority(previous.URL, req.URL) {
 		req.Header.Del("Authorization")
