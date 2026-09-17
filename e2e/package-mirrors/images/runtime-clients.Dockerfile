@@ -216,7 +216,7 @@ ENTRYPOINT ["/usr/local/bin/katch-client-entrypoint"]
 
 FROM composer:2.9.5 AS composer
 USER root
-RUN apk add --no-cache git iproute2 iptables jq shadow strace util-linux \
+RUN apk add --no-cache ca-certificates git iproute2 iptables jq shadow strace util-linux \
     && adduser -D -u 10001 client \
     && install -d -o client -g client /work \
     && command -v iptables >/dev/null \

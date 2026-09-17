@@ -52,6 +52,18 @@ KATCH_HOST=host.docker.internal KATCH_PORT=8080 \
 
 The harness supplies the same value as both `KATCH_URL` and `KATCH_BASE_URL`. `KATCH_HOST` is injected into `/etc/hosts` with Docker/Podman's `host-gateway`, so bootstrap does not need public DNS. Set `KATCH_ADD_HOST` to a static katch IPv4 address when katch is attached through another bridge.
 
+For an HTTPS test endpoint signed by a private test CA, set `KATCH_CA_CERT` to an absolute path to a readable regular certificate file on the host:
+
+```sh
+KATCH_CA_CERT=/absolute/path/to/ca.crt \
+KATCH_URL=https://host.docker.internal:8443 \
+KATCH_METRICS_URL=http://127.0.0.1:8080/metrics \
+KATCH_HOST=host.docker.internal KATCH_PORT=8443 \
+  e2e/package-mirrors/harness.sh nuget
+```
+
+The harness mounts that file read-only at `/run/katch-test-ca.crt` and passes only the mounted path to the client entrypoint. The root entrypoint installs it into the image's system trust store before firewall tracing and before switching to `client` or `linuxbrew`. Leaving `KATCH_CA_CERT` unset adds neither the mount nor the client environment variable. This trust path is required for HTTPS NuGet repository-signature resources; signature validation remains enabled.
+
 Artifacts include per-phase client output, connection records, firewall snapshots, and Prometheus snapshots under `${ARTIFACT_ROOT:-${TMPDIR:-/tmp}/katch-package-mirrors-artifacts}`. Root is required only inside disposable client containers for `NET_ADMIN`; host root is not used.
 
 The npm case generates new lockfiles and rejects leaked public registry URLs. Existing lockfiles are not silently claimed compatible: use registry-host replacement where the client supports it, otherwise regenerate them through katch.

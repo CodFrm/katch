@@ -5,7 +5,7 @@ USER root
 RUN rm -f /etc/apt/sources.list.d/github-cli.list /etc/apt/sources.list.d/github-cli.sources \
     && apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-       iptables strace util-linux \
+       ca-certificates iptables strace util-linux \
     && rm -rf /var/lib/apt/lists/* \
     && command -v iptables >/dev/null \
     && command -v ip6tables >/dev/null \

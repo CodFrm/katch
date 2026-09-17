@@ -5,6 +5,7 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 CASE_DIR=${CASE_DIR:-$ROOT/e2e/package-mirrors/cases}
 ARTIFACT_ROOT=${ARTIFACT_ROOT:-${TMPDIR:-/tmp}/katch-package-mirrors-artifacts}
 RUNTIME=${CONTAINER_RUNTIME:-}
+CLIENT_CA_CERT=/run/katch-test-ca.crt
 
 usage() {
   printf '%s\n' "usage: $0 --check CASE... | $0 [CASE...]" >&2
@@ -59,6 +60,20 @@ if [ "${1:-}" = "--check" ]; then
   done
   printf '%s\n' "package mirror cases valid"
   exit
+fi
+
+if [ -n "${KATCH_CA_CERT:-}" ]; then
+  case $KATCH_CA_CERT in
+    /*) ;;
+    *)
+      printf '%s\n' "KATCH_CA_CERT must be an absolute readable regular file: $KATCH_CA_CERT" >&2
+      exit 66
+      ;;
+  esac
+  if [ ! -f "$KATCH_CA_CERT" ] || [ ! -r "$KATCH_CA_CERT" ]; then
+    printf '%s\n' "KATCH_CA_CERT must be an absolute readable regular file: $KATCH_CA_CERT" >&2
+    exit 66
+  fi
 fi
 
 : "${KATCH_URL:?KATCH_URL must be reachable from client containers}"
@@ -122,19 +137,26 @@ run_phase() {
   jq -r '.assert' "$case_file" > "$scripts/assert"
   chmod 0555 "$scripts/setup" "$scripts/run" "$scripts/assert"
 
-  "$RUNTIME" run --rm \
+  set -- "$RUNTIME" run --rm \
     --cap-add NET_ADMIN --cap-add NET_RAW \
     --security-opt no-new-privileges \
     --add-host "$KATCH_HOST:${KATCH_ADD_HOST:-host-gateway}" \
     --mount "type=bind,src=$scripts,dst=/case,readonly" \
-    --mount "type=bind,src=$artifacts,dst=/artifacts" \
+    --mount "type=bind,src=$artifacts,dst=/artifacts"
+  if [ -n "${KATCH_CA_CERT:-}" ]; then
+    set -- "$@" \
+      --mount "type=bind,src=$KATCH_CA_CERT,dst=$CLIENT_CA_CERT,readonly" \
+      --env "KATCH_CLIENT_CA_CERT=$CLIENT_CA_CERT"
+  fi
+  set -- "$@" \
     --env "KATCH_URL=$KATCH_URL" \
     --env "KATCH_BASE_URL=$KATCH_URL" \
     --env "KATCH_HOST=$KATCH_HOST" \
     --env "KATCH_PORT=$KATCH_PORT" \
     --env "KATCH_PHASE=$phase" \
     --env KATCH_ARTIFACTS=/artifacts \
-    "$image" > "$phase_root/client.log" 2>&1
+    "$image"
+  "$@" > "$phase_root/client.log" 2>&1
 }
 
 files=$(mktemp "${TMPDIR:-/tmp}/katch-case-list.XXXXXX")

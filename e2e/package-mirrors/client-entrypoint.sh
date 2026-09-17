@@ -54,16 +54,42 @@ fi
 : "${KATCH_ARTIFACTS:?KATCH_ARTIFACTS is required}"
 : "${KATCH_CLIENT_USER:=client}"
 
+[ "$(id -u)" -eq 0 ] || {
+  printf '%s\n' "client entrypoint requires container root for trust and firewall setup" >&2
+  exit 77
+}
+
+install_trusted_ca() {
+  ca_cert=${KATCH_CLIENT_CA_CERT:-}
+  [ -n "$ca_cert" ] || return 0
+  if [ ! -f "$ca_cert" ] || [ ! -r "$ca_cert" ]; then
+    printf '%s\n' "trusted client CA is not a readable regular file: $ca_cert" >&2
+    return 66
+  fi
+
+  if command -v update-ca-certificates >/dev/null 2>&1; then
+    install -m 0644 "$ca_cert" /usr/local/share/ca-certificates/katch-test-ca.crt
+    update-ca-certificates
+    return
+  fi
+  if command -v update-ca-trust >/dev/null 2>&1; then
+    install -m 0644 "$ca_cert" /etc/pki/ca-trust/source/anchors/katch-test-ca.crt
+    update-ca-trust extract
+    return
+  fi
+
+  printf '%s\n' "no supported system CA trust mechanism is available" >&2
+  return 69
+}
+
+install_trusted_ca
+
 for command in iptables ip6tables iptables-save iptables-restore ip6tables-save ip6tables-restore strace runuser; do
   command -v "$command" >/dev/null 2>&1 || {
     printf '%s\n' "required isolation command unavailable: $command" >&2
     exit 69
   }
 done
-[ "$(id -u)" -eq 0 ] || {
-  printf '%s\n' "client entrypoint requires container root for firewall setup" >&2
-  exit 77
-}
 
 katch_ip=$(awk -v host="$KATCH_HOST" '
   {

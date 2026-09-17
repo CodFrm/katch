@@ -116,6 +116,7 @@ jq -c '.[]' "$IMAGE_CONTRACT" | while IFS= read -r row; do
   esac
   printf '%s\n' "$stage" | grep -F 'ENTRYPOINT ["/usr/local/bin/katch-client-entrypoint"]' >/dev/null || fail "$target bypasses isolation entrypoint"
   printf '%s\n' "$stage" | grep -F "KATCH_CLIENT_USER=$user" >/dev/null || fail "$target has the wrong runtime user"
+  printf '%s\n' "$stage" | grep -F 'ca-certificates' >/dev/null || fail "$target does not install the system CA trust tooling"
   printf '%s' "$row" | jq -r '.smoke | to_entries[] | "\(.key) \(.value)"' | while IFS=' ' read -r client version; do
     grep -F "expect_version $client $version" "$IMAGE_SMOKE" >/dev/null ||
       fail "$target smoke metadata is not enforced for $client $version"
@@ -236,6 +237,13 @@ case ${0##*/} in
     printf '%s\n' '*filter' COMMIT
     ;;
   iptables-restore|ip6tables-restore|iptables|ip6tables)
+    printf '%s\n' "${0##*/} $*" >> "$ENTRYPOINT_EVENT_LOG"
+    ;;
+  install)
+    printf '%s\n' "install $*" >> "$ENTRYPOINT_EVENT_LOG"
+    ;;
+  update-ca-certificates|update-ca-trust)
+    printf '%s\n' "${0##*/} $*" >> "$ENTRYPOINT_EVENT_LOG"
     ;;
   strace)
     capture=
@@ -252,33 +260,142 @@ case ${0##*/} in
     "$@"
     ;;
   runuser)
+    printf '%s\n' "runuser $*" >> "$ENTRYPOINT_EVENT_LOG"
     printf '%s\n' "$*" >> "$RUNUSER_LOG"
     ;;
   *) exit 64 ;;
 esac
 EOF
 chmod 0555 "$fake_bin/fake-command"
-for command in awk id iptables ip6tables iptables-save iptables-restore ip6tables-save ip6tables-restore strace runuser; do
+for command in awk id install iptables ip6tables iptables-save iptables-restore ip6tables-save ip6tables-restore strace runuser; do
   ln -s fake-command "$fake_bin/$command"
 done
 
 run_entrypoint() {
   artifacts=$1
   shift
-  env PATH="$fake_bin:$PATH" RUNUSER_LOG="$workdir/runuser.log" \
+  env PATH="$fake_bin:$PATH" RUNUSER_LOG="$workdir/runuser.log" ENTRYPOINT_EVENT_LOG="$workdir/entrypoint-events.log" \
     KATCH_HOST=katch.invalid KATCH_PORT=8080 KATCH_ARTIFACTS="$artifacts" \
     "$@" "$ENTRYPOINT"
 }
 
 : > "$workdir/runuser.log"
-run_entrypoint "$workdir/default-artifacts" env -u KATCH_CLIENT_USER
+: > "$workdir/entrypoint-events.log"
+run_entrypoint "$workdir/default-artifacts" env -u KATCH_CLIENT_USER -u KATCH_CLIENT_CA_CERT
 grep -q '^-u client --preserve-environment -- env HOME=/home/client USER=client LOGNAME=client /bin/sh -eu -c ' "$workdir/runuser.log" ||
   fail "entrypoint did not retain the default client user and identity environment"
+if grep -E '^(install|update-ca-certificates|update-ca-trust) ' "$workdir/entrypoint-events.log"; then
+  fail "entrypoint changed system trust when no client CA was configured"
+fi
 
 : > "$workdir/runuser.log"
-run_entrypoint "$workdir/homebrew-artifacts" env KATCH_CLIENT_USER=linuxbrew
+: > "$workdir/entrypoint-events.log"
+run_entrypoint "$workdir/homebrew-artifacts" env -u KATCH_CLIENT_CA_CERT KATCH_CLIENT_USER=linuxbrew
 grep -q '^-u linuxbrew --preserve-environment -- env HOME=/home/linuxbrew USER=linuxbrew LOGNAME=linuxbrew /bin/sh -eu -c ' "$workdir/runuser.log" ||
   fail "entrypoint did not switch to the requested client identity environment"
+
+trusted_ca=$workdir/test-ca.crt
+printf '%s\n' 'test certificate' > "$trusted_ca"
+ln -s fake-command "$fake_bin/update-ca-certificates"
+: > "$workdir/runuser.log"
+: > "$workdir/entrypoint-events.log"
+run_entrypoint "$workdir/debian-ca-artifacts" env KATCH_CLIENT_CA_CERT="$trusted_ca"
+grep -Fx "install -m 0644 $trusted_ca /usr/local/share/ca-certificates/katch-test-ca.crt" "$workdir/entrypoint-events.log" >/dev/null ||
+  fail "entrypoint did not install the trusted CA into the update-ca-certificates anchor directory"
+grep -Fx 'update-ca-certificates ' "$workdir/entrypoint-events.log" >/dev/null ||
+  fail "entrypoint did not refresh Debian/Ubuntu/Alpine system trust"
+ca_update_line=$(grep -n -F 'update-ca-certificates ' "$workdir/entrypoint-events.log" | cut -d: -f1)
+firewall_line=$(grep -n -m1 -E '^iptables (-F|-P|-A)' "$workdir/entrypoint-events.log" | cut -d: -f1)
+user_drop_line=$(grep -n -F 'runuser -u client ' "$workdir/entrypoint-events.log" | cut -d: -f1)
+[ "$ca_update_line" -lt "$firewall_line" ] || fail "entrypoint installs the trusted CA after firewall setup"
+[ "$ca_update_line" -lt "$user_drop_line" ] || fail "entrypoint installs the trusted CA after the user drop"
+rm "$fake_bin/update-ca-certificates"
+
+ln -s fake-command "$fake_bin/update-ca-trust"
+: > "$workdir/entrypoint-events.log"
+run_entrypoint "$workdir/rpm-ca-artifacts" env KATCH_CLIENT_CA_CERT="$trusted_ca"
+grep -Fx "install -m 0644 $trusted_ca /etc/pki/ca-trust/source/anchors/katch-test-ca.crt" "$workdir/entrypoint-events.log" >/dev/null ||
+  fail "entrypoint did not install the trusted CA into the update-ca-trust anchor directory"
+grep -Fx 'update-ca-trust extract' "$workdir/entrypoint-events.log" >/dev/null ||
+  fail "entrypoint did not refresh RPM system trust"
+rm "$fake_bin/update-ca-trust"
+
+: > "$workdir/runuser.log"
+: > "$workdir/entrypoint-events.log"
+if run_entrypoint "$workdir/no-ca-tool-artifacts" env KATCH_CLIENT_CA_CERT="$trusted_ca" >"$workdir/out" 2>&1; then
+  fail "entrypoint accepted a trusted CA without a supported system trust mechanism"
+fi
+grep -F 'no supported system CA trust mechanism is available' "$workdir/out" >/dev/null ||
+  fail "entrypoint did not report the missing system trust mechanism"
+[ ! -s "$workdir/runuser.log" ] || fail "entrypoint dropped users after trusted CA installation failed"
+
+harness_bin=$workdir/harness-bin
+mkdir -p "$harness_bin"
+cat > "$harness_bin/fake-runtime" <<'EOF'
+#!/bin/sh
+set -eu
+for argument do
+  printf 'ARG=%s\n' "$argument"
+done >> "$RUNTIME_LOG"
+printf '%s\n' END >> "$RUNTIME_LOG"
+EOF
+cat > "$harness_bin/curl" <<'EOF'
+#!/bin/sh
+set -eu
+count=0
+[ ! -f "$METRIC_STATE" ] || count=$(cat "$METRIC_STATE")
+case $count in
+  0) total=0 ;;
+  *) total=1 ;;
+esac
+printf '%s\n' "$((count + 1))" > "$METRIC_STATE"
+printf 'katch_origin_requests_total{upstream="example.invalid"} %s\n' "$total"
+EOF
+chmod 0555 "$harness_bin/fake-runtime" "$harness_bin/curl"
+
+harness_case=$workdir/harness-case.yaml
+printf '%s\n' '{"name":"ca-contract","image":"example/client:1","setup":"true","run":"true","assert":"true","required_upstreams":["example.invalid"]}' > "$harness_case"
+run_harness() {
+  artifact_dir=$1
+  shift
+  : > "$workdir/runtime.log"
+  printf '%s\n' 0 > "$workdir/metric-state"
+  env PATH="$harness_bin:$PATH" RUNTIME_LOG="$workdir/runtime.log" METRIC_STATE="$workdir/metric-state" \
+    CONTAINER_RUNTIME=fake-runtime ARTIFACT_ROOT="$artifact_dir" \
+    KATCH_URL=https://katch.invalid KATCH_METRICS_URL=http://metrics.invalid \
+    KATCH_HOST=katch.invalid KATCH_PORT=443 \
+    "$@" "$HARNESS" "$harness_case"
+}
+
+run_harness "$workdir/harness-unset" env -u KATCH_CA_CERT >"$workdir/out" 2>&1
+if grep -E 'KATCH_(CA_CERT|CLIENT_CA_CERT)|/run/katch-test-ca.crt' "$workdir/runtime.log"; then
+  fail "harness changed the container contract when KATCH_CA_CERT was unset"
+fi
+
+: > "$workdir/runtime.log"
+if run_harness "$workdir/harness-relative" env KATCH_CA_CERT=relative/ca.crt >"$workdir/out" 2>&1; then
+  fail "harness accepted a relative KATCH_CA_CERT"
+fi
+grep -F 'KATCH_CA_CERT must be an absolute readable regular file' "$workdir/out" >/dev/null ||
+  fail "harness did not report the invalid relative CA path"
+[ ! -s "$workdir/runtime.log" ] || fail "harness started a client for an invalid relative CA path"
+
+invalid_ca_dir=$workdir/invalid-ca-dir
+mkdir "$invalid_ca_dir"
+: > "$workdir/runtime.log"
+if run_harness "$workdir/harness-directory" env KATCH_CA_CERT="$invalid_ca_dir" >"$workdir/out" 2>&1; then
+  fail "harness accepted a directory as KATCH_CA_CERT"
+fi
+[ ! -s "$workdir/runtime.log" ] || fail "harness started a client for a non-regular CA path"
+
+run_harness "$workdir/harness-ca" env KATCH_CA_CERT="$trusted_ca" >"$workdir/out" 2>&1
+[ "$(grep -Fc "ARG=type=bind,src=$trusted_ca,dst=/run/katch-test-ca.crt,readonly" "$workdir/runtime.log")" -eq 2 ] ||
+  fail "harness did not mount the trusted CA read-only at the fixed client path for both phases"
+[ "$(grep -Fc 'ARG=KATCH_CLIENT_CA_CERT=/run/katch-test-ca.crt' "$workdir/runtime.log")" -eq 2 ] ||
+  fail "harness did not pass the internal trusted CA path for both phases"
+if grep -F 'ARG=KATCH_CA_CERT=' "$workdir/runtime.log"; then
+  fail "harness exposed the host CA path as a client environment variable"
+fi
 
 grep -F -- '--env "KATCH_URL=$KATCH_URL"' "$HARNESS" >/dev/null ||
   fail "harness does not forward KATCH_URL"
