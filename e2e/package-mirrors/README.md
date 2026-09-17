@@ -37,6 +37,12 @@ Run deterministic schema, image-contract, embedded-shell, isolation, and connect
 make test-package-mirror-harness
 ```
 
+## Runtime acceptance
+
+Every case uses a fresh workdir for each phase. The cold phase runs the normal client workflow to prove metadata resolution and artifact download through katch and must make at least one origin request. The warm phase must perform a real client installation while making zero origin requests.
+
+RubyGems compact-index responses such as `/versions` and `/info/rake` can arrive already older than their 60-second freshness lifetime, so a protocol-correct cache must revalidate them. The RubyGems/Bundler warm phase therefore avoids mutable metadata: it writes a deterministic lockfile, fetches the exact immutable `rake-13.2.1.gem` through katch with `Gem::RemoteFetcher`, then performs fresh native `gem install --local` and frozen `bundle install --local` operations. This still proves a real katch artifact-cache hit without treating stale metadata as reusable.
+
 ## Running cases
 
 Case files use the JSON-compatible subset of YAML and the fixed schema `{name,image,setup,run,assert,required_upstreams}`. The harness writes commands to read-only mounted scripts and never interpolates them through `eval`.

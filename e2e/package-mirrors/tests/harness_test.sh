@@ -297,6 +297,100 @@ fi
 [ "$(cat "$nuget_events")" = "$(printf 'run\nshutdown\n')" ] ||
   fail "NuGet case skips build-server cleanup after an assertion failure"
 
+rubygems_case=$CASES/rubygems.yaml
+rubygems_setup_script=$workdir/rubygems-setup.sh
+rubygems_run_script=$workdir/rubygems-run.sh
+jq -r '.setup' "$rubygems_case" > "$rubygems_setup_script"
+jq -r '.run' "$rubygems_case" > "$rubygems_run_script"
+rubygems_phase_root=$workdir/rubygems-phase
+mkdir -p "$rubygems_phase_root/cold" "$rubygems_phase_root/warm"
+for phase in cold warm; do
+  (
+    cd "$rubygems_phase_root/$phase"
+    KATCH_PHASE=$phase KATCH_URL=https://katch.test /bin/sh "$rubygems_setup_script"
+  )
+  expected_gemfile=$rubygems_phase_root/$phase/expected-Gemfile
+  printf "%s\n%s\n" "source 'https://katch.test/rubygems.org/'" "gem 'rake', '13.2.1'" > "$expected_gemfile"
+  cmp -s "$expected_gemfile" "$rubygems_phase_root/$phase/bundler/Gemfile" ||
+    fail "RubyGems $phase setup does not write the exact Katch-only Gemfile"
+  [ -d "$rubygems_phase_root/$phase/gem-home" ] ||
+    fail "RubyGems $phase setup does not create a fresh GEM_HOME"
+  [ -d "$rubygems_phase_root/$phase/bundler/vendor/cache" ] ||
+    fail "RubyGems $phase setup does not create a fresh Bundler artifact cache"
+done
+[ ! -e "$rubygems_phase_root/cold/bundler/Gemfile.lock" ] ||
+  fail "RubyGems cold setup pre-locks dependencies instead of exercising normal resolution"
+cat > "$rubygems_phase_root/warm/expected-Gemfile.lock" <<'EOF'
+GEM
+  remote: https://katch.test/rubygems.org/
+  specs:
+    rake (13.2.1)
+
+PLATFORMS
+  ruby
+  x86_64-linux
+
+DEPENDENCIES
+  rake (= 13.2.1)
+
+BUNDLED WITH
+   2.7.1
+EOF
+cmp -s "$rubygems_phase_root/warm/expected-Gemfile.lock" "$rubygems_phase_root/warm/bundler/Gemfile.lock" ||
+  fail "RubyGems warm setup does not write the approved deterministic lock"
+
+rubygems_bin=$workdir/rubygems-bin
+rubygems_events=$workdir/rubygems-events.log
+mkdir -p "$rubygems_bin"
+cat > "$rubygems_bin/fake-ruby-client" <<'EOF'
+#!/bin/sh
+set -eu
+tool=${0##*/}
+printf '%s|%s|%s|%s|%s|%s\n' "$tool" "${GEM_HOME:-}" "${GEM_PATH-unset}" "${BUNDLE_GEMFILE:-}" "${BUNDLE_PATH:-}" "$*" >> "$RUBYGEMS_EVENT_LOG"
+if [ "$tool" = ruby ]; then
+  output=
+  for argument do output=$argument; done
+  : > "$output"
+fi
+EOF
+chmod 0555 "$rubygems_bin/fake-ruby-client"
+for client in ruby gem bundle; do
+  ln -s fake-ruby-client "$rubygems_bin/$client"
+done
+run_rubygems_phase() {
+  phase=$1
+  : > "$rubygems_events"
+  (
+    cd "$rubygems_phase_root/$phase"
+    PATH="$rubygems_bin:$PATH" KATCH_PHASE=$phase KATCH_URL=https://katch.test \
+      RUBYGEMS_EVENT_LOG="$rubygems_events" /bin/sh "$rubygems_run_script"
+  )
+}
+run_rubygems_phase cold
+[ "$(wc -l < "$rubygems_events" | tr -d ' ')" -eq 2 ] ||
+  fail "RubyGems cold run does not invoke exactly gem and Bundler"
+grep -F 'gem|' "$rubygems_events" | grep -F -- 'install rake --version 13.2.1 --no-document --clear-sources --source https://katch.test/rubygems.org/' >/dev/null ||
+  fail "RubyGems cold run is not a normal mirrored gem install"
+grep -F 'bundle|' "$rubygems_events" | grep -F '|install' >/dev/null ||
+  fail "RubyGems cold run is not a normal Bundler install"
+run_rubygems_phase warm
+[ "$(wc -l < "$rubygems_events" | tr -d ' ')" -eq 3 ] ||
+  fail "RubyGems warm run does not invoke exactly fetch, local gem install, and local Bundler install"
+grep -F 'ruby|' "$rubygems_events" | grep -F 'Gem::RemoteFetcher.fetcher.fetch_path' | grep -F 'https://katch.test/rubygems.org/gems/rake-13.2.1.gem' >/dev/null ||
+  fail "RubyGems warm run does not fetch the exact immutable gem through Katch with RemoteFetcher"
+grep -F 'gem|' "$rubygems_events" | grep -F -- 'install --local ' | grep -F 'rake-13.2.1.gem --no-document' >/dev/null ||
+  fail "RubyGems warm run does not install the fetched artifact locally"
+grep -F 'bundle|' "$rubygems_events" | grep -F '|install --local' >/dev/null ||
+  fail "RubyGems warm run does not install the cached artifact locally with Bundler"
+[ -f "$rubygems_phase_root/warm/bundler/vendor/cache/rake-13.2.1.gem" ] ||
+  fail "RubyGems warm run does not copy the fetched artifact into fresh vendor/cache"
+rubygems_case_commands=$(jq -r '[.setup, .run, .assert] | join("\n")' "$rubygems_case")
+if printf '%s\n' "$rubygems_case_commands" | grep -i -E '(NoSecurity|VERIFY_NONE|ssl[_-]?verify|--trust-policy|https?://rubygems[.]org)'; then
+  fail "RubyGems mirror case disables trust or uses a public RubyGems URL"
+fi
+printf '%s\n' "$rubygems_case_commands" | grep -F 'BUNDLE_FROZEN=true' >/dev/null ||
+  fail "RubyGems warm Bundler install is not frozen"
+
 maven_case=$CASES/maven.yaml
 maven_setup=$(jq -r '.setup' "$maven_case")
 maven_run=$(jq -r '.run' "$maven_case")
