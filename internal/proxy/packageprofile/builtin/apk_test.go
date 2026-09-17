@@ -39,6 +39,13 @@ func TestAPKClassifyPaths(t *testing.T) {
 			if got.Transform {
 				t.Fatalf("Classify(%q).Transform = true, signed APK data must stay byte-transparent", fixture.Path)
 			}
+			if got.Recognized() {
+				if len(got.Variants) != 1 || got.Variants[0] != "Origin" {
+					t.Fatalf("Classify(%q).Variants = %#v, want []string{\"Origin\"}", fixture.Path, got.Variants)
+				}
+			} else if len(got.Variants) != 0 {
+				t.Fatalf("Classify(%q).Variants = %#v, unknown paths must not declare variants", fixture.Path, got.Variants)
+			}
 		})
 	}
 }

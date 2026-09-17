@@ -32,9 +32,9 @@ func (apkProfile) Classify(request packageprofile.Request) packageprofile.Repres
 
 	switch {
 	case name == "APKINDEX" || name == "APKINDEX.tar.gz":
-		return packageprofile.Representation{Class: packageprofile.ClassMutable}
+		return packageprofile.Representation{Class: packageprofile.ClassMutable, Variants: []string{"Origin"}}
 	case apkPackagePath.MatchString(name):
-		return packageprofile.Representation{Class: packageprofile.ClassImmutable}
+		return packageprofile.Representation{Class: packageprofile.ClassImmutable, Variants: []string{"Origin"}}
 	default:
 		return packageprofile.Representation{}
 	}

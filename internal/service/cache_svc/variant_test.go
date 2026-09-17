@@ -2,6 +2,7 @@ package cache_svc
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -259,6 +260,64 @@ func pullWith(t *testing.T, svc CacheSvc, target *proxy_svc.Target) (string, *pr
 		t.Fatalf("关响应体失败：%v", err)
 	}
 	return string(got), meta
+}
+
+func TestGet_APKOriginVariantsCacheAndDoNotCross(t *testing.T) {
+	profile, ok := packageprofile.Lookup(upstream_entity.PackageProfileAPK)
+	if !ok {
+		t.Fatal("APK profile is not registered")
+	}
+	profiles := packageprofile.NewRegistry()
+	if err := profiles.Register(profile); err != nil {
+		t.Fatal(err)
+	}
+
+	var o *originStub
+	o = newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.alpine.apk")
+		w.Header().Set("Vary", "Origin")
+		_, _ = io.WriteString(w, fmt.Sprintf("signed-apk-%d", o.hits.Load()))
+	})
+	up := staticUpstream("dl-cdn.alpinelinux.org")
+	up.PackageProfile = upstream_entity.PackageProfileAPK
+	svc, repo, _ := setupSvc(t, o, up, Options{Profiles: profiles})
+	const path = "/alpine/v3.22/main/x86_64/busybox-1.37.0-r18.apk"
+
+	pull := func(origin string) (string, *proxy_svc.Meta) {
+		t.Helper()
+		tg := target(up.Host, path)
+		if origin != "" {
+			tg.Header.Set("Origin", origin)
+		}
+		return pullWith(t, svc, tg)
+	}
+	assertColdWarm := func(origin, wantBody string, wantHits int64) {
+		t.Helper()
+		coldBody, coldMeta := pull(origin)
+		warmBody, warmMeta := pull(origin)
+		if coldBody != wantBody || warmBody != wantBody {
+			t.Fatalf("Origin %q bodies = %q, %q, want %q", origin, coldBody, warmBody, wantBody)
+		}
+		if coldMeta.Header.Get(cacheStatusHeader) != cacheStatusMiss ||
+			warmMeta.Header.Get(cacheStatusHeader) != cacheStatusHit {
+			t.Fatalf("Origin %q cache statuses = %q, %q", origin,
+				coldMeta.Header.Get(cacheStatusHeader), warmMeta.Header.Get(cacheStatusHeader))
+		}
+		if coldMeta.Header.Get("Vary") != "Origin" || warmMeta.Header.Get("Vary") != "Origin" {
+			t.Fatalf("Origin %q Vary headers = %q, %q", origin,
+				coldMeta.Header.Get("Vary"), warmMeta.Header.Get("Vary"))
+		}
+		if got := o.hits.Load(); got != wantHits {
+			t.Fatalf("Origin %q origin hits = %d, want %d", origin, got, wantHits)
+		}
+	}
+
+	assertColdWarm("", "signed-apk-1", 1)
+	assertColdWarm("https://a.example", "signed-apk-2", 2)
+	assertColdWarm("https://b.example", "signed-apk-3", 3)
+	if got := len(repo.all()); got != 3 {
+		t.Fatalf("cache rows = %d, want 3 isolated Origin variants", got)
+	}
 }
 
 // TestGet_ManifestAcceptVariantsDoNotShareOneCopy 同一个 tag，两种客户端两份副本。
