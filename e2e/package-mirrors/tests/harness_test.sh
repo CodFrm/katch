@@ -655,7 +655,22 @@ printf '%s\n' "$homebrew_run" | grep -Fx '    export HOMEBREW_NO_INSTALL_FROM_AP
   fail "Homebrew warm phase does not switch to the pinned core tap"
 [ "$(printf '%s\n' "$homebrew_run" | grep -Fxc 'git ls-remote "$HOMEBREW_CORE_GIT_REMOTE" HEAD > results/core-head')" -eq 1 ] ||
   fail "Homebrew does not run one unconditional mirrored git ls-remote per phase"
+[ "$(printf '%s\n' "$homebrew_run" | grep -Fxc 'brew list --versions jq > results/jq-list')" -eq 1 ] ||
+  fail "Homebrew does not record the native installed formula version"
+[ "$(printf '%s\n' "$homebrew_run" | grep -Fxc 'brew info --json=v2 jq > results/jq.json')" -eq 1 ] ||
+  fail "Homebrew does not record installed formula metadata"
+[ "$(printf '%s\n' "$homebrew_run" | grep -Fxc 'brew --cellar jq > results/jq-cellar')" -eq 1 ] ||
+  fail "Homebrew does not record the formula Cellar path"
+printf '%s\n' "$homebrew_assert" | grep -Fx "grep -Eqx 'jq [0-9]+([.][0-9]+)+([._-][A-Za-z0-9]+)*' results/jq-list" >/dev/null ||
+  fail "Homebrew does not require one exact native formula version line"
+printf '%s\n' "$homebrew_assert" | grep -Fx 'test -s "$(cat results/jq-cellar)/$jq_version/INSTALL_RECEIPT.json"' >/dev/null ||
+  fail "Homebrew does not require a nonempty receipt for the listed Cellar version"
+printf '%s\n' "$homebrew_assert" | grep -F '.installed | length > 0' >/dev/null ||
+  fail "Homebrew no longer asserts the installed JSON entry"
 homebrew_commands=$(jq -r '[.setup, .run, .assert] | join("\n")' "$homebrew_case")
+if printf '%s\n' "$homebrew_commands" | grep -E '(brew --prefix jq|[/]bin[/]jq|jq-version)'; then
+  fail "Homebrew mirror case executes the installed Bottle binary"
+fi
 if printf '%s\n' "$homebrew_commands" | grep -i -E 'https?://([^/]*[.])?ghcr[.]io([/:]|$)'; then
   fail "Homebrew mirror case contains a direct GHCR URL"
 fi
@@ -680,10 +695,12 @@ set -eu
 printf 'brew|%s|%s|%s|%s|%s|%s|%s\n' "$KATCH_PHASE" "$HOME" "$HOMEBREW_API_DOMAIN" \
   "$HOMEBREW_ARTIFACT_DOMAIN" "$HOMEBREW_ARTIFACT_DOMAIN_NO_FALLBACK" \
   "${HOMEBREW_NO_INSTALL_FROM_API-unset}" "$*" >> "$HOMEBREW_EVENT_LOG"
-case $1 in
-  install) ;;
-  info) printf '%s\n' '{"formulae":[{"name":"jq","installed":[{"version":"1.8.1"}]}]}' ;;
-  --prefix) printf '%s\n' "$HOMEBREW_TEST_PREFIX" ;;
+case "$*" in
+  'install jq') ;;
+  'info --json=v2 jq') printf '%s\n' '{"formulae":[{"name":"jq","installed":[{"version":"1.8.2"}]}]}' ;;
+  'list --versions jq') printf '%s\n' 'jq 1.8.2' ;;
+  '--cellar jq') printf '%s\n' "$HOMEBREW_TEST_CELLAR/jq" ;;
+  '--prefix jq') printf '%s\n' "$HOMEBREW_TEST_PREFIX" ;;
   *) exit 64 ;;
 esac
 EOF
@@ -697,8 +714,12 @@ EOF
 cat > "$homebrew_prefix/bin/jq" <<'EOF'
 #!/bin/sh
 set -eu
-printf '%s\n' 'jq-1.8.1'
+printf '%s\n' 'installed Bottle binary was executed' >&2
+exit 86
 EOF
+homebrew_cellar=$workdir/homebrew-cellar
+mkdir -p "$homebrew_cellar/jq/1.8.2"
+printf '%s\n' '{"source":{"path":"/home/linuxbrew/.linuxbrew/Homebrew/Library/Taps/homebrew/homebrew-core/Formula/j/jq.rb"}}' > "$homebrew_cellar/jq/1.8.2/INSTALL_RECEIPT.json"
 chmod 0555 "$homebrew_case_bin"/* "$homebrew_prefix/bin/jq"
 homebrew_phase_root=$workdir/homebrew-phase
 mkdir -p "$homebrew_phase_root/cold" "$homebrew_phase_root/warm"
@@ -708,10 +729,10 @@ for phase in cold warm; do
     cd "$homebrew_phase_root/$phase"
     PATH="$homebrew_case_bin:$PATH" KATCH_PHASE=$phase KATCH_URL=https://katch.test \
       HOMEBREW_EVENT_LOG="$homebrew_events" HOMEBREW_TEST_PREFIX="$homebrew_prefix" \
-      /bin/sh "$homebrew_setup_script"
+      HOMEBREW_TEST_CELLAR="$homebrew_cellar" /bin/sh "$homebrew_setup_script"
     PATH="$homebrew_case_bin:$PATH" KATCH_PHASE=$phase KATCH_URL=https://katch.test \
       HOMEBREW_EVENT_LOG="$homebrew_events" HOMEBREW_TEST_PREFIX="$homebrew_prefix" \
-      /bin/sh "$homebrew_run_script"
+      HOMEBREW_TEST_CELLAR="$homebrew_cellar" /bin/sh "$homebrew_run_script"
     /bin/sh "$homebrew_assert_script"
   ) || fail "Homebrew $phase phase does not satisfy the isolated runtime contract"
 done
