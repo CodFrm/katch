@@ -1,0 +1,16 @@
+[
+  {"path":"/alpine/v3.22/main/x86_64/APKINDEX.tar.gz","class":"mutable"},
+  {"path":"/edge/testing/aarch64/APKINDEX.tar.gz","class":"mutable"},
+  {"path":"/local/repository/APKINDEX","class":"mutable"},
+  {"path":"/alpine/v3.22/main/x86_64/busybox-1.37.0-r18.apk","class":"immutable"},
+  {"path":"/edge/community/x86_64/py3-typing-extensions-4.14.1-r0.apk","class":"immutable"},
+  {"path":"/edge/testing/x86_64/libfoo-1.2.3_git20250601-r2.apk","class":"immutable"},
+  {"path":"/edge/community/x86_64/R-4.5.1-r0.apk","class":"immutable"},
+  {"path":"/alpine/v3.22/main/x86_64/readme.apk","class":"unknown"},
+  {"path":"/alpine/v3.22/main/x86_64/busybox-latest-r0.apk","class":"unknown"},
+  {"path":"/alpine/v3.22/main/x86_64/busybox-1.37.0.apk","class":"unknown"},
+  {"path":"/alpine/v3.22/main/x86_64/busybox-1.37.0-r.apk","class":"unknown"},
+  {"path":"/alpine/v3.22/main/x86_64/busybox-1.37.0-r0.apk.sig","class":"unknown"},
+  {"path":"/alpine/v3.22/main/x86_64/APKINDEX.tar.gz.old","class":"unknown"},
+  {"path":"/alpine/v3.22/main/x86_64/apkindex.tar.gz","class":"unknown"}
+]
