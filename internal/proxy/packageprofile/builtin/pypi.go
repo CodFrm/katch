@@ -265,7 +265,7 @@ func pyPISimplePath(path string) bool {
 
 func pyPIArtifactPath(path string) bool {
 	parts := strings.Split(strings.Trim(strings.TrimSpace(path), "/"), "/")
-	if len(parts) != 5 || parts[0] != "packages" || len(parts[1]) != 2 || len(parts[2]) != 2 || len(parts[3]) != 64 {
+	if len(parts) != 5 || parts[0] != "packages" || len(parts[1]) != 2 || len(parts[2]) != 2 || len(parts[3]) != 60 {
 		return false
 	}
 	if !pyPIHex(parts[1]) || !pyPIHex(parts[2]) || !pyPIHex(parts[3]) {

@@ -33,16 +33,26 @@ func TestPyPIProfileRegistersCompanionAndClassifies(t *testing.T) {
 	}
 
 	immutable := []string{
-		"/packages/ab/cd/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/demo_pkg-1.0-py3-none-any.whl",
-		"/packages/ab/cd/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/demo_pkg-1.0-py3-none-any.whl.metadata",
-		"/packages/fe/dc/fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210/demo_pkg-1.0.tar.gz",
+		"/packages/ab/cd/0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab/demo_pkg-1.0-py3-none-any.whl",
+		"/packages/ab/cd/0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab/demo_pkg-1.0-py3-none-any.whl.metadata",
+		"/packages/fe/dc/fedcba9876543210fedcba9876543210fedcba9876543210fedcba987654/demo_pkg-1.0.tar.gz",
 	}
 	for _, path := range immutable {
 		if got := profile.Classify(packageprofile.Request{Path: path}); got.Class != packageprofile.ClassImmutable || got.Transform {
 			t.Errorf("Classify(%q) = %+v", path, got)
 		}
 	}
-	for _, path := range []string{"/project/demo-pkg", "/packages/demo_pkg-1.0.whl", "/simple/demo-pkg/files"} {
+	unknown := []string{
+		"/project/demo-pkg",
+		"/packages/demo_pkg-1.0.whl",
+		"/simple/demo-pkg/files",
+		"/packages/ab/cd/0123456789abcdef0123456789abcdef0123456789abcdef012345678/demo.whl",
+		"/packages/ab/cd/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc/demo.whl",
+		"/packages/ab/cd/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/demo.whl",
+		"/packages/ab/cd/0123456789abcdef0123456789abcdef0123456789abcdef0123456789ag/demo.whl",
+		"/packages/ab/cd/0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab/demo.exe",
+	}
+	for _, path := range unknown {
 		if got := profile.Classify(packageprofile.Request{Path: path}); got.Recognized() {
 			t.Errorf("Classify(%q) = %+v, want unknown", path, got)
 		}
@@ -54,6 +64,23 @@ func TestPyPIProfileRegistersCompanionAndClassifies(t *testing.T) {
 	}
 	if guidance := profile.Guidance(); guidance.Client != "pip" || len(guidance.Configuration) == 0 {
 		t.Fatalf("guidance = %+v", guidance)
+	}
+}
+
+func TestPyPITransformAcceptsWarehouseArtifactPath(t *testing.T) {
+	profile := mustPyPIProfile(t)
+	body := []byte(`{"meta":{"api-version":"1.1"},"name":"idna","files":[{"filename":"idna-0.2.tar.gz","url":"https://files.pythonhosted.org/packages/22/35/04dedec60e9366ba19ac7c147cd715c88a7e87d43cda47a75802190c0950/idna-0.2.tar.gz"}]}`)
+
+	result, err := profile.Transform(context.Background(), packageprofile.TransformRequest{
+		Body: body, ContentType: "application/vnd.pypi.simple.v1+json",
+		Source: mustPyPIURL(t, "https://pypi.org/simple/idna/"), SiteBaseURL: "https://katch.example.com",
+		RewriteURL: successfulPyPIRewrite,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(result.Body), "https://katch.example.com/files.pythonhosted.org/packages/22/35/04dedec60e9366ba19ac7c147cd715c88a7e87d43cda47a75802190c0950/idna-0.2.tar.gz") {
+		t.Fatalf("body = %s", result.Body)
 	}
 }
 
@@ -85,7 +112,7 @@ func TestPyPITransformPEP503PreservesLinkMetadata(t *testing.T) {
 		t.Fatalf("links = %+v", links)
 	}
 	wheel := links[0]
-	if wheel["href"] != "https://katch.example.com/files.pythonhosted.org/packages/ab/cd/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/demo_pkg-1.0-py3-none-any.whl?download=1#sha256=wheelhash" {
+	if wheel["href"] != "https://katch.example.com/files.pythonhosted.org/packages/ab/cd/0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab/demo_pkg-1.0-py3-none-any.whl?download=1#sha256=wheelhash" {
 		t.Errorf("wheel href = %q", wheel["href"])
 	}
 	if wheel["data-requires-python"] != ">=3.8" || wheel["data-yanked"] != "broken build" || wheel["data-dist-info-metadata"] != "sha256=metadatahash" {
@@ -158,7 +185,7 @@ func TestPyPITransformPEP691RootPreservesProjects(t *testing.T) {
 
 func TestPyPITransformFailsClosed(t *testing.T) {
 	profile := mustPyPIProfile(t)
-	validJSON := []byte(`{"meta":{"api-version":"1.1"},"name":"demo","files":[{"filename":"demo.whl","url":"https://files.pythonhosted.org/packages/ab/cd/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/demo.whl"}]}`)
+	validJSON := []byte(`{"meta":{"api-version":"1.1"},"name":"demo","files":[{"filename":"demo.whl","url":"https://files.pythonhosted.org/packages/ab/cd/0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab/demo.whl"}]}`)
 	tests := []struct {
 		name string
 		in   packageprofile.TransformRequest
@@ -168,8 +195,9 @@ func TestPyPITransformFailsClosed(t *testing.T) {
 		{name: "missing rewriter", in: packageprofile.TransformRequest{Body: validJSON, ContentType: "application/vnd.pypi.simple.v1+json", SiteBaseURL: "https://katch.example.com"}, want: packageprofile.ErrUnavailable},
 		{name: "missing companion", in: packageprofile.TransformRequest{Body: validJSON, ContentType: "application/vnd.pypi.simple.v1+json", SiteBaseURL: "https://katch.example.com", RewriteURL: unavailablePyPIRewrite}, want: packageprofile.ErrUnavailable},
 		{name: "malformed json", in: packageprofile.TransformRequest{Body: []byte(`{`), ContentType: "application/vnd.pypi.simple.v1+json", SiteBaseURL: "https://katch.example.com", RewriteURL: successfulPyPIRewrite}, want: packageprofile.ErrInvalidMetadata},
-		{name: "wrong companion host", in: packageprofile.TransformRequest{Body: []byte(`{"files":[{"filename":"demo.whl","url":"https://evil.example/packages/ab/cd/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/demo.whl"}]}`), ContentType: "application/vnd.pypi.simple.v1+json", SiteBaseURL: "https://katch.example.com", RewriteURL: successfulPyPIRewrite}, want: packageprofile.ErrInvalidMetadata},
-		{name: "wrong HTML companion host", in: packageprofile.TransformRequest{Body: []byte(`<a href="https://evil.example/packages/ab/cd/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/demo.whl">demo</a>`), ContentType: "text/html", SiteBaseURL: "https://katch.example.com", RewriteURL: successfulPyPIRewrite}, want: packageprofile.ErrInvalidMetadata},
+		{name: "wrong companion host", in: packageprofile.TransformRequest{Body: []byte(`{"files":[{"filename":"demo.whl","url":"https://evil.example/packages/ab/cd/0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab/demo.whl"}]}`), ContentType: "application/vnd.pypi.simple.v1+json", SiteBaseURL: "https://katch.example.com", RewriteURL: successfulPyPIRewrite}, want: packageprofile.ErrInvalidMetadata},
+		{name: "wrong companion scheme", in: packageprofile.TransformRequest{Body: []byte(`{"files":[{"filename":"demo.whl","url":"ftp://files.pythonhosted.org/packages/ab/cd/0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab/demo.whl"}]}`), ContentType: "application/vnd.pypi.simple.v1+json", SiteBaseURL: "https://katch.example.com", RewriteURL: successfulPyPIRewrite}, want: packageprofile.ErrInvalidMetadata},
+		{name: "wrong HTML companion host", in: packageprofile.TransformRequest{Body: []byte(`<a href="https://evil.example/packages/ab/cd/0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab/demo.whl">demo</a>`), ContentType: "text/html", SiteBaseURL: "https://katch.example.com", RewriteURL: successfulPyPIRewrite}, want: packageprofile.ErrInvalidMetadata},
 		{name: "unsupported media type", in: packageprofile.TransformRequest{Body: validJSON, ContentType: "application/xml", SiteBaseURL: "https://katch.example.com", RewriteURL: successfulPyPIRewrite}, want: packageprofile.ErrInvalidMetadata},
 	}
 	for _, tc := range tests {
