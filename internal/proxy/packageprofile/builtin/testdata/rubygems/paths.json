@@ -1,0 +1,19 @@
+[
+  {"path":"/versions","class":"mutable"},
+  {"path":"/versions/","class":"unknown"},
+  {"path":"/info/rake","class":"mutable"},
+  {"path":"/info/rails-dom-testing","class":"mutable"},
+  {"path":"/info/","class":"unknown"},
+  {"path":"/info/rake/extra","class":"unknown"},
+  {"path":"/names","class":"mutable"},
+  {"path":"/specs.4.8.gz","class":"mutable"},
+  {"path":"/latest_specs.4.8.gz","class":"mutable"},
+  {"path":"/prerelease_specs.4.8.gz","class":"mutable"},
+  {"path":"/quick/Marshal.4.8/rake-13.2.1.gemspec.rz","class":"mutable"},
+  {"path":"/api/v1/dependencies","raw_query":"gems=rake","class":"mutable"},
+  {"path":"/gems/rake-13.2.1.gem","class":"immutable"},
+  {"path":"/gems/nokogiri-1.16.5-x86_64-linux.gem","class":"immutable"},
+  {"path":"/gems/rake.gem","class":"unknown"},
+  {"path":"/gems/rake-latest.gem","class":"unknown"},
+  {"path":"/other/rake-13.2.1.gem","class":"unknown"}
+]
