@@ -2,7 +2,8 @@ FROM homebrew/brew@sha256:b0072bfdebf5934ae24b93b44a1928a88057399b3283ffa0177bb8
 
 USER root
 
-RUN apt-get update \
+RUN rm -f /etc/apt/sources.list.d/github-cli.list /etc/apt/sources.list.d/github-cli.sources \
+    && apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
        iptables strace util-linux \
     && rm -rf /var/lib/apt/lists/* \
