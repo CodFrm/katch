@@ -153,6 +153,15 @@ fi
 nuget_required_upstreams=$(jq -c '.required_upstreams' "$CASES/nuget.yaml")
 [ "$nuget_required_upstreams" = '["api.nuget.org","nuget.azure.cn","azuresearch-usnc.nuget.org","azuresearch-ea.nuget.org","azuresearch-sea.nuget.org","globalcdn.nuget.org","www.nuget.org"]' ] ||
   fail "NuGet required_upstreams does not match the fixed official host contract"
+nuget_setup=$(jq -r '.setup' "$CASES/nuget.yaml")
+printf '%s\n' "$nuget_setup" | grep -Fx '    <NuGetAudit>false</NuGetAudit>' >/dev/null ||
+  fail "NuGet test project does not disable only the out-of-scope vulnerability audit"
+printf '%s\n' "$nuget_setup" | grep -F "'using System;'" >/dev/null ||
+  fail "NuGet generated source does not import System for Console"
+nuget_case=$(jq -r '[.setup, .run, .assert] | join("\n")' "$CASES/nuget.yaml")
+if printf '%s\n' "$nuget_case" | grep -i -E '(signatureValidationMode|allowUntrusted|allowInsecureConnections|disableTLSCertificateValidation|--allow-insecure-connections)'; then
+  fail "NuGet mirror case disables package signatures, repository signatures, or TLS certificate validation"
+fi
 
 npm_run=$(jq -r '.run' "$CASES/npm.yaml")
 printf '%s\n' "$npm_run" | grep -Fx '(cd npm && npm install --ignore-scripts --no-audit --no-update-notifier --registry="$registry" --replace-registry-host=always)' >/dev/null ||
