@@ -1,0 +1,8 @@
+{
+  "name": "cargo",
+  "image": "katch/package-client-tools:2026-09-16",
+  "setup": "set -eu\nmkdir -p cargo/src\nprintf '%s\\n' '[package]' 'name = \"katch-cargo-e2e\"' 'version = \"0.1.0\"' 'edition = \"2024\"' '' '[dependencies]' 'itoa = \"=1.0.11\"' > cargo/Cargo.toml\nprintf '%s\\n' 'fn main() {' '    let mut buffer = itoa::Buffer::new();' '    println!(\"{}\", buffer.format(42));' '}' > cargo/src/main.rs",
+  "run": "set -eu\ncd cargo\nmkdir -p .cargo\nprintf '%s\\n' '[source.crates-io]' 'replace-with = \"katch\"' '' '[source.katch]' \"registry = \\\"sparse+${KATCH_URL%/}/index.crates.io/\\\"\" '' '[net]' 'retry = 0' > .cargo/config.toml\ncargo build --locked 2>/dev/null || cargo build",
+  "assert": "set -eu\ntest \"$(cargo/target/debug/katch-cargo-e2e)\" = '42'\ngrep -q 'checksum = \"' cargo/Cargo.lock\nif grep -R -n -E 'https://(index|static)\\.crates\\.io' cargo/.cargo cargo/Cargo.lock 2>/dev/null; then\n  echo 'Cargo configuration or lockfile leaked a direct crates.io URL' >&2\n  exit 1\nfi",
+  "required_upstreams": ["index.crates.io", "static.crates.io"]
+}
