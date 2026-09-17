@@ -250,6 +250,33 @@ if grep -n -E '(AllowUnauthenticated|AllowInsecureRepositories|AllowDowngradeToI
   fail "Homebrew image disables apt signature verification"
 fi
 
+rpm_required_upstreams=$(jq -c '.required_upstreams' "$CASES/rpm.yaml")
+[ "$rpm_required_upstreams" = '["ftp.riken.jp","www.centos.org"]' ] ||
+  fail "RPM required_upstreams does not match the fixed RIKEN mirror and official GPG key hosts"
+rpm_setup_script=$workdir/rpm-setup.sh
+rpm_setup_root=$workdir/rpm-setup
+jq -r '.setup' "$CASES/rpm.yaml" > "$rpm_setup_script"
+mkdir -p "$rpm_setup_root"
+(
+  cd "$rpm_setup_root"
+  KATCH_URL=https://katch.test /bin/sh "$rpm_setup_script"
+)
+expected_rpm_repo=$(printf '%s\n' \
+  '[katch]' \
+  'name=katch fixed baseurl' \
+  'baseurl=https://katch.test/ftp.riken.jp/Linux/centos-stream/9-stream/BaseOS/x86_64/os/' \
+  'mirrorlist=' \
+  'metalink=' \
+  'enabled=1' \
+  'gpgcheck=1' \
+  'gpgkey=https://katch.test/www.centos.org/keys/RPM-GPG-KEY-CentOS-Official')
+[ "$(cat "$rpm_setup_root/katch.repo")" = "$expected_rpm_repo" ] ||
+  fail "RPM repo does not use the exact fixed RIKEN baseurl and official signature configuration"
+rpm_case=$(jq -r '[.setup, .run, .assert] | join("\n")' "$CASES/rpm.yaml")
+if printf '%s\n' "$rpm_case" | grep -E 'https?://|mirror[.]stream[.]centos[.]org'; then
+  fail "RPM mirror case contains an alternate direct URL or the region-blocked official CDN"
+fi
+
 nuget_required_upstreams=$(jq -c '.required_upstreams' "$CASES/nuget.yaml")
 [ "$nuget_required_upstreams" = '["api.nuget.org","nuget.azure.cn","azuresearch-usnc.nuget.org","azuresearch-ea.nuget.org","azuresearch-sea.nuget.org","globalcdn.nuget.org","www.nuget.org"]' ] ||
   fail "NuGet required_upstreams does not match the fixed official host contract"

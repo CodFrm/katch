@@ -1,8 +1,8 @@
 {
   "name": "rpm-dnf-yum",
   "image": "katch/package-client-centos:stream9-2026-09-16",
-  "setup": "set -eu\nbaseurl=\"${KATCH_URL%/}/mirror.stream.centos.org/9-stream/BaseOS/x86_64/os/\"\ngpgkey=\"${KATCH_URL%/}/www.centos.org/keys/RPM-GPG-KEY-CentOS-Official\"\nprintf '%s\\n' '[katch]' 'name=katch fixed baseurl' \"baseurl=$baseurl\" 'mirrorlist=' 'metalink=' 'enabled=1' 'gpgcheck=1' \"gpgkey=$gpgkey\" > katch.repo\nmkdir -p dnf-root yum-root dnf-cache yum-cache",
+  "setup": "set -eu\nbaseurl=\"${KATCH_URL%/}/ftp.riken.jp/Linux/centos-stream/9-stream/BaseOS/x86_64/os/\"\ngpgkey=\"${KATCH_URL%/}/www.centos.org/keys/RPM-GPG-KEY-CentOS-Official\"\nprintf '%s\\n' '[katch]' 'name=katch fixed baseurl' \"baseurl=$baseurl\" 'mirrorlist=' 'metalink=' 'enabled=1' 'gpgcheck=1' \"gpgkey=$gpgkey\" > katch.repo\nmkdir -p dnf-root yum-root dnf-cache yum-cache",
   "run": "set -eu\ndnf -y --config=\"$PWD/katch.repo\" --disablerepo='*' --enablerepo=katch --releasever=9 --installroot=\"$PWD/dnf-root\" --setopt=cachedir=\"$PWD/dnf-cache\" --setopt=install_weak_deps=False install setup\nyum -y --config=\"$PWD/katch.repo\" --disablerepo='*' --enablerepo=katch --releasever=9 --installroot=\"$PWD/yum-root\" --setopt=cachedir=\"$PWD/yum-cache\" --setopt=install_weak_deps=False install tzdata\ndnf --version\nyum --version",
   "assert": "set -eu\nrpm --root \"$PWD/dnf-root\" --quiet -q setup\nrpm --root \"$PWD/yum-root\" --quiet -q tzdata\ngrep -qx 'mirrorlist=' katch.repo\ngrep -qx 'metalink=' katch.repo\n! grep -Eq '^[[:space:]]*(mirrorlist|metalink)=.+' katch.repo",
-  "required_upstreams": ["mirror.stream.centos.org", "www.centos.org"]
+  "required_upstreams": ["ftp.riken.jp", "www.centos.org"]
 }
