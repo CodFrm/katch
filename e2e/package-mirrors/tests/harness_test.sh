@@ -971,10 +971,64 @@ expected_homebrew_events=$(printf '%s\n' \
 [ "$(cat "$homebrew_events")" = "$expected_homebrew_events" ] ||
   fail "Homebrew cold/warm command sequence does not match the exact API, Tap, and Bottle contract"
 
-jq -r '.run' "$CASES/registry-git-regression.yaml" | grep -F 'git clone --depth=1' >/dev/null ||
-  fail "Git regression is no longer executed"
-jq -r '.run' "$CASES/registry-git-regression.yaml" | grep -F 'blocked: $client is unavailable in the pinned client image' >/dev/null ||
-  fail "Docker/Podman regression is no longer explicitly blocked"
+git_regression_case=$CASES/registry-git-regression.yaml
+git_regression_setup=$(jq -r '.setup' "$git_regression_case")
+git_regression_run=$(jq -r '.run' "$git_regression_case")
+git_regression_assert=$(jq -r '.assert' "$git_regression_case")
+git_regression_commands=$(jq -r '[.setup, .run, .assert] | join("\n")' "$git_regression_case")
+if printf '%s\n' "$git_regression_commands" | grep -E -- '(^|[[:space:]])--(depth|filter)(=|[[:space:]]|$)'; then
+  fail "Git regression uses shallow or filtered requests that must remain passthrough"
+fi
+printf '%s\n' "$git_regression_run" | grep -Fx 'case "$KATCH_PHASE" in' >/dev/null ||
+  fail "Git regression does not branch explicitly between cold and warm phases"
+printf '%s\n' "$git_regression_run" | grep -Fx 'cold)' >/dev/null ||
+  fail "Git regression has no explicit cold phase"
+printf '%s\n' "$git_regression_run" | grep -Fx '  git clone "$repository_url" repository' >/dev/null ||
+  fail "Git regression cold phase is not a fresh ordinary clone"
+printf '%s\n' "$git_regression_run" | grep -Fx '  max_attempts=60' >/dev/null ||
+  fail "Git regression local-mirror poll does not have the approved finite attempt bound"
+printf '%s\n' "$git_regression_run" | grep -Fx '  poll_interval=5' >/dev/null ||
+  fail "Git regression local-mirror poll does not have the approved interval"
+printf '%s\n' "$git_regression_run" | grep -Fx '  poll_timeout=300' >/dev/null ||
+  fail "Git regression local-mirror poll does not have a reasonable wall-clock timeout"
+printf '%s\n' "$git_regression_run" | grep -Fx '  request_timeout=15' >/dev/null ||
+  fail "Git regression ls-remote attempts do not have an individual timeout"
+printf '%s\n' "$git_regression_run" | grep -Fx '  deadline=$(($(date +%s) + poll_timeout))' >/dev/null ||
+  fail "Git regression local-mirror poll does not calculate a finite deadline"
+printf '%s\n' "$git_regression_run" | grep -Fx '  while [ "$attempt" -le "$max_attempts" ] && [ "$(date +%s)" -lt "$deadline" ]; do' >/dev/null ||
+  fail "Git regression local-mirror poll does not consume its finite bound"
+printf '%s\n' "$git_regression_run" | grep -Fx '    attempt=$((attempt + 1))' >/dev/null ||
+  fail "Git regression local-mirror poll does not advance its attempt counter"
+printf '%s\n' "$git_regression_run" | grep -Fx '        sleep "$poll_interval"' >/dev/null ||
+  fail "Git regression local-mirror poll does not apply its bounded interval"
+printf '%s\n' "$git_regression_run" | grep -Fx '    poll_trace="results/cold-local-$attempt.trace"' >/dev/null ||
+  fail "Git regression poll does not use a fresh trace file for every attempt"
+printf '%s\n' "$git_regression_run" | grep -Fx '    if GIT_TRACE_CURL=1 timeout "$call_timeout" git ls-remote "$repository_url" HEAD > "$poll_refs" 2> "$poll_trace"; then' >/dev/null ||
+  fail "Git regression cold phase does not use a bounded ls-remote through Katch with curl tracing"
+printf '%s\n' "$git_regression_run" | grep -Fx "      if tr -d '\\r' < \"\$poll_trace\" | grep -Eiq '<= Recv header: X-Katch-Git: local\$'; then" >/dev/null ||
+  fail "Git regression poll does not require the exact local response header case-insensitively"
+printf '%s\n' "$git_regression_run" | grep -Fx '  if [ "$local_ready" != true ]; then' >/dev/null ||
+  fail "Git regression does not fail when the mirror never becomes local"
+printf '%s\n' "$git_regression_run" | grep -Fx '    echo "last trace: $last_poll_trace" >&2' >/dev/null ||
+  fail "Git regression timeout does not identify its last trace diagnostic"
+printf '%s\n' "$git_regression_run" | grep -Fx '    cat "$last_poll_trace" >&2 || true' >/dev/null ||
+  fail "Git regression timeout does not emit its last trace diagnostic"
+printf '%s\n' "$git_regression_run" | grep -Fx 'warm)' >/dev/null ||
+  fail "Git regression has no explicit warm phase"
+printf '%s\n' "$git_regression_run" | grep -Fx '  GIT_TRACE_CURL=1 git clone "$repository_url" repository > results/warm-clone.stdout 2> results/warm-clone.trace' >/dev/null ||
+  fail "Git regression warm phase is not a fresh traced ordinary clone"
+printf '%s\n' "$git_regression_assert" | grep -Fx "  tr -d '\\r' < results/warm-clone.trace | grep -Eiq '<= Recv header: X-Katch-Git: local\$'" >/dev/null ||
+  fail "Git regression warm phase does not assert local Git evidence"
+printf '%s\n' "$git_regression_setup" | grep -Fx 'test ! -e repository && test ! -e results' >/dev/null ||
+  fail "Git regression setup does not require fresh phase files"
+if printf '%s\n' "$git_regression_commands" | grep -F 'KATCH_SHARED'; then
+  fail "Git regression shares checkout or client state between phases"
+fi
+[ "$(printf '%s\n' "$git_regression_run" | grep -Fc 'NOT runtime verification')" -eq 2 ] ||
+  fail "Docker/Podman unavailable and daemon-blocked diagnostics are not disclaimed"
+if printf '%s\n' "$git_regression_assert" | grep -Ei '(blocked:|Client:|Version:)'; then
+  fail "Docker/Podman diagnostic output is treated as passing runtime verification"
+fi
 
 if grep -R -n -E '^[[:space:]]*(docker|podman)[[:space:]].*(-v|--volume)[= ]?/var/run/(docker|podman)\.sock' "$ROOT/e2e/package-mirrors"; then
   fail "harness mounts a host container socket"
