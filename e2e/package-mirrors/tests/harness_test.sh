@@ -651,16 +651,29 @@ printf '%s\n' "$homebrew_run" | grep -Fx 'export HOMEBREW_ARTIFACT_DOMAIN="${KAT
   fail "Homebrew does not use the exact registry base route"
 printf '%s\n' "$homebrew_run" | grep -Fx 'export HOMEBREW_ARTIFACT_DOMAIN_NO_FALLBACK=1' >/dev/null ||
   fail "Homebrew does not force artifact-domain no-fallback"
-printf '%s\n' "$homebrew_run" | grep -Fx '    brew info --json=v2 jq > results/api-jq.json' >/dev/null ||
-  fail "Homebrew cold phase does not fetch and verify formula API metadata"
+printf '%s\n' "$homebrew_run" | grep -Fx 'export HOMEBREW_NO_INSTALL_FROM_API=1' >/dev/null ||
+  fail "Homebrew does not disable API installs before invoking brew ruby"
+printf '%s\n' "$homebrew_run" | grep -F 'require "api/internal"' >/dev/null ||
+  fail "Homebrew cold phase does not load the native internal API"
+printf '%s\n' "$homebrew_run" | grep -F 'Homebrew::API.fetch_json_api_file(Homebrew::API::Internal.formula_endpoint)' >/dev/null ||
+  fail "Homebrew cold phase does not fetch the system-specific formula JWS through the native API helper"
+printf '%s\n' "$homebrew_run" | grep -F 'JSON.generate({"name" => "jq", "version" => version})' >/dev/null ||
+  fail "Homebrew cold phase does not emit compact jq API evidence"
+printf '%s\n' "$homebrew_run" | grep -F '> results/api-jq.json' >/dev/null ||
+  fail "Homebrew cold phase does not preserve formula API evidence"
+[ "$(printf '%s\n' "$homebrew_run" | grep -Fxc 'export HOMEBREW_NO_INSTALL_FROM_API=1')" -eq 1 ] ||
+  fail "Homebrew does not keep both installs and the API probe in pinned tap mode"
+if printf '%s\n' "$homebrew_run" | grep -F 'unset HOMEBREW_NO_INSTALL_FROM_API'; then
+  fail "Homebrew enables global API preloading before the cold probe"
+fi
+[ "$(printf '%s\n' "$homebrew_run" | grep -Fc 'brew info --json=v2 jq')" -eq 1 ] ||
+  fail "Homebrew invokes brew info outside the single installed tap metadata check"
+[ "$(printf '%s\n' "$homebrew_run" | grep -Fxc 'brew info --json=v2 jq > results/jq.json')" -eq 1 ] ||
+  fail "Homebrew does not limit brew info to installed tap metadata"
 [ "$(printf '%s\n' "$homebrew_run" | grep -Fxc '    git ls-remote "$HOMEBREW_CORE_GIT_REMOTE" HEAD > results/core-head')" -eq 1 ] ||
   fail "Homebrew does not run one cold-only mirrored git ls-remote"
-[ "$(printf '%s\n' "$homebrew_run" | grep -Fxc 'export HOMEBREW_NO_INSTALL_FROM_API=1')" -eq 1 ] ||
-  fail "Homebrew does not switch both installs to the pinned core tap"
 [ "$(printf '%s\n' "$homebrew_run" | grep -Fxc 'brew list --versions jq > results/jq-list')" -eq 1 ] ||
   fail "Homebrew does not record the native installed formula version"
-[ "$(printf '%s\n' "$homebrew_run" | grep -Fxc 'brew info --json=v2 jq > results/jq.json')" -eq 1 ] ||
-  fail "Homebrew does not record installed formula metadata"
 [ "$(printf '%s\n' "$homebrew_run" | grep -Fxc 'brew --cellar jq > results/jq-cellar')" -eq 1 ] ||
   fail "Homebrew does not record the formula Cellar path"
 printf '%s\n' "$homebrew_assert" | grep -Fx "grep -Eqx 'jq [0-9]+([.][0-9]+)+([._-][A-Za-z0-9]+)*' results/jq-list" >/dev/null ||
@@ -690,6 +703,9 @@ fi
 if printf '%s\n' "$homebrew_commands" | grep -i -E 'https?://([^/]*[.])?ghcr[.]io([/:]|$)'; then
   fail "Homebrew mirror case contains a direct GHCR URL"
 fi
+if printf '%s\n' "$homebrew_commands" | grep -i -E -- '(^|[^[:alnum:]_])(curl|wget)([^[:alnum:]_]|$)|verify_and_parse_jws|cached_jws_payload|openssl|homebrew-1|formula[.]jws[.]json|cask[.]jws[.]json|cask_endpoint|fetch_cask_api|internal/cask[.]'; then
+  fail "Homebrew mirror case bypasses the native system-specific formula JWS verification path"
+fi
 if printf '%s\n' "$homebrew_commands" | grep -i -E -- '(^|[[:space:]])--insecure([=[:space:]]|$)|HOMEBREW_.*(NO_VERIFY|DISABLE.*(TLS|SSL|CHECKSUM|SIGNATURE))|(^|[[:space:]])(SSL_CERT_FILE|CURL_CA_BUNDLE)=/dev/null'; then
   fail "Homebrew mirror case disables TLS, checksum, or signature verification"
 fi
@@ -716,14 +732,19 @@ fi
 printf 'brew|%s|%s|%s|%s|%s|%s|%s\n' "$KATCH_PHASE" "$HOME" "$HOMEBREW_API_DOMAIN" \
   "$HOMEBREW_ARTIFACT_DOMAIN" "$HOMEBREW_ARTIFACT_DOMAIN_NO_FALLBACK" \
   "${HOMEBREW_NO_INSTALL_FROM_API-unset}" "$*" >> "$HOMEBREW_EVENT_LOG"
+[ "${HOMEBREW_NO_INSTALL_FROM_API-unset}" = 1 ] || exit 65
+if [ "$#" -eq 4 ] && [ "$1" = ruby ] && [ "$2" = -rjson ] && [ "$3" = -e ]; then
+  script=$4
+  case $script in *'require "api/internal"'*) ;; *) exit 66 ;; esac
+  case $script in *'Homebrew::API.fetch_json_api_file(Homebrew::API::Internal.formula_endpoint)'*) ;; *) exit 66 ;; esac
+  case $script in *'data.fetch("formulae")'*'formulae.fetch("jq")'*'JSON.generate({"name" => "jq", "version" => version})'*) ;; *) exit 66 ;; esac
+  printf '%s\n' '{"name":"jq","version":"10.0.0"}'
+  exit 0
+fi
 case "$*" in
   'install jq') ;;
   'info --json=v2 jq')
-    if [ "${HOMEBREW_NO_INSTALL_FROM_API-unset}" = unset ]; then
-      printf '%s\n' '{"formulae":[{"name":"jq","versions":{"stable":"10.0.0"},"installed":[]}]}'
-    else
-      printf '%s\n' '{"formulae":[{"name":"jq","installed":[{"version":"9.7.6"}]}]}'
-    fi
+    printf '%s\n' '{"formulae":[{"name":"jq","installed":[{"version":"9.7.6"}]}]}'
     ;;
   'list --versions jq') printf '%s\n' 'jq 9.7.6' ;;
   '--cellar jq') printf '%s\n' "$HOMEBREW_TEST_CELLAR/$KATCH_PHASE/jq" ;;
@@ -772,8 +793,13 @@ file=$4
 printf '%s\n' "$file" >> "${PORTABLE_RUBY_EXECUTION_LOG:?PORTABLE_RUBY_EXECUTION_LOG is required}"
 case $file in
   results/api-jq.json)
-    case $script in *'entry["name"] == "jq"'*) ;; *) exit 88 ;; esac
-    "$HOMEBREW_TEST_JQ" -e '.formulae | type == "array" and any(.[]; .name == "jq")' "$file" >/dev/null
+    case $script in *'data.keys.sort == ["name", "version"]'*'data["name"] == "jq"'*'version.empty?'*) ;; *) exit 88 ;; esac
+    "$HOMEBREW_TEST_JQ" -e '
+      type == "object" and
+      (keys == ["name", "version"]) and
+      .name == "jq" and
+      (.version | type == "string" and length > 0 and (contains("\n") | not))
+    ' "$file" >/dev/null
     ;;
   results/jq.json)
     case $script in *'entry["name"] == "jq"'*'installed.length == 1'*'version.empty?'*) ;; *) exit 88 ;; esac
@@ -844,14 +870,23 @@ for invalid_homebrew_json in \
   fi
 done
 printf '%s\n' '{"formulae":[{"name":"jq","installed":[{"version":"9.7.6"}]}]}' > "$homebrew_phase_root/cold/results/jq.json"
-printf '%s\n' '{"formulae":[]}' > "$homebrew_phase_root/cold/results/api-jq.json"
-if (cd "$homebrew_phase_root/cold" && PATH="$homebrew_case_bin:$homebrew_prefix/bin:$PATH" KATCH_PHASE=cold \
-  HOMEBREW_TEST_REPOSITORY="$homebrew_repository" HOMEBREW_TEST_JQ="$homebrew_system_jq" \
-  JQ_EXECUTION_LOG="$homebrew_jq_execution_log" PATH_RUBY_EXECUTION_LOG="$homebrew_path_ruby_execution_log" \
-  PORTABLE_RUBY_EXECUTION_LOG="$homebrew_portable_ruby_execution_log" /bin/sh "$homebrew_assert_script" >/dev/null 2>&1); then
-  fail "Homebrew assertion accepted API JSON without the requested formula"
-fi
-printf '%s\n' '{"formulae":[{"name":"jq","versions":{"stable":"10.0.0"},"installed":[]}]}' > "$homebrew_phase_root/cold/results/api-jq.json"
+for invalid_homebrew_api_json in \
+  'not-json' \
+  '{}' \
+  '{"name":"jq"}' \
+  '{"name":"not-jq","version":"10.0.0"}' \
+  '{"name":"jq","version":""}' \
+  '{"name":"jq","version":"10.0.0","extra":true}' \
+  '[{"name":"jq","version":"10.0.0"}]'; do
+  printf '%s\n' "$invalid_homebrew_api_json" > "$homebrew_phase_root/cold/results/api-jq.json"
+  if (cd "$homebrew_phase_root/cold" && PATH="$homebrew_case_bin:$homebrew_prefix/bin:$PATH" KATCH_PHASE=cold \
+    HOMEBREW_TEST_REPOSITORY="$homebrew_repository" HOMEBREW_TEST_JQ="$homebrew_system_jq" \
+    JQ_EXECUTION_LOG="$homebrew_jq_execution_log" PATH_RUBY_EXECUTION_LOG="$homebrew_path_ruby_execution_log" \
+    PORTABLE_RUBY_EXECUTION_LOG="$homebrew_portable_ruby_execution_log" /bin/sh "$homebrew_assert_script" >/dev/null 2>&1); then
+    fail "Homebrew assertion accepted invalid formula API evidence: $invalid_homebrew_api_json"
+  fi
+done
+printf '%s\n' '{"name":"jq","version":"10.0.0"}' > "$homebrew_phase_root/cold/results/api-jq.json"
 printf '%s\n' '{"poured_from_bottle":false}' > "$homebrew_cellar/cold/jq/9.7.6/INSTALL_RECEIPT.json"
 if (cd "$homebrew_phase_root/cold" && PATH="$homebrew_case_bin:$homebrew_prefix/bin:$PATH" KATCH_PHASE=cold \
   HOMEBREW_TEST_REPOSITORY="$homebrew_repository" HOMEBREW_TEST_JQ="$homebrew_system_jq" \
@@ -861,8 +896,9 @@ if (cd "$homebrew_phase_root/cold" && PATH="$homebrew_case_bin:$homebrew_prefix/
 fi
 [ ! -e "$homebrew_jq_execution_log" ] || fail "Homebrew assertion executed the installed jq command"
 [ ! -e "$homebrew_path_ruby_execution_log" ] || fail "Homebrew assertion executed Ruby from PATH"
+homebrew_api_ruby_script='require "api/internal"; data, = Homebrew::API.fetch_json_api_file(Homebrew::API::Internal.formula_endpoint); formulae = data.fetch("formulae"); formula = formulae.fetch("jq"); version = formula.fetch(0); raise "invalid jq version" unless version.is_a?(String) && !version.empty?; puts JSON.generate({"name" => "jq", "version" => version})'
 expected_homebrew_events=$(printf '%s\n' \
-  "brew|cold|$homebrew_phase_root/cold/client-home|https://katch.test/formulae.brew.sh/api|https://katch.test/registry/ghcr.io|1|unset|info --json=v2 jq" \
+  "brew|cold|$homebrew_phase_root/cold/client-home|https://katch.test/formulae.brew.sh/api|https://katch.test/registry/ghcr.io|1|1|ruby -rjson -e $homebrew_api_ruby_script" \
   "git|cold|$homebrew_phase_root/cold/client-home|ls-remote https://katch.test/github.com/Homebrew/homebrew-core.git HEAD" \
   "brew|cold|$homebrew_phase_root/cold/client-home|https://katch.test/formulae.brew.sh/api|https://katch.test/registry/ghcr.io|1|1|install jq" \
   "brew|cold|$homebrew_phase_root/cold/client-home|https://katch.test/formulae.brew.sh/api|https://katch.test/registry/ghcr.io|1|1|list --versions jq" \
