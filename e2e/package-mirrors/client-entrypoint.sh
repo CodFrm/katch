@@ -8,7 +8,7 @@ verify_capture() {
     printf '%s\n' "missing connection record: $capture" >&2
     return 1
   }
-  awk -v allowed="$katch_ip" '
+  awk -v allowed="$katch_ip" -v allowed_port="${KATCH_PORT:-}" '
     function reject(destination, line) {
       if (destination == allowed || destination ~ /^127\./ || destination == "::1") return
       print "non-katch connection attempt: " line > "/dev/stderr"
@@ -25,7 +25,11 @@ verify_capture() {
     /sa_family=AF_INET6,/ {
       line = $0
       if (match(line, /inet_pton\(AF_INET6, "[0-9A-Fa-f:.]+"/)) {
-        destination = substr(line, RSTART + 23, RLENGTH - 24)
+        destination = substr(line, RSTART + 21, RLENGTH - 22)
+        if (destination == "::ffff:" allowed && match(line, /sin6_port=htons\([0-9]+\)/)) {
+          port = substr(line, RSTART + 16, RLENGTH - 17)
+          if (port == allowed_port) next
+        }
         reject(destination, line)
       }
       next

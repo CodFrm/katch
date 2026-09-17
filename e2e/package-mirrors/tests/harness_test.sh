@@ -204,6 +204,40 @@ cat > "$workdir/allowed.log" <<'EOF'
 EOF
 "$ENTRYPOINT" --verify-capture "$workdir/allowed.log" 172.18.0.2
 
+capture_katch_ip=172.17.0.1
+capture_katch_port=38443
+cat > "$workdir/mapped-katch.log" <<EOF
+126 connect(3, {sa_family=AF_INET6, sin6_port=htons($capture_katch_port), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "::ffff:$capture_katch_ip", &sin6_addr), sin6_scope_id=0}, 28) = 0
+EOF
+KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/mapped-katch.log" "$capture_katch_ip" ||
+  fail "exact IPv4-mapped Katch connection was rejected"
+
+cat > "$workdir/mapped-other-ip.log" <<EOF
+127 connect(3, {sa_family=AF_INET6, sin6_port=htons($capture_katch_port), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "::ffff:172.17.0.2", &sin6_addr), sin6_scope_id=0}, 28) = -1 ECONNREFUSED (Connection refused)
+EOF
+if KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/mapped-other-ip.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "IPv4-mapped connection to another IP was accepted"
+fi
+grep -F '::ffff:172.17.0.2' "$workdir/out" >/dev/null ||
+  fail "IPv4-mapped connection to another IP was not reported"
+
+cat > "$workdir/mapped-other-port.log" <<EOF
+128 connect(3, {sa_family=AF_INET6, sin6_port=htons(443), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "::ffff:$capture_katch_ip", &sin6_addr), sin6_scope_id=0}, 28) = -1 ECONNREFUSED (Connection refused)
+EOF
+if KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/mapped-other-port.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "IPv4-mapped Katch connection to another port was accepted"
+fi
+grep -F 'sin6_port=htons(443)' "$workdir/out" >/dev/null ||
+  fail "IPv4-mapped Katch connection to another port was not reported"
+
+cat > "$workdir/ipv6-leak.log" <<EOF
+129 connect(3, {sa_family=AF_INET6, sin6_port=htons($capture_katch_port), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "2001:db8::1", &sin6_addr), sin6_scope_id=0}, 28) = -1 ENETUNREACH (Network unreachable)
+EOF
+if KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/ipv6-leak.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "ordinary IPv6 connection was accepted"
+fi
+grep -F '2001:db8::1' "$workdir/out" >/dev/null || fail "ordinary IPv6 connection was not reported"
+
 cat > "$workdir/dns-leak.log" <<'EOF'
 124 sendto(3, "query", 5, MSG_NOSIGNAL, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, 16) = -1 EACCES (Permission denied)
 EOF
