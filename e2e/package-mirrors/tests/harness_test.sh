@@ -168,6 +168,56 @@ if printf '%s\n' "$nuget_case" | grep -i -E '(signatureValidationMode|allowUntru
   fail "NuGet mirror case disables package signatures, repository signatures, or TLS certificate validation"
 fi
 
+nuget_assert_script=$workdir/nuget-assert.sh
+nuget_assert_root=$workdir/nuget-assert
+nuget_bin=$workdir/nuget-bin
+nuget_events=$workdir/nuget-events.log
+jq -r '.assert' "$CASES/nuget.yaml" > "$nuget_assert_script"
+mkdir -p "$nuget_assert_root/app/obj" "$nuget_assert_root/packages/newtonsoft.json/13.0.3" "$nuget_bin"
+: > "$nuget_assert_root/packages/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg"
+printf '%s\n' 'Newtonsoft.Json' > "$nuget_assert_root/search.json"
+cat > "$nuget_bin/dotnet" <<'EOF'
+#!/bin/sh
+set -eu
+case "$*" in
+  'run --project app/app.csproj --no-restore')
+    printf '%s\n' run >> "$NUGET_EVENT_LOG"
+    printf '%s\n' '{"mirrored":true}'
+    ;;
+  'build-server shutdown')
+    printf '%s\n' shutdown >> "$NUGET_EVENT_LOG"
+    exit "${NUGET_SHUTDOWN_STATUS:-0}"
+    ;;
+  *) exit 64 ;;
+esac
+EOF
+chmod 0555 "$nuget_bin/dotnet"
+run_nuget_assert() {
+  shutdown_status=$1
+  : > "$nuget_events"
+  (cd "$nuget_assert_root" && env PATH="$nuget_bin:$PATH" NUGET_EVENT_LOG="$nuget_events" \
+    NUGET_SHUTDOWN_STATUS="$shutdown_status" /bin/sh "$nuget_assert_script")
+}
+
+run_nuget_assert 0 >"$workdir/out" 2>&1 || fail "NuGet assertions or build-server shutdown failed"
+[ "$(cat "$nuget_events")" = "$(printf 'run\nshutdown\n')" ] ||
+  fail "NuGet case does not shut down build servers after the final program assertion"
+if run_nuget_assert 42 >"$workdir/out" 2>&1; then
+  fail "NuGet case masks a build-server shutdown failure after successful assertions"
+else
+  nuget_status=$?
+fi
+[ "$nuget_status" -eq 42 ] || fail "NuGet case changed the build-server shutdown failure status"
+printf '%s\n' 'https://api.nuget.org/leak' >> "$nuget_assert_root/search.json"
+if run_nuget_assert 42 >"$workdir/out" 2>&1; then
+  fail "NuGet case masks an assertion failure while shutting down build servers"
+else
+  nuget_status=$?
+fi
+[ "$nuget_status" -eq 1 ] || fail "NuGet build-server cleanup masked the original assertion status"
+[ "$(cat "$nuget_events")" = "$(printf 'run\nshutdown\n')" ] ||
+  fail "NuGet case skips build-server cleanup after an assertion failure"
+
 npm_run=$(jq -r '.run' "$CASES/npm.yaml")
 printf '%s\n' "$npm_run" | grep -Fx '(cd npm && npm install --ignore-scripts --no-audit --no-update-notifier --registry="$registry" --replace-registry-host=always)' >/dev/null ||
   fail "npm mirror case does not disable audit and the npm update notifier"
