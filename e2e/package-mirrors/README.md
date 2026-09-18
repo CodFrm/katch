@@ -1,6 +1,6 @@
 # Package mirror runtime harness
 
-The harness runs each case twice in a fresh, locally built client image. Every image starts as root in the common entrypoint so it can install an IPv4/IPv6 OUTPUT firewall and start `strace`; the command phase then runs as the image contract user with matching `HOME`, `USER`, and `LOGNAME`. Only the Debian APT, CentOS DNF/YUM, and Alpine APK cases stay root because they modify the container package database.
+The harness runs each case twice in a fresh, locally built client image. Every image starts as root in the common entrypoint so it can install an IPv4/IPv6 OUTPUT firewall and start `strace`; the command phase then runs as the image contract user with matching `HOME`, `USER`, and `LOGNAME`. Debian APT, CentOS DNF/YUM, Alpine APK, Docker, and Podman stay root because they modify system package, daemon, or container storage state.
 
 The client namespace permits TCP only to katch and loopback. Katch remains outside that namespace and retains origin egress. `strace` records every DNS/socket connection attempt, and any destination other than katch or loopback fails the case even when the client command succeeds. The harness never mounts a host Docker or Podman socket.
 
@@ -22,6 +22,8 @@ The client namespace permits TCP only to katch and loopback. Katch remains outsi
 | alpine | APK 2.14.9 | `root` |
 | composer | Composer 2.9.5 | `client` |
 | homebrew | Homebrew 4.6.20 | `linuxbrew` |
+| docker | Docker 29.2.1 daemon and client | `root` |
+| podman | Podman 5.6.2 rootful client | `root` |
 
 The Node base already supplies Yarn Classic 1.22.22. Yarn Berry is installed privately under `/opt/yarn-berry` and exposed only as `yarn-berry`, so the two CLIs cannot replace each other's symlinks.
 
@@ -29,6 +31,12 @@ Build every target and run its exact-version smoke with container networking dis
 
 ```sh
 make package-mirror-image
+```
+
+Build and smoke only the dedicated registry clients:
+
+```sh
+make package-mirror-registry-images
 ```
 
 Run deterministic schema, image-contract, embedded-shell, isolation, and connection-capture tests without Docker or Podman:
@@ -47,7 +55,7 @@ The Composer case registers `repo.packagist.org`, `api.github.com`, and `codeloa
 
 ## Running cases
 
-Case files use the JSON-compatible subset of YAML and the fixed schema `{name,image,setup,run,assert,required_upstreams}`. The harness writes commands to read-only mounted scripts and never interpolates them through `eval`.
+Case files use the JSON-compatible subset of YAML and the fixed required schema `{name,image,setup,run,assert,required_upstreams}`. They may set the boolean `privileged` field, which defaults to `false`. The harness writes commands to read-only mounted scripts and never interpolates them through `eval`.
 
 After katch has `site_domain` set to the exact client-visible URL and compatible upstreams enabled, run one or more cases:
 
@@ -74,7 +82,9 @@ KATCH_HOST=host.docker.internal KATCH_PORT=8443 \
 
 The harness mounts that file read-only at `/run/katch-test-ca.crt` and passes only the mounted path to the client entrypoint. The root entrypoint installs it into the image's system trust store before firewall tracing and before switching to `client` or `linuxbrew`. Leaving `KATCH_CA_CERT` unset adds neither the mount nor the client environment variable. This trust path is required for HTTPS NuGet repository-signature resources; signature validation remains enabled.
 
-Artifacts include per-phase client output, connection records, firewall snapshots, and Prometheus snapshots under `${ARTIFACT_ROOT:-${TMPDIR:-/tmp}/katch-package-mirrors-artifacts}`. Root is required only inside disposable client containers for `NET_ADMIN`; host root is not used.
+Artifacts include per-phase client output, connection records, firewall snapshots, and Prometheus snapshots under `${ARTIFACT_ROOT:-${TMPDIR:-/tmp}/katch-package-mirrors-artifacts}`. Root is required only inside disposable standard client containers for `NET_ADMIN`. Standard cases receive only `NET_ADMIN`, `NET_RAW`, and `no-new-privileges`.
+
+The Docker and Podman registry regressions are the only cases with `privileged: true`. For those cases the harness passes `--privileged` and omits the incompatible `no-new-privileges` option and individual capability grants. Privileged containers can control kernel-facing resources and can compromise the host if their image or case script is untrusted, so run these pinned images only on a dedicated trusted runner. They still receive no host daemon socket, daemon storage mount, or host container storage. The firewall is installed before the case shell starts; the nested daemon/storage and native client then run in that same container network namespace under the entrypoint's `strace`, with fresh phase-local storage.
 
 The npm case generates new lockfiles and rejects leaked public registry URLs. Existing lockfiles are not silently claimed compatible: use registry-host replacement where the client supports it, otherwise regenerate them through katch.
 
@@ -82,8 +92,8 @@ Homebrew uses `${KATCH_URL%/}/registry/ghcr.io` as its artifact domain and enabl
 
 The Homebrew cold phase covers all three protocol surfaces explicitly. With `HOMEBREW_NO_INSTALL_FROM_API=1` set from process startup, it invokes `brew ruby` and Homebrew's `Homebrew::API.fetch_json_api_file(Homebrew::API::Internal.formula_endpoint)` path through `HOMEBREW_API_DOMAIN`. Homebrew therefore downloads only the native system-specific formula JWS (for this image, `internal/formula.x86_64_linux.jws.json`), verifies its PS512 signature with Homebrew's embedded key, and emits compact jq name/version evidence with both the source and Bottle SHA-256 checksums; it does not preload the global formula JWS or fetch the irrelevant cask JWS. The cold phase then probes the mirrored Homebrew/core Git HEAD and installs the standard Bottle from the image-pinned core tap through Katch. The warm phase skips the mutable API and Git checks, keeps the same tap mode, and installs the same formula/Bottle identity. This is deliberate: API/JWS and Git remain governed by their honest HTTP and Git freshness rules, while the immutable Bottle can be reused with zero origin requests. API cache, tap state, package state, `HOME`, and the Cellar remain phase-local rather than being shared to manufacture a warm hit. The pinned client validates the exact cold evidence shape, nonempty version, lowercase 64-hex checksums, Tap evidence, native installed-formula list and JSON, and Bottle install receipt without hardcoding the current jq version. It deliberately does not execute the formula binary because upstream bottles may advance their minimum glibc beyond the pinned image's OS ABI.
 
-The shared registry/Git regression uses an ordinary full clone in each fresh phase. After the cold clone and `git fsck`, it polls `git ls-remote` through Katch for up to five minutes, keeping a fresh curl trace per attempt, until an exact case-insensitive `X-Katch-Git: local` response proves that the background bare mirror is ready. Those polls remain part of the cold origin count. The independent warm clone must carry the same local header and make zero origin requests; no checkout or Git client state is shared between phases.
+The Git regression uses an ordinary full clone in each fresh phase. After the cold clone and `git fsck`, it polls `git ls-remote` through Katch for up to five minutes, keeping a fresh curl trace per attempt, until an exact case-insensitive `X-Katch-Git: local` response proves that the background bare mirror is ready. Those polls remain part of the cold origin count. The independent warm clone must carry the same local header and make zero origin requests; no checkout or Git client state is shared between phases. It contains no Docker or Podman diagnostics.
 
-Docker and Podman commands in that case are diagnostic probes only. An unavailable or daemon-blocked line explicitly says `NOT runtime verification`, is never accepted as a passing runtime assertion, and must not be reported as runtime success. The harness mounts no daemon socket because a host daemon would bypass the client firewall.
+The dedicated Docker regression starts Docker 29.2.1's `dockerd` only after the OUTPUT firewall is active, on a phase-local Unix socket with fresh `vfs` storage, no bridge, and daemon iptables disabled. The dedicated Podman regression uses rootful Podman 5.6.2 with phase-local `vfs` root and runroot. Both require `KATCH_CA_CERT`, install that exact certificate for `${KATCH_HOST}:${KATCH_PORT}`, pull `ghcr.io/stefanprodan/podinfo` through katch without disabling TLS, retain native digest verification evidence, and run the pulled `./podinfo --version`. Docker uses 6.9.2 and Podman uses 6.9.1 so a combined run cannot turn the second cold phase into an origin-free tag reuse. Both cases require enabled `ghcr.io` registry and `pkg-containers.githubusercontent.com` static upstreams.
 
-A missing container runtime is a blocked runtime verification, not a pass. The deterministic test remains runnable without a container runtime; the full image build and runtime case matrix must run on `coding.local`.
+A missing outer container runtime, privileged-container support, nested daemon prerequisites, or test CA is a blocked runtime verification, not a pass. Deterministic tests remain runnable without Docker or Podman; the full image build and runtime case matrix must run on a trusted Linux amd64 runner such as `coding.local`.

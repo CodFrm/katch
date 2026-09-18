@@ -111,5 +111,21 @@
     "user": "linuxbrew",
     "cases": ["homebrew-bottle"],
     "smoke": {"brew": "4.6.20"}
+  },
+  {
+    "image": "katch/package-client-docker:29.2.1",
+    "dockerfile": "docker.Dockerfile",
+    "target": "docker",
+    "user": "root",
+    "cases": ["docker-registry-regression"],
+    "smoke": {"docker": "29.2.1"}
+  },
+  {
+    "image": "katch/package-client-podman:5.6.2",
+    "dockerfile": "podman.Dockerfile",
+    "target": "podman",
+    "user": "root",
+    "cases": ["podman-registry-regression"],
+    "smoke": {"podman": "5.6.2"}
   }
 ]

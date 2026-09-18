@@ -160,7 +160,8 @@ git 因为要处理带请求体的协商，是另一个适配器（见下）。
 package profile，因此这些明确 allowlist 的 profile 返回 `runtime_verified=true`；`none`、
 空值和未来未知 profile 仍返回 `false`。界面只有在 `runtime_verified` 和当次数据库快照
 算出的 `package_readiness.ready` 同时为真时才显示可复制配置。共享回归中的真实 Git
-clone 已验证；Docker、Podman 只有 blocked/version 诊断，没有 runtime 成功结论。
+clone 已验证；Docker、Podman 改由独立的 privileged 回归用例执行原生 pull、digest 校验和
+容器内版本运行，blocked/version 诊断不再构成 runtime 成功证据。
 
 git 的适配器走的是**穿透 + 本地镜像双路径**：镜像还没建成、或者请求带着 shallow、
 `--filter` 这类本地给不了的形态时，请求原样转给上游，同时在后台把这个仓库镜像

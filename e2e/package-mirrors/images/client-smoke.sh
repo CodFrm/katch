@@ -89,6 +89,12 @@ case $client_flavor in
   composer)
     expect_version composer 2.9.5 "$(composer --version --no-ansi | awk '{ print $3 }')"
     ;;
+  docker)
+    expect_version docker 29.2.1 "$(docker --version | awk '{ sub(/,$/, "", $3); print $3 }')"
+    ;;
+  podman)
+    expect_version podman 5.6.2 "$(podman --version | awk '{ print $3 }')"
+    ;;
   homebrew)
     expect_version brew 4.6.20 "$(brew --version | awk 'NR == 1 { print $2 }')"
     ;;

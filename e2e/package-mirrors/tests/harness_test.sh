@@ -7,6 +7,8 @@ ENTRYPOINT=$ROOT/e2e/package-mirrors/client-entrypoint.sh
 IMAGE_SMOKE=$ROOT/e2e/package-mirrors/images/client-smoke.sh
 IMAGE_BUILD=$ROOT/e2e/package-mirrors/images/build.sh
 IMAGE_CONTRACT=$ROOT/e2e/package-mirrors/images/contract.json
+DOCKER_CLIENT_DOCKERFILE=$ROOT/e2e/package-mirrors/images/docker.Dockerfile
+PODMAN_CLIENT_DOCKERFILE=$ROOT/e2e/package-mirrors/images/podman.Dockerfile
 CASES=$ROOT/e2e/package-mirrors/cases
 workdir=$(mktemp -d "${TMPDIR:-/tmp}/katch-harness-test.XXXXXX")
 trap 'rm -rf "$workdir"' EXIT HUP INT TERM
@@ -154,7 +156,7 @@ if grep -n -E '(safe[.]directory|(^|[[:space:]])(chmod|chown)([[:space:]]|$))' "
 fi
 
 jq -e '
-  type == "array" and length == 12 and
+  type == "array" and length == 14 and
   all(.[];
     (keys | sort) == (["cases", "dockerfile", "image", "smoke", "target", "user"] | sort) and
     (.image | test("^katch/package-client-[a-z0-9-]+:[A-Za-z0-9._-]+$")) and
@@ -167,10 +169,10 @@ jq -e '
   ([.[].image] | unique | length) == length and
   ([.[].target] | unique | length) == length and
   ([.[].cases[]] | unique | length) == ([.[].cases[]] | length) and
-  ([.[] | select(.user == "root") | .cases[]] | sort) == (["apk", "apt-update-install-signature", "rpm-dnf-yum"] | sort)
+  ([.[] | select(.user == "root") | .cases[]] | sort) == (["apk", "apt-update-install-signature", "docker-registry-regression", "podman-registry-regression", "rpm-dnf-yum"] | sort)
 ' "$IMAGE_CONTRACT" >/dev/null || fail "invalid image contract"
 
-expected_smoke=$(printf '%s' '{"alpine":{"apk":"2.14.9"},"composer":{"composer":"2.9.5"},"debian":{"apt":"2.6.1"},"dotnet":{"dotnet":"8.0.414"},"go":{"go":"1.26.0"},"homebrew":{"brew":"4.6.20"},"jvm":{"gradle":"9.0.0","java":"21.0.8","maven":"3.9.11","sbt":"1.11.6"},"node":{"bun":"1.3.11","node":"22.20.0","npm":"11.12.1","pnpm":"11.9.0","yarn":"1.22.22","yarn-berry":"4.10.3"},"python":{"pip":"25.2","poetry":"2.2.1","python":"3.13.7","uv":"0.8.17"},"ruby":{"bundler":"2.7.1","ruby":"3.4.5"},"rust":{"cargo":"1.89.0","rust":"1.89.0"},"rpm":{"dnf":"4.14.0","yum":"4.14.0"}}' | jq -Sc .)
+expected_smoke=$(printf '%s' '{"alpine":{"apk":"2.14.9"},"composer":{"composer":"2.9.5"},"debian":{"apt":"2.6.1"},"docker":{"docker":"29.2.1"},"dotnet":{"dotnet":"8.0.414"},"go":{"go":"1.26.0"},"homebrew":{"brew":"4.6.20"},"jvm":{"gradle":"9.0.0","java":"21.0.8","maven":"3.9.11","sbt":"1.11.6"},"node":{"bun":"1.3.11","node":"22.20.0","npm":"11.12.1","pnpm":"11.9.0","yarn":"1.22.22","yarn-berry":"4.10.3"},"podman":{"podman":"5.6.2"},"python":{"pip":"25.2","poetry":"2.2.1","python":"3.13.7","uv":"0.8.17"},"ruby":{"bundler":"2.7.1","ruby":"3.4.5"},"rust":{"cargo":"1.89.0","rust":"1.89.0"},"rpm":{"dnf":"4.14.0","yum":"4.14.0"}}' | jq -Sc .)
 actual_smoke=$(jq -Sc 'map({key: .target, value: .smoke}) | from_entries' "$IMAGE_CONTRACT")
 [ "$actual_smoke" = "$expected_smoke" ] || fail "client smoke versions differ from the approved exact matrix"
 
@@ -225,6 +227,14 @@ jq -c '.[]' "$IMAGE_CONTRACT" | while IFS= read -r row; do
     printf '%s\n' "$stage" | grep -F "$tool" >/dev/null || fail "$target does not declare $tool"
   done
 done
+
+[ "$(awk 'toupper($1) == "FROM" { print $2; exit }' "$DOCKER_CLIENT_DOCKERFILE")" = 'docker:29.2.1-dind@sha256:68f6d9ab84623d1116c5432a3b924a07ee09960e6129ca1cb03ef14010588cb4' ] ||
+  fail "Docker client image does not use the approved official manifest digest"
+[ "$(awk 'toupper($1) == "FROM" { print $2; exit }' "$PODMAN_CLIENT_DOCKERFILE")" = 'quay.io/podman/stable:v5.6.2@sha256:28c72e39a70b8a6e2b567efe1b34e53850ea77b4c7c1538e41fe5a138055566d' ] ||
+  fail "Podman client image does not use the approved linux/amd64 digest"
+if grep -n -E '(apk|apt-get|dnf)[[:space:]].*(docker|podman)' "$DOCKER_CLIENT_DOCKERFILE" "$PODMAN_CLIENT_DOCKERFILE"; then
+  fail "registry client images install a second container client instead of using their pinned base"
+fi
 
 for dockerfile in "$ROOT"/e2e/package-mirrors/images/*.Dockerfile; do
   awk 'toupper($1) == "FROM" { print $2 }' "$dockerfile" | while IFS= read -r base; do
@@ -1024,11 +1034,67 @@ printf '%s\n' "$git_regression_setup" | grep -Fx 'test ! -e repository && test !
 if printf '%s\n' "$git_regression_commands" | grep -F 'KATCH_SHARED'; then
   fail "Git regression shares checkout or client state between phases"
 fi
-[ "$(printf '%s\n' "$git_regression_run" | grep -Fc 'NOT runtime verification')" -eq 2 ] ||
-  fail "Docker/Podman unavailable and daemon-blocked diagnostics are not disclaimed"
-if printf '%s\n' "$git_regression_assert" | grep -Ei '(blocked:|Client:|Version:)'; then
-  fail "Docker/Podman diagnostic output is treated as passing runtime verification"
+if printf '%s\n' "$git_regression_commands" | grep -Ei '(^|[^[:alnum:]_-])(docker|dockerd|podman)([^[:alnum:]_-]|$)|NOT runtime verification|diagnostic only'; then
+  fail "Git regression still contains Docker/Podman diagnostics"
 fi
+
+registry_upstreams='["ghcr.io","pkg-containers.githubusercontent.com"]'
+for registry_client in docker podman; do
+  registry_case=$CASES/$registry_client-registry-regression.yaml
+  [ -f "$registry_case" ] || fail "missing real $registry_client registry regression case"
+  [ "$(jq -r '.privileged' "$registry_case")" = true ] || fail "$registry_client registry case is not privileged"
+  [ "$(jq -c '.required_upstreams' "$registry_case")" = "$registry_upstreams" ] ||
+    fail "$registry_client registry case has the wrong required upstreams"
+  registry_commands=$(jq -r '[.setup, .run, .assert] | join("\n")' "$registry_case")
+  if [ "$registry_client" = podman ]; then
+    native_pull='podman_client pull "$image_ref"'
+  else
+    native_pull='docker pull "$image_ref"'
+  fi
+  printf '%s\n' "$registry_commands" | grep -F "$native_pull" >/dev/null ||
+    fail "$registry_client registry case does not perform a native pull"
+  printf '%s\n' "$registry_commands" | grep -F './podinfo' >/dev/null ||
+    fail "$registry_client registry case does not run the pulled podinfo binary"
+  if printf '%s\n' "$registry_commands" | grep -Ei 'blocked:|diagnostic only|NOT runtime verification|--tls-verify=false|--tlsverify=false|insecure'; then
+    fail "$registry_client registry case accepts blocked diagnostics or disables registry TLS"
+  fi
+  [ "$(printf '%s\n' "$registry_commands" | grep -Fc '^[a-f0-9]{64}$')" -eq 0 ] ||
+    fail "$registry_client registry case accepts a digest without the sha256 algorithm"
+  printf '%s\n' "$registry_commands" | grep -F "^sha256:[a-f0-9]{64}$" >/dev/null ||
+    fail "$registry_client registry case does not require exact sha256 evidence"
+done
+
+[ "$(find "$CASES" -maxdepth 1 -type f -name '*.yaml' -exec jq -r 'select(.privileged == true) | .name' {} + | LC_ALL=C sort)" = "$(printf '%s\n' docker-registry-regression podman-registry-regression)" ] ||
+  fail "only Docker and Podman registry cases may opt into privileged containers"
+
+docker_registry_commands=$(jq -r '[.setup, .run, .assert] | join("\n")' "$CASES/docker-registry-regression.yaml")
+for contract in \
+  'dockerd --host=unix:///run/katch-docker.sock' \
+  '--storage-driver=vfs' \
+  '--bridge=none' \
+  '--iptables=false' \
+  'docker info' \
+  'ghcr.io/stefanprodan/podinfo:6.9.2' \
+  'cmp -s "$KATCH_CLIENT_CA_CERT" "$registry_ca"' \
+  'kill -TERM "$dockerd_pid"'; do
+  printf '%s\n' "$docker_registry_commands" | grep -F -- "$contract" >/dev/null ||
+    fail "Docker registry case lacks contract: $contract"
+done
+printf '%s\n' "$docker_registry_commands" | grep -F "[ \"\$(cat results/version)\" = '6.9.2' ]" >/dev/null ||
+  fail "Docker registry case does not require podinfo 6.9.2"
+
+podman_registry_commands=$(jq -r '[.setup, .run, .assert] | join("\n")' "$CASES/podman-registry-regression.yaml")
+for contract in \
+  '--root "$PWD/podman-root"' \
+  '--runroot "$PWD/podman-runroot"' \
+  '--storage-driver=vfs' \
+  'ghcr.io/stefanprodan/podinfo:6.9.1' \
+  'cmp -s "$KATCH_CLIENT_CA_CERT" "$registry_ca"'; do
+  printf '%s\n' "$podman_registry_commands" | grep -F -- "$contract" >/dev/null ||
+    fail "Podman registry case lacks contract: $contract"
+done
+printf '%s\n' "$podman_registry_commands" | grep -F "[ \"\$(cat results/version)\" = '6.9.1' ]" >/dev/null ||
+  fail "Podman registry case does not require podinfo 6.9.1"
 
 if grep -R -n -E '^[[:space:]]*(docker|podman)[[:space:]].*(-v|--volume)[= ]?/var/run/(docker|podman)\.sock' "$ROOT/e2e/package-mirrors"; then
   fail "harness mounts a host container socket"
@@ -1467,8 +1533,10 @@ EOF
 chmod 0555 "$harness_bin/fake-runtime" "$harness_bin/curl"
 
 harness_case=$workdir/harness-case.yaml
+privileged_harness_case=$workdir/privileged-harness-case.yaml
 second_harness_case=$workdir/second-harness-case.yaml
 printf '%s\n' '{"name":"ca-contract","image":"example/client:1","setup":"true","run":"true","assert":"true","required_upstreams":["example.invalid"]}' > "$harness_case"
+printf '%s\n' '{"name":"privileged-contract","image":"example/client:1","privileged":true,"setup":"true","run":"true","assert":"true","required_upstreams":["example.invalid"]}' > "$privileged_harness_case"
 printf '%s\n' '{"name":"shared-isolation","image":"example/client:1","setup":"true","run":"true","assert":"true","required_upstreams":["example.invalid"]}' > "$second_harness_case"
 run_harness() {
   artifact_dir=$1
@@ -1497,6 +1565,30 @@ fi
   fail "harness did not export the fixed shared path in both phases"
 if grep -E 'KATCH_(CA_CERT|CLIENT_CA_CERT)|/run/katch-test-ca.crt' "$workdir/runtime.log"; then
   fail "harness changed the container contract when KATCH_CA_CERT was unset"
+fi
+[ "$(grep -Fc 'ARG=--cap-add' "$workdir/runtime.log")" -eq 4 ] ||
+  fail "standard cases do not retain NET_ADMIN and NET_RAW in both phases"
+[ "$(grep -Fc 'ARG=NET_ADMIN' "$workdir/runtime.log")" -eq 2 ] || fail "standard cases lack NET_ADMIN"
+[ "$(grep -Fc 'ARG=NET_RAW' "$workdir/runtime.log")" -eq 2 ] || fail "standard cases lack NET_RAW"
+[ "$(grep -Fc 'ARG=--security-opt' "$workdir/runtime.log")" -eq 2 ] ||
+  fail "standard cases do not retain no-new-privileges"
+[ "$(grep -Fc 'ARG=no-new-privileges' "$workdir/runtime.log")" -eq 2 ] ||
+  fail "standard cases have the wrong security option"
+if grep -Fx 'ARG=--privileged' "$workdir/runtime.log"; then
+  fail "standard cases unexpectedly run privileged"
+fi
+
+: > "$workdir/runtime.log"
+printf '%s\n' 0 > "$workdir/metric-state"
+env PATH="$harness_bin:$PATH" RUNTIME_LOG="$workdir/runtime.log" METRIC_STATE="$workdir/metric-state" \
+  CONTAINER_RUNTIME=fake-runtime ARTIFACT_ROOT="$workdir/harness-privileged" \
+  KATCH_URL=https://katch.invalid KATCH_METRICS_URL=http://metrics.invalid \
+  KATCH_HOST=katch.invalid KATCH_PORT=443 \
+  "$HARNESS" "$privileged_harness_case" >"$workdir/out" 2>&1
+[ "$(grep -Fxc 'ARG=--privileged' "$workdir/runtime.log")" -eq 2 ] ||
+  fail "privileged cases do not pass --privileged in both phases"
+if grep -E '^ARG=(--security-opt|no-new-privileges|--cap-add|NET_ADMIN|NET_RAW)$' "$workdir/runtime.log"; then
+  fail "privileged cases retain incompatible standard isolation flags"
 fi
 
 : > "$workdir/runtime.log"
@@ -1552,6 +1644,11 @@ bad_case=$workdir/bad.yaml
 printf '%s\n' '{"name":"bad; touch /tmp/injected","image":"busybox:latest","setup":"true","run":"true","assert":"true","required_upstreams":[]}' > "$bad_case"
 if "$HARNESS" --check "$bad_case" >"$workdir/out" 2>&1; then
   fail "unpinned image and unsafe case name were accepted"
+fi
+
+printf '%s\n' '{"name":"bad-privileged","image":"busybox:1","privileged":"yes","setup":"true","run":"true","assert":"true","required_upstreams":["example.invalid"]}' > "$bad_case"
+if "$HARNESS" --check "$bad_case" >"$workdir/out" 2>&1; then
+  fail "case schema accepted a non-boolean privileged value"
 fi
 
 printf '%s\n' "harness self-tests passed"

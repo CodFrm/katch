@@ -23,7 +23,8 @@ validate_case() {
   case_file=$1
   jq -e '
     type == "object" and
-    (keys | sort) == (["assert", "image", "name", "required_upstreams", "run", "setup"] | sort) and
+    (keys - ["privileged"] | sort) == (["assert", "image", "name", "required_upstreams", "run", "setup"] | sort) and
+    ((has("privileged") | not) or (.privileged | type == "boolean")) and
     (.name | type == "string" and test("^[a-z0-9][a-z0-9-]{0,62}$")) and
     (.image | type == "string" and test("^[A-Za-z0-9./_-]+(:[A-Za-z0-9._-]+|@sha256:[a-f0-9]{64})$") and (endswith(":latest") | not)) and
     (.setup | type == "string" and length > 0) and
@@ -127,6 +128,7 @@ run_phase() {
   phase=$2
   case_root=$3
   image=$(jq -r '.image' "$case_file")
+  privileged=$(jq -r '.privileged // false' "$case_file")
   phase_root=$case_root/$phase
   shared=$case_root/shared
   scripts=$phase_root/case
@@ -138,9 +140,15 @@ run_phase() {
   jq -r '.assert' "$case_file" > "$scripts/assert"
   chmod 0555 "$scripts/setup" "$scripts/run" "$scripts/assert"
 
-  set -- "$RUNTIME" run --rm \
-    --cap-add NET_ADMIN --cap-add NET_RAW \
-    --security-opt no-new-privileges \
+  set -- "$RUNTIME" run --rm
+  if [ "$privileged" = true ]; then
+    set -- "$@" --privileged
+  else
+    set -- "$@" \
+      --cap-add NET_ADMIN --cap-add NET_RAW \
+      --security-opt no-new-privileges
+  fi
+  set -- "$@" \
     --add-host "$KATCH_HOST:${KATCH_ADD_HOST:-host-gateway}" \
     --mount "type=bind,src=$scripts,dst=/case,readonly" \
     --mount "type=bind,src=$artifacts,dst=/artifacts" \
