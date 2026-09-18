@@ -42,11 +42,13 @@ func (rubyGemsProfile) Companions() []packageprofile.Companion { return nil }
 
 func (rubyGemsProfile) Guidance() packageprofile.Guidance {
 	return packageprofile.Guidance{
-		Client: "RubyGems / Bundler",
+		Clients: []string{"gem", "bundler"},
 		Configuration: []string{
-			"gem sources --add https://<katch>/rubygems.org/ --remove https://rubygems.org/",
-			"bundle config set --global mirror.https://rubygems.org https://<katch>/rubygems.org/",
+			"gem sources --add https://<katch>/<upstream>/ --remove https://rubygems.org/",
+			"bundle config set --global mirror.https://rubygems.org https://<katch>/<upstream>/",
 		},
+		Constraints:     []string{"trailing_slash"},
+		RuntimeVerified: true,
 	}
 }
 

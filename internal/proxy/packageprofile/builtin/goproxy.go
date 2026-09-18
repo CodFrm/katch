@@ -52,11 +52,13 @@ func (goProxyProfile) Companions() []packageprofile.Companion {
 
 func (goProxyProfile) Guidance() packageprofile.Guidance {
 	return packageprofile.Guidance{
-		Client: "go",
+		Clients: []string{"go"},
 		Configuration: []string{
-			"GOPROXY=https://<katch>/proxy.golang.org",
-			"GOSUMDB=sum.golang.org https://<katch>/sumdb/sum.golang.org",
+			"export GOPROXY=https://<katch>/<upstream>",
+			"export GOSUMDB='sum.golang.org https://<katch>/sumdb/sum.golang.org'",
 		},
+		Constraints:     []string{"no_fallback"},
+		RuntimeVerified: true,
 	}
 }
 

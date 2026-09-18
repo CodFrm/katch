@@ -3,7 +3,6 @@ package upstream_svc
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"time"
 
@@ -401,89 +400,26 @@ func packageGuidance(
 	host string,
 	baseURL string,
 ) api_upstream.PackageGuidance {
+	profile, ok := packageprofile.Lookup(profileName)
+	if !ok {
+		return api_upstream.PackageGuidance{}
+	}
+	declared := profile.Guidance()
 	guidance := api_upstream.PackageGuidance{
-		Clients:         packageClients(profileName),
-		Constraints:     packageConstraints(profileName, baseURL),
-		RuntimeVerified: packageRuntimeVerified(profileName),
+		Clients:         append([]string(nil), declared.Clients...),
+		Constraints:     append([]string(nil), declared.Constraints...),
+		RuntimeVerified: declared.RuntimeVerified,
+	}
+	lowerBase := strings.ToLower(strings.TrimSpace(baseURL))
+	if strings.HasPrefix(lowerBase, "http://localhost") || strings.HasPrefix(lowerBase, "http://127.0.0.1") {
+		guidance.Constraints = append(guidance.Constraints, "insecure_localhost")
 	}
 	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if baseURL == "" {
 		return guidance
 	}
 	prefix := baseURL + "/" + strings.Trim(strings.TrimSpace(host), "/")
-	if profile, ok := packageprofile.Lookup(profileName); ok {
-		declared := profile.Guidance()
-		guidance.Configuration = expandDeclaredGuidance(declared.Configuration, prefix, baseURL, host)
-	}
-
-	switch profileName {
-	case upstream_entity.PackageProfileNPM:
-		guidance.Configuration = []string{
-			"npm config set registry " + prefix + "/",
-			"npm config set replace-registry-host always",
-			"pnpm config set registry " + prefix + "/",
-			"yarn config set registry " + prefix + "/",
-			fmt.Sprintf("npmRegistryServer: %q", prefix+"/"),
-			fmt.Sprintf("[install]\nregistry = %q", prefix+"/"),
-		}
-	case upstream_entity.PackageProfilePyPI:
-		guidance.Configuration = []string{
-			"pip install --index-url " + prefix + "/simple/ <package>",
-			"uv pip install --index-url " + prefix + "/simple/ <package>",
-			"poetry source add --priority=primary katch " + prefix + "/simple/",
-		}
-	case upstream_entity.PackageProfileGoProxy:
-		guidance.Configuration = []string{
-			"export GOPROXY=" + prefix,
-			"export GOSUMDB='sum.golang.org " + baseURL + "/sumdb/sum.golang.org'",
-		}
-	case upstream_entity.PackageProfileMaven:
-		guidance.Configuration = []string{
-			fmt.Sprintf("<repository><id>katch</id><url>%s/</url></repository>", prefix),
-			fmt.Sprintf("repositories { maven { url = uri(%q) } }", prefix+"/"),
-			fmt.Sprintf("resolvers += %q at %q", "katch", prefix+"/"),
-		}
-	case upstream_entity.PackageProfileCargo:
-		guidance.Configuration = []string{
-			fmt.Sprintf("[source.crates-io]\nreplace-with = %q\n[source.katch]\nregistry = %q", "katch", "sparse+"+prefix+"/"),
-		}
-	case upstream_entity.PackageProfileNuGet:
-		guidance.Configuration = []string{
-			"dotnet nuget add source " + prefix + "/v3/index.json --name katch",
-			"dotnet restore --source " + prefix + "/v3/index.json",
-			"dotnet package search <term> --source " + prefix + "/v3/index.json",
-		}
-	case upstream_entity.PackageProfileRubyGems:
-		guidance.Configuration = []string{
-			"gem sources --add " + prefix + "/ --remove https://rubygems.org/",
-			"bundle config set --global mirror.https://rubygems.org " + prefix + "/",
-		}
-	case upstream_entity.PackageProfileAPT:
-		guidance.Configuration = []string{
-			"deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] " + prefix + "/<repository> <suite> <components>",
-		}
-	case upstream_entity.PackageProfileRPM:
-		guidance.Configuration = []string{
-			"baseurl=" + prefix + "/<repository-path>/",
-			"mirrorlist=",
-			"metalink=",
-		}
-	case upstream_entity.PackageProfileAPK:
-		guidance.Configuration = []string{prefix + "/<release>/<repository>/<architecture>"}
-	case upstream_entity.PackageProfileComposer:
-		guidance.Configuration = []string{
-			"composer config --global repos.packagist composer " + prefix,
-			"composer install --prefer-dist",
-		}
-	case upstream_entity.PackageProfileHomebrew:
-		guidance.Configuration = []string{
-			"export HOMEBREW_API_DOMAIN=" + prefix + "/api",
-			"export HOMEBREW_ARTIFACT_DOMAIN=" + baseURL + "/registry/ghcr.io",
-			"export HOMEBREW_ARTIFACT_DOMAIN_NO_FALLBACK=1",
-			"export HOMEBREW_BREW_GIT_REMOTE=" + baseURL + "/github.com/Homebrew/brew.git",
-			"export HOMEBREW_CORE_GIT_REMOTE=" + baseURL + "/github.com/Homebrew/homebrew-core.git",
-		}
-	}
+	guidance.Configuration = expandDeclaredGuidance(declared.Configuration, prefix, baseURL, host)
 	return guidance
 }
 
@@ -498,67 +434,6 @@ func expandDeclaredGuidance(lines []string, prefix, baseURL, host string) []stri
 		expanded = append(expanded, line)
 	}
 	return expanded
-}
-
-func packageRuntimeVerified(profile upstream_entity.PackageProfile) bool {
-	switch profile {
-	case upstream_entity.PackageProfileNPM,
-		upstream_entity.PackageProfilePyPI,
-		upstream_entity.PackageProfileGoProxy,
-		upstream_entity.PackageProfileMaven,
-		upstream_entity.PackageProfileCargo,
-		upstream_entity.PackageProfileNuGet,
-		upstream_entity.PackageProfileRubyGems,
-		upstream_entity.PackageProfileAPT,
-		upstream_entity.PackageProfileRPM,
-		upstream_entity.PackageProfileAPK,
-		upstream_entity.PackageProfileComposer,
-		upstream_entity.PackageProfileHomebrew:
-		return true
-	default:
-		return false
-	}
-}
-
-func packageClients(profile upstream_entity.PackageProfile) []string {
-	clients := map[upstream_entity.PackageProfile][]string{
-		upstream_entity.PackageProfileNPM:      {"npm", "pnpm", "yarn_classic", "yarn_berry", "bun"},
-		upstream_entity.PackageProfilePyPI:     {"pip", "uv", "poetry"},
-		upstream_entity.PackageProfileGoProxy:  {"go"},
-		upstream_entity.PackageProfileMaven:    {"maven", "gradle", "sbt"},
-		upstream_entity.PackageProfileCargo:    {"cargo"},
-		upstream_entity.PackageProfileNuGet:    {"dotnet", "nuget"},
-		upstream_entity.PackageProfileRubyGems: {"gem", "bundler"},
-		upstream_entity.PackageProfileAPT:      {"apt"},
-		upstream_entity.PackageProfileRPM:      {"dnf", "yum"},
-		upstream_entity.PackageProfileAPK:      {"apk"},
-		upstream_entity.PackageProfileComposer: {"composer"},
-		upstream_entity.PackageProfileHomebrew: {"homebrew"},
-	}
-	return append([]string(nil), clients[profile]...)
-}
-
-func packageConstraints(profile upstream_entity.PackageProfile, baseURL string) []string {
-	constraints := map[upstream_entity.PackageProfile][]string{
-		upstream_entity.PackageProfileNPM:      {"trailing_slash", "old_lockfile"},
-		upstream_entity.PackageProfilePyPI:     {"trailing_slash"},
-		upstream_entity.PackageProfileGoProxy:  {"no_fallback"},
-		upstream_entity.PackageProfileMaven:    {"fixed_base"},
-		upstream_entity.PackageProfileCargo:    {"trailing_slash", "sparse_only"},
-		upstream_entity.PackageProfileNuGet:    {"read_only"},
-		upstream_entity.PackageProfileRubyGems: {"trailing_slash"},
-		upstream_entity.PackageProfileAPT:      {"fixed_base"},
-		upstream_entity.PackageProfileRPM:      {"fixed_base", "no_dynamic_mirrors"},
-		upstream_entity.PackageProfileAPK:      {"fixed_base"},
-		upstream_entity.PackageProfileComposer: {"dist_only", "old_lockfile"},
-		upstream_entity.PackageProfileHomebrew: {"no_fallback", "bottles_only"},
-	}
-	out := append([]string(nil), constraints[profile]...)
-	lowerBase := strings.ToLower(strings.TrimSpace(baseURL))
-	if strings.HasPrefix(lowerBase, "http://localhost") || strings.HasPrefix(lowerBase, "http://127.0.0.1") {
-		out = append(out, "insecure_localhost")
-	}
-	return out
 }
 
 // protocols 把协议集合拷成一份普通 []string，不把存储形态泄漏给调用方。

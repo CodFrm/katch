@@ -65,7 +65,7 @@ func TestMavenProfileContract(t *testing.T) {
 	}
 
 	guidance := profile.Guidance()
-	if guidance.Client != "Maven / Gradle / sbt" || len(guidance.Configuration) == 0 {
+	if len(guidance.Clients) != 3 || guidance.Clients[0] != "maven" || len(guidance.Configuration) == 0 {
 		t.Fatalf("Guidance() = %#v", guidance)
 	}
 

@@ -62,7 +62,7 @@ func TestPyPIProfileRegistersCompanionAndClassifies(t *testing.T) {
 	if len(companions) != 1 || companions[0].Host != "files.pythonhosted.org" || companions[0].Profile != upstream_entity.PackageProfilePyPI || companions[0].Transport != upstream_entity.ProtocolStatic {
 		t.Fatalf("companions = %+v", companions)
 	}
-	if guidance := profile.Guidance(); guidance.Client != "pip" || len(guidance.Configuration) == 0 {
+	if guidance := profile.Guidance(); len(guidance.Clients) != 3 || guidance.Clients[0] != "pip" || len(guidance.Configuration) == 0 {
 		t.Fatalf("guidance = %+v", guidance)
 	}
 }

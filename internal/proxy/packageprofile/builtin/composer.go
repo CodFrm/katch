@@ -111,11 +111,13 @@ func (composerProfile) Companions() []packageprofile.Companion {
 
 func (composerProfile) Guidance() packageprofile.Guidance {
 	return packageprofile.Guidance{
-		Client: "composer",
+		Clients: []string{"composer"},
 		Configuration: []string{
-			"composer config --global repos.packagist composer <site-base>/repo.packagist.org",
+			"composer config --global repos.packagist composer https://<katch>/<upstream>",
 			"composer install --prefer-dist",
 		},
+		Constraints:     []string{"dist_only", "old_lockfile"},
+		RuntimeVerified: true,
 	}
 }
 

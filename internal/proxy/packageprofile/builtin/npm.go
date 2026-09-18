@@ -102,12 +102,17 @@ func (npmProfile) Companions() []packageprofile.Companion {
 
 func (npmProfile) Guidance() packageprofile.Guidance {
 	return packageprofile.Guidance{
-		Client: "npm",
+		Clients: []string{"npm", "pnpm", "yarn_classic", "yarn_berry", "bun"},
 		Configuration: []string{
-			"registry=https://<katch>/registry.npmjs.org/",
-			"replace-registry-host=always",
-			"Regenerate existing lockfiles when the client cannot replace registry hosts.",
+			"npm config set registry https://<katch>/<upstream>/",
+			"npm config set replace-registry-host always",
+			"pnpm config set registry https://<katch>/<upstream>/",
+			"yarn config set registry https://<katch>/<upstream>/",
+			"npmRegistryServer: \"https://<katch>/<upstream>/\"",
+			"[install]\nregistry = \"https://<katch>/<upstream>/\"",
 		},
+		Constraints:     []string{"trailing_slash", "old_lockfile"},
+		RuntimeVerified: true,
 	}
 }
 

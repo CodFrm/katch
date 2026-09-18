@@ -23,7 +23,10 @@ func (contractProfile) Companions() []Companion {
 	return []Companion{{Host: "cdn.example.com", Profile: upstream_entity.PackageProfileNPM, Transport: upstream_entity.ProtocolStatic}}
 }
 func (contractProfile) Guidance() Guidance {
-	return Guidance{Client: "npm", Configuration: []string{"registry"}}
+	return Guidance{
+		Clients: []string{"npm"}, Configuration: []string{"registry"},
+		Constraints: []string{"read_only"}, RuntimeVerified: true,
+	}
 }
 
 func TestProfileContract(t *testing.T) {
@@ -44,7 +47,7 @@ func TestProfileContract(t *testing.T) {
 	if err != nil || string(result.Body) != "rewritten:body" {
 		t.Fatalf("transform result = %+v, err = %v", result, err)
 	}
-	if len(profile.Companions()) != 1 || profile.Guidance().Client != "npm" {
+	if len(profile.Companions()) != 1 || len(profile.Guidance().Clients) != 1 || profile.Guidance().Clients[0] != "npm" {
 		t.Fatal("companion and guidance contracts are not usable")
 	}
 }

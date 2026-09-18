@@ -79,7 +79,7 @@ func TestAPTProfileContract(t *testing.T) {
 		t.Fatalf("Companions() = %#v", companions)
 	}
 	guidance := profile.Guidance()
-	if guidance.Client != "apt" || len(guidance.Configuration) != 1 {
+	if len(guidance.Clients) != 1 || guidance.Clients[0] != "apt" || len(guidance.Configuration) != 1 {
 		t.Fatalf("Guidance() = %#v", guidance)
 	}
 }

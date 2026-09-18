@@ -92,12 +92,14 @@ func (pyPIProfile) Companions() []packageprofile.Companion {
 
 func (pyPIProfile) Guidance() packageprofile.Guidance {
 	return packageprofile.Guidance{
-		Client: "pip",
+		Clients: []string{"pip", "uv", "poetry"},
 		Configuration: []string{
-			"pip: --index-url https://<katch>/pypi.org/simple/",
-			"uv: --index-url https://<katch>/pypi.org/simple/",
-			"poetry: source add --priority=primary katch https://<katch>/pypi.org/simple/",
+			"pip install --index-url https://<katch>/<upstream>/simple/ <package>",
+			"uv pip install --index-url https://<katch>/<upstream>/simple/ <package>",
+			"poetry source add --priority=primary katch https://<katch>/<upstream>/simple/",
 		},
+		Constraints:     []string{"trailing_slash"},
+		RuntimeVerified: true,
 	}
 }
 

@@ -78,7 +78,7 @@ func TestAPKProfileContract(t *testing.T) {
 		t.Fatalf("companions = %+v", profile.Companions())
 	}
 	guidance := profile.Guidance()
-	if guidance.Client != "apk" || len(guidance.Configuration) != 1 {
+	if len(guidance.Clients) != 1 || guidance.Clients[0] != "apk" || len(guidance.Configuration) != 1 {
 		t.Fatalf("guidance = %+v", guidance)
 	}
 	registered, ok := packageprofile.Lookup(upstream_entity.PackageProfileAPK)

@@ -75,11 +75,11 @@ func TestRPMGuidanceUsesFixedBaseAndDisablesDynamicMirrors(t *testing.T) {
 		t.Fatal("rpm profile is not registered")
 	}
 	guidance := profile.Guidance()
-	if guidance.Client != "dnf/yum" {
-		t.Fatalf("client = %q", guidance.Client)
+	if len(guidance.Clients) != 2 || guidance.Clients[0] != "dnf" || guidance.Clients[1] != "yum" {
+		t.Fatalf("clients = %#v", guidance.Clients)
 	}
 	for _, required := range []string{
-		"baseurl=https://<katch>/<rpm-host>/<repository-path>/",
+		"baseurl=https://<katch>/<upstream>/<repository-path>/",
 		"mirrorlist=",
 		"metalink=",
 	} {

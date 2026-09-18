@@ -222,7 +222,7 @@ func TestComposerProfileDescription(t *testing.T) {
 		{Host: "api.github.com", Profile: upstream_entity.PackageProfileComposer, Transport: upstream_entity.ProtocolStatic},
 		{Host: "codeload.github.com", Profile: upstream_entity.PackageProfileComposer, Transport: upstream_entity.ProtocolStatic},
 	}, profile.Companions())
-	assertComposerEqual(t, "composer", profile.Guidance().Client)
+	assertComposerEqual(t, []string{"composer"}, profile.Guidance().Clients)
 }
 
 func readComposerFixture(t *testing.T, name string) []byte {

@@ -110,13 +110,12 @@ func (cargoProfile) Companions() []packageprofile.Companion {
 
 func (cargoProfile) Guidance() packageprofile.Guidance {
 	return packageprofile.Guidance{
-		Client: "Cargo",
+		Clients: []string{"cargo"},
 		Configuration: []string{
-			"[source.crates-io]",
-			"replace-with = \"katch\"",
-			"[source.katch]",
-			"registry = \"sparse+https://<katch>/index.crates.io/\"",
+			"[source.crates-io]\nreplace-with = \"katch\"\n[source.katch]\nregistry = \"sparse+https://<katch>/<upstream>/\"",
 		},
+		Constraints:     []string{"trailing_slash", "sparse_only"},
+		RuntimeVerified: true,
 	}
 }
 

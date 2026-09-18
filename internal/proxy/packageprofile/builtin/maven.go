@@ -63,12 +63,14 @@ func (mavenProfile) Companions() []packageprofile.Companion { return nil }
 
 func (mavenProfile) Guidance() packageprofile.Guidance {
 	return packageprofile.Guidance{
-		Client: "Maven / Gradle / sbt",
+		Clients: []string{"maven", "gradle", "sbt"},
 		Configuration: []string{
-			"Maven repository URL: https://<katch>/repo.maven.apache.org/maven2",
-			"Gradle repository URL: https://<katch>/repo.maven.apache.org/maven2",
-			"sbt repository URL: https://<katch>/repo.maven.apache.org/maven2",
+			"<repository><id>katch</id><url>https://<katch>/<upstream>/</url></repository>",
+			"repositories { maven { url = uri(\"https://<katch>/<upstream>/\") } }",
+			"resolvers += \"katch\" at \"https://<katch>/<upstream>/\"",
 		},
+		Constraints:     []string{"fixed_base"},
+		RuntimeVerified: true,
 	}
 }
 

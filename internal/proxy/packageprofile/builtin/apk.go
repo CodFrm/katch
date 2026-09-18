@@ -51,8 +51,10 @@ func (apkProfile) Companions() []packageprofile.Companion { return nil }
 
 func (apkProfile) Guidance() packageprofile.Guidance {
 	return packageprofile.Guidance{
-		Client:        "apk",
-		Configuration: []string{"repository"},
+		Clients:         []string{"apk"},
+		Configuration:   []string{"https://<katch>/<upstream>/<release>/<repository>/<architecture>"},
+		Constraints:     []string{"fixed_base"},
+		RuntimeVerified: true,
 	}
 }
 

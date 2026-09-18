@@ -57,12 +57,14 @@ func (rpmProfile) Companions() []packageprofile.Companion {
 
 func (rpmProfile) Guidance() packageprofile.Guidance {
 	return packageprofile.Guidance{
-		Client: "dnf/yum",
+		Clients: []string{"dnf", "yum"},
 		Configuration: []string{
-			"baseurl=https://<katch>/<rpm-host>/<repository-path>/",
+			"baseurl=https://<katch>/<upstream>/<repository-path>/",
 			"mirrorlist=",
 			"metalink=",
 		},
+		Constraints:     []string{"fixed_base", "no_dynamic_mirrors"},
+		RuntimeVerified: true,
 	}
 }
 

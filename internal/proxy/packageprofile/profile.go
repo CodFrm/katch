@@ -61,8 +61,10 @@ type Companion struct {
 
 // Guidance is structured client configuration guidance for presentation layers.
 type Guidance struct {
-	Client        string
-	Configuration []string
+	Clients         []string
+	Configuration   []string
+	Constraints     []string
+	RuntimeVerified bool
 }
 
 // RewriteURL validates an upstream URL and maps it to the public katch URL space.

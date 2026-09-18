@@ -56,10 +56,12 @@ func (aptProfile) Companions() []packageprofile.Companion { return nil }
 
 func (aptProfile) Guidance() packageprofile.Guidance {
 	return packageprofile.Guidance{
-		Client: "apt",
+		Clients: []string{"apt"},
 		Configuration: []string{
 			"deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://<katch>/<upstream>/<repository> <suite> <components>",
 		},
+		Constraints:     []string{"fixed_base"},
+		RuntimeVerified: true,
 	}
 }
 

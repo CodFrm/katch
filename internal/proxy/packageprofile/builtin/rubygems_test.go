@@ -77,7 +77,7 @@ func TestRubyGemsProfileIsByteTransparentAndSelfContained(t *testing.T) {
 		t.Fatalf("companions = %+v, want none", profile.Companions())
 	}
 	guidance := profile.Guidance()
-	if guidance.Client != "RubyGems / Bundler" || len(guidance.Configuration) != 2 {
+	if len(guidance.Clients) != 2 || guidance.Clients[0] != "gem" || len(guidance.Configuration) != 2 {
 		t.Fatalf("guidance = %+v", guidance)
 	}
 }

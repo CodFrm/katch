@@ -57,13 +57,15 @@ func (homebrewProfile) Companions() []packageprofile.Companion {
 
 func (homebrewProfile) Guidance() packageprofile.Guidance {
 	return packageprofile.Guidance{
-		Client: "Homebrew",
+		Clients: []string{"homebrew"},
 		Configuration: []string{
-			"HOMEBREW_API_DOMAIN=https://<katch>/formulae.brew.sh/api",
-			"HOMEBREW_ARTIFACT_DOMAIN=https://<katch>/registry/ghcr.io",
-			"HOMEBREW_ARTIFACT_DOMAIN_NO_FALLBACK=1",
-			"HOMEBREW_BREW_GIT_REMOTE=https://<katch>/github.com/Homebrew/brew.git",
-			"HOMEBREW_CORE_GIT_REMOTE=https://<katch>/github.com/Homebrew/homebrew-core.git",
+			"export HOMEBREW_API_DOMAIN=https://<katch>/<upstream>/api",
+			"export HOMEBREW_ARTIFACT_DOMAIN=https://<katch>/registry/ghcr.io",
+			"export HOMEBREW_ARTIFACT_DOMAIN_NO_FALLBACK=1",
+			"export HOMEBREW_BREW_GIT_REMOTE=https://<katch>/github.com/Homebrew/brew.git",
+			"export HOMEBREW_CORE_GIT_REMOTE=https://<katch>/github.com/Homebrew/homebrew-core.git",
 		},
+		Constraints:     []string{"no_fallback", "bottles_only"},
+		RuntimeVerified: true,
 	}
 }

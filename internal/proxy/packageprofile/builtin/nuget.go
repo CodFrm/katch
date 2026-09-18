@@ -120,11 +120,14 @@ func (nugetProfile) Companions() []packageprofile.Companion {
 
 func (nugetProfile) Guidance() packageprofile.Guidance {
 	return packageprofile.Guidance{
-		Client: "dotnet",
+		Clients: []string{"dotnet", "nuget"},
 		Configuration: []string{
-			"dotnet restore --source https://<katch>/api.nuget.org/v3/index.json",
-			"dotnet package search <term> --source https://<katch>/api.nuget.org/v3/index.json",
+			"dotnet nuget add source https://<katch>/<upstream>/v3/index.json --name katch",
+			"dotnet restore --source https://<katch>/<upstream>/v3/index.json",
+			"dotnet package search <term> --source https://<katch>/<upstream>/v3/index.json",
 		},
+		Constraints:     []string{"read_only"},
+		RuntimeVerified: true,
 	}
 }
 
