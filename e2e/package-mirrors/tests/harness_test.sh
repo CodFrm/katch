@@ -615,13 +615,40 @@ done
 [ "$(wc -l < "$maven_events" | tr -d ' ')" -eq 6 ] ||
   fail "JVM case did not invoke all three tools in both isolated phases"
 
-npm_run=$(jq -r '.run' "$CASES/npm.yaml")
+npm_case=$CASES/npm.yaml
+npm_run=$(jq -r '.run' "$npm_case")
+npm_commands=$(jq -r '[.setup, .run, .assert] | join("\n")' "$npm_case")
+ca_guard_line=$(printf '%s\n' "$npm_run" | awk '$0 == "[ \"${KATCH_CLIENT_CA_CERT:-}\" = /run/katch-test-ca.crt ] || { echo '\''npm-family requires mounted test CA at /run/katch-test-ca.crt'\'' >&2; exit 69; }" { print NR }')
+node_extra_line=$(printf '%s\n' "$npm_run" | awk '$0 == "export NODE_EXTRA_CA_CERTS=\"$KATCH_CLIENT_CA_CERT\"" { print NR }')
+[ -n "$ca_guard_line" ] || fail "npm mirror case does not require the exact mounted test CA path"
+[ -n "$node_extra_line" ] || fail "npm mirror case does not add the mounted test CA to Node trust"
+[ "$ca_guard_line" -lt "$node_extra_line" ] || fail "npm mirror case configures Node trust before requiring the exact mounted test CA"
+printf '%s\n' "$npm_run" | grep -Fx '[ -f "$KATCH_CLIENT_CA_CERT" ] && [ -r "$KATCH_CLIENT_CA_CERT" ] || { echo '\''npm-family test CA is not a readable regular file'\'' >&2; exit 69; }' >/dev/null ||
+  fail "npm mirror case does not require the mounted test CA to be a readable regular file"
+[ "$(printf '%s\n' "$npm_run" | grep -Fxc 'export NODE_EXTRA_CA_CERTS="$KATCH_CLIENT_CA_CERT"')" -eq 1 ] ||
+  fail "npm mirror case does not configure the exact Node extra CA once"
+if printf '%s\n' "$npm_commands" | grep -i -E -- 'strict[-_]?ssl([=[:space:]]+)false|NODE_TLS_REJECT_UNAUTHORIZED[[:space:]]*=[[:space:]]*0|NODE_EXTRA_CA_CERTS[[:space:]]*=[[:space:]]*([^[:space:]]*[*]|/dev/null)|(^|[[:space:]])--?insecure([=[:space:]]|$)|trust[-_]?all|(^|[[:space:]])(ca|cafile)([=[:space:]]+)(/dev/null|[*])'; then
+  fail "npm mirror case bypasses TLS verification or broadens CA trust"
+fi
+for case_file in "$CASES"/*.yaml; do
+  [ "$case_file" = "$npm_case" ] && continue
+  if grep -F 'NODE_EXTRA_CA_CERTS' "$case_file"; then
+    fail "non-npm mirror case configures Node-specific CA trust: $case_file"
+  fi
+done
+if grep -F 'NODE_EXTRA_CA_CERTS' "$HARNESS" "$ENTRYPOINT"; then
+  fail "shared package mirror harness configures Node-specific CA trust"
+fi
 printf '%s\n' "$npm_run" | grep -Fx '(cd npm && npm install --ignore-scripts --no-audit --no-update-notifier --registry="$registry" --replace-registry-host=always)' >/dev/null ||
   fail "npm mirror case does not disable audit and the npm update notifier"
 printf '%s\n' "$npm_run" | grep -Fx '(cd pnpm && PNPM_CONFIG_UPDATE_NOTIFIER=false pnpm install --ignore-scripts --registry="$registry")' >/dev/null ||
   fail "npm mirror case does not disable the pnpm update notifier"
+printf '%s\n' "$npm_run" | grep -Fx '(cd yarn-classic && yarn install --ignore-scripts --registry "$registry")' >/dev/null ||
+  fail "npm mirror case does not run Yarn Classic through the configured registry"
 printf '%s\n' "$npm_run" | grep -Fx '(cd yarn-berry && yarn-berry config set npmRegistryServer "$registry" && yarn-berry config set unsafeHttpWhitelist --json "[\"$KATCH_HOST\"]" && yarn-berry install --mode=skip-build)' >/dev/null ||
   fail "npm mirror case does not allow HTTP only for the configured Katch host before Yarn Berry install"
+printf '%s\n' "$npm_run" | grep -Fx '(cd bun && bun install --ignore-scripts --registry "$registry")' >/dev/null ||
+  fail "npm mirror case does not run Bun through the configured registry"
 
 pypi_run=$(jq -r '.run' "$CASES/pypi.yaml")
 printf '%s\n' "$pypi_run" | grep -Fx 'pip/.venv/bin/python -m pip install --disable-pip-version-check --no-cache-dir --trusted-host "$KATCH_HOST" --index-url "$index" idna==3.10' >/dev/null ||
