@@ -7,25 +7,19 @@ import (
 	"strings"
 
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
-	"github.com/CodFrm/katch/internal/proxy/destination"
-	"github.com/CodFrm/katch/internal/proxy/origin"
+	"github.com/CodFrm/katch/internal/proxy/dispatch"
 )
 
-const (
-	sumDBHost   = "sum.golang.org"
-	sumDBPrefix = "/sumdb/" + sumDBHost
-)
+const sumDBHost = "sum.golang.org"
 
-// SumDBOptions supplies the coherent configuration and pinned destination used by the checksum bridge.
+// SumDBOptions supplies the coherent configuration and normal proxy fallback used by the checksum bridge.
 type SumDBOptions struct {
-	RewriteConfig       RewriteConfigSource
-	DestinationResolver destination.DestinationResolver
-	Fallback            ProxySvc
+	RewriteConfig RewriteConfigSource
+	Fallback      ProxySvc
 }
 
 type sumDBSvc struct {
 	source   RewriteConfigSource
-	origin   *origin.Client
 	fallback ProxySvc
 }
 
@@ -34,14 +28,8 @@ func NewSumDB(opt SumDBOptions) ProxySvc {
 	if opt.RewriteConfig == nil {
 		opt.RewriteConfig = NewRewriteConfigSource()
 	}
-	if opt.DestinationResolver == nil {
-		opt.DestinationResolver = destination.New(destination.Options{
-			Source: destinationConfigSource{source: opt.RewriteConfig},
-		})
-	}
 	return &sumDBSvc{
 		source:   opt.RewriteConfig,
-		origin:   origin.New(origin.Options{Resolver: opt.DestinationResolver}),
 		fallback: opt.Fallback,
 	}
 }
@@ -57,35 +45,20 @@ func (s *sumDBSvc) Fetch(ctx context.Context, target *Target) (io.ReadCloser, *M
 	if target.Method != http.MethodGet && target.Method != http.MethodHead {
 		return sumDBResponse(http.StatusMethodNotAllowed)
 	}
-	if !s.configured(ctx) {
-		return sumDBResponse(http.StatusServiceUnavailable)
-	}
 	if supported {
+		if !s.configured(ctx) {
+			return sumDBResponse(http.StatusServiceUnavailable)
+		}
 		return sumDBResponse(http.StatusOK)
 	}
-
-	resp, err := s.origin.Do(ctx, &origin.Request{
-		Method:   target.Method,
-		Origin:   "https://" + sumDBHost,
-		Path:     upstreamPath,
-		RawQuery: target.RawQuery,
-		Header:   target.Header,
-		Requirement: destination.DestinationRequirement{
-			RequireRegistered: true,
-			Transport:         upstream_entity.ProtocolStatic,
-			Profile:           upstream_entity.PackageProfileGoProxy,
-			AddressPolicy:     destination.PublicAddressesOnly,
-		},
-	})
-	if err != nil {
-		return nil, nil, err
+	if s.fallback == nil {
+		return nil, nil, ErrUpstreamNotAllowed
 	}
-	return resp.Body, &Meta{
-		StatusCode:    resp.StatusCode,
-		Header:        resp.Header,
-		ContentLength: resp.ContentLength,
-		SourceURL:     cloneURL(resp.SourceURL),
-	}, nil
+	canonical := *target
+	canonical.Kind = dispatch.KindStatic
+	canonical.Host = sumDBHost
+	canonical.Path = upstreamPath
+	return s.fallback.Fetch(ctx, &canonical)
 }
 
 func (s *sumDBSvc) configured(ctx context.Context) bool {
@@ -108,17 +81,10 @@ func canonicalSumDBTarget(target *Target) bool {
 }
 
 func sumDBRoute(target *Target) (upstreamPath string, supported, ok bool) {
-	if target == nil {
+	if target == nil || !canonicalSumDBTarget(target) {
 		return "", false, false
 	}
 	path := target.Path
-	if !canonicalSumDBTarget(target) {
-		var found bool
-		path, found = strings.CutPrefix(path, sumDBPrefix)
-		if !found {
-			return "", false, false
-		}
-	}
 	if path == "/supported" {
 		return "", true, true
 	}

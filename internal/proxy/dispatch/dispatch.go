@@ -16,6 +16,10 @@ const (
 	// Keeping the boundary in the route avoids guessing whether a repository's
 	// legitimate first segment named v2 is a protocol prefix.
 	registryBaseNamespace = "/registry"
+	sumDBNamespace        = "/sumdb"
+	sumDBHost             = "sum.golang.org"
+	sumDBRoutePrefix      = sumDBNamespace + "/" + sumDBHost
+	goProxyHost           = "proxy.golang.org"
 )
 
 // Kind 一个路径的归属。
@@ -90,6 +94,9 @@ func Classify(path string) (Kind, string, string) {
 	if path == registryBaseNamespace || strings.HasPrefix(path, registryBaseNamespace+"/") {
 		return classifyRegistryBase(path)
 	}
+	if sumDBNamespacePath(path) {
+		return classifySumDB(path)
+	}
 	if path == "/v2" || path == "/v2/" {
 		return KindRegistryPing, "", ""
 	}
@@ -98,7 +105,29 @@ func Classify(path string) (Kind, string, string) {
 		// 它不含点就是个拿不出上游的请求，和未知主机一样 404。
 		return upstream(KindRegistry, rest)
 	}
-	return upstream(KindStatic, strings.TrimPrefix(path, "/"))
+	kind, host, rest := upstream(KindStatic, strings.TrimPrefix(path, "/"))
+	if kind == KindStatic && strings.EqualFold(host, goProxyHost) && sumDBNamespacePath(rest) {
+		return classifySumDB(rest)
+	}
+	return kind, host, rest
+}
+
+func sumDBNamespacePath(path string) bool {
+	return path == sumDBNamespace || strings.HasPrefix(path, sumDBNamespace+"/")
+}
+
+func classifySumDB(path string) (Kind, string, string) {
+	if path != sumDBRoutePrefix && !strings.HasPrefix(path, sumDBRoutePrefix+"/") {
+		return KindInvalid, "", ""
+	}
+	rest := strings.TrimPrefix(path, sumDBRoutePrefix)
+	if rest == "" {
+		rest = "/"
+	}
+	if !safeTail(strings.TrimPrefix(rest, "/")) {
+		return KindInvalid, "", ""
+	}
+	return KindStatic, sumDBHost, rest
 }
 
 // classifyRegistryBase parses the one route whose /v2 segment is a delimiter

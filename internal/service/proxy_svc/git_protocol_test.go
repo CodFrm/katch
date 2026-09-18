@@ -14,7 +14,7 @@ import (
 //
 // 两个方向都要钉住：只开 static 的 github.com 不能因为路径长得像 git 端点就
 // 把 clone 转出去（那条记录的站长没开这个协议）；只开 git 的记录也不能反过来
-// 把普通静态路径服务掉——protocolMatches 里已有的那条用例管着后半句。
+// 把普通静态路径服务掉——SupportsTarget 里已有的那条用例管着后半句。
 func TestProtocolMatches_Git(t *testing.T) {
 	set := func(protocols ...string) upstream_entity.ProtocolSet {
 		return upstream_entity.ProtocolSet(protocols)
@@ -51,7 +51,7 @@ func TestProtocolMatches_Git(t *testing.T) {
 	convey.Convey("git 端点要的是 git 协议", t, func() {
 		for _, c := range cases {
 			convey.Convey(c.name, func() {
-				got := protocolMatches(
+				got := SupportsTarget(
 					&Target{Kind: c.kind, Git: c.git, Host: "example.invalid", Path: "/x"},
 					&upstream_entity.Upstream{Host: "example.invalid", Protocols: c.protocols},
 				)

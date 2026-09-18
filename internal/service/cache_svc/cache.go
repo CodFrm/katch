@@ -250,6 +250,9 @@ func (c *cacheSvc) Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCl
 	if err != nil || upstream == nil {
 		return proxy_svc.Proxy().Fetch(ctx, target)
 	}
+	if !proxy_svc.SupportsTarget(target, upstream) {
+		return proxy_svc.Proxy().Fetch(ctx, target)
+	}
 	representation, profile := c.classify(upstream, target)
 	if representation.Recognized() && representation.Transform {
 		if !identityAccepted(target.Header) {
@@ -267,12 +270,11 @@ func (c *cacheSvc) Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCl
 	immutable, protocolDefined := registryRequestImmutability(target)
 	if representation.Recognized() {
 		immutable = representation.Class == packageprofile.ClassImmutable
-		protocolDefined = true
 	} else if !protocolDefined {
 		immutable = cache.IsImmutable(upstream.ImmutablePatterns, key)
 	}
 	body, meta, m := c.serveFromDisk(ctx, target, upstream, key, immutable,
-		protocolDefined && !immutable, false)
+		!immutable, false)
 	if m == nil {
 		return body, meta, nil
 	}
@@ -797,7 +799,7 @@ func cacheKey(target *proxy_svc.Target) string {
 // 第三个返回值为 nil 表示这次是命中；否则它带着这次未命中的归因——判断只能在
 // 这里做，往上一层就只剩「查不到记录」这一个事实了。
 func (c *cacheSvc) serveFromDisk(ctx context.Context, target *proxy_svc.Target,
-	upstream *upstream_entity.Upstream, key string, immutable, protocolMutable, transformed bool,
+	upstream *upstream_entity.Upstream, key string, immutable, currentlyMutable, transformed bool,
 ) (io.ReadCloser, *proxy_svc.Meta, *miss) {
 	repo := cache_repo.CacheObject()
 	object, err := repo.FindByKey(ctx, upstream.ID, key)
@@ -811,7 +813,7 @@ func (c *cacheSvc) serveFromDisk(ctx context.Context, target *proxy_svc.Target,
 		// 表里什么都没有：可能从没缓存过，也可能是被我们自己收走的。
 		return nil, nil, &miss{reason: c.forgot.recall(upstream.ID, key)}
 	}
-	if protocolMutable && object.Immutable {
+	if currentlyMutable && object.Immutable {
 		// 旧配置可能用宽泛模式把 tag manifest 或 referrers 写成了永久对象。
 		// 不继续发这份没有新鲜度边界的旧快照；回源成功后 saveRecord 会按 TTL
 		// 覆盖元数据，失败则保留旧记录供下次重试。

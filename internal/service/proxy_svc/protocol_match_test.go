@@ -62,7 +62,7 @@ func TestProtocolMatches(t *testing.T) {
 	convey.Convey("协议集合决定一条上游服务哪些请求形态", t, func() {
 		for _, c := range cases {
 			convey.Convey(c.name, func() {
-				got := protocolMatches(
+				got := SupportsTarget(
 					&Target{Kind: c.kind, Host: "example.invalid", Path: "/x"},
 					&upstream_entity.Upstream{Host: "example.invalid", Protocols: c.protocols},
 				)

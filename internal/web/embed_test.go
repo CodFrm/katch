@@ -461,7 +461,7 @@ func TestProxy_SumDBNestedRoutesAreCanonicalAndOriginFailuresAre502(t *testing.T
 		t.Fatal(err)
 	}
 	resolver := webResolverFunc(func(_ context.Context, target *url.URL, requirement destination.DestinationRequirement) (*destination.ResolvedTarget, error) {
-		if target.Scheme != "https" || target.Host != "sum.golang.org" || !requirement.RequireRegistered ||
+		if target.Scheme != "https" || target.Host != "sum.golang.org" || requirement.RequireRegistered ||
 			requirement.Transport != upstream_entity.ProtocolStatic || requirement.Profile != upstream_entity.PackageProfileGoProxy {
 			t.Fatalf("resolver target = %s, requirement = %+v", target, requirement)
 		}

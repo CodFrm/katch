@@ -157,7 +157,7 @@ func New(opt Options) ProxySvc {
 		recorder: opt.Metrics,
 	}
 	return NewSumDB(SumDBOptions{
-		RewriteConfig: opt.RewriteConfig, DestinationResolver: opt.DestinationResolver, Fallback: proxy,
+		RewriteConfig: opt.RewriteConfig, Fallback: proxy,
 	})
 }
 
@@ -207,7 +207,7 @@ func (p *proxySvc) Fetch(ctx context.Context, target *Target) (io.ReadCloser, *M
 	if upstream == nil {
 		return nil, nil, ErrUpstreamNotAllowed
 	}
-	if !protocolMatches(target, upstream) {
+	if !SupportsTarget(target, upstream) {
 		return nil, nil, ErrUpstreamNotAllowed
 	}
 	// 闸问在这里，而不是在白名单判定之前：表里没有的主机名必须先拿到那一个
@@ -451,7 +451,7 @@ func destinationRequirement(
 	return requirement
 }
 
-// protocolMatches 校验请求形态所需的协议，这条上游开没开。
+// SupportsTarget 校验请求形态所需的协议，这条上游当前开没开。
 //
 // 没开就当作没有这个上游：registry 客户端固定走 /v2 前缀，一个只开 static 的上游
 // 出现在 /v2/ 之下（或反过来）只可能是拼错或在试探，按白名单之外处理最省事。
@@ -459,7 +459,12 @@ func destinationRequirement(
 // 查集合而不是比单值，于是一条同时开了 static 与 git 的记录照常服务 static 路径，
 // 而回填成 [registry] 的 docker.io 在 static 路径上仍然什么都不是。空集合对任何
 // 形态都答 false，见 ProtocolSet.Has。
-func protocolMatches(target *Target, upstream *upstream_entity.Upstream) bool {
+//
+// 缓存与回源共用这一个判定，配置变化后旧缓存不能继续从已移除的协议暴露。
+func SupportsTarget(target *Target, upstream *upstream_entity.Upstream) bool {
+	if target == nil || upstream == nil {
+		return false
+	}
 	switch target.Kind {
 	case dispatch.KindRegistry:
 		return upstream.Protocols.Has(upstream_entity.ProtocolRegistry)

@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,7 +19,10 @@ import (
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
 	"github.com/CodFrm/katch/internal/repository/cache_repo"
 	mock_cache_repo "github.com/CodFrm/katch/internal/repository/cache_repo/mock"
+	"github.com/CodFrm/katch/internal/repository/upstream_repo"
+	mock_upstream_repo "github.com/CodFrm/katch/internal/repository/upstream_repo/mock"
 	"github.com/CodFrm/katch/internal/service/cache_svc"
+	"github.com/CodFrm/katch/internal/service/proxy_svc"
 )
 
 // countingOrigin 假源站：记下被打了几次，并且可以当场关掉。
@@ -322,5 +326,52 @@ func TestProxy_SecondPullIsServedFromDisk(t *testing.T) {
 		convey.So(second.Header().Get("Content-Type"), convey.ShouldEqual, "text/plain")
 		convey.So(second.Header().Get("X-Katch-Cache"), convey.ShouldEqual, "HIT")
 		convey.So(hits.Load(), convey.ShouldEqual, 1)
+	})
+}
+
+func TestProxy_WarmHitRechecksCurrentTransport(t *testing.T) {
+	convey.Convey("移除 static 协议后旧缓存不再可见并返回普通 404", t, func() {
+		srv, hits := countingOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = io.WriteString(w, "cached package bytes")
+		})
+		current := &upstream_entity.Upstream{
+			ID: 1, Host: "packages.example.com", Origin: srv.URL, Enabled: true,
+			Protocols:         upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+			ImmutablePatterns: upstream_entity.PatternList{"/pool/"}, MutableTTLSeconds: 60,
+		}
+		repo := mock_upstream_repo.NewMockUpstreamRepo(gomock.NewController(t))
+		repo.EXPECT().List(gomock.Any()).AnyTimes().DoAndReturn(func(context.Context) ([]*upstream_entity.Upstream, error) {
+			copy := *current
+			copy.Protocols = append(upstream_entity.ProtocolSet(nil), current.Protocols...)
+			return []*upstream_entity.Upstream{&copy}, nil
+		})
+		repo.EXPECT().Save(gomock.Any(), gomock.Any()).DoAndReturn(func(_ context.Context, updated *upstream_entity.Upstream) error {
+			copy := *updated
+			copy.Protocols = append(upstream_entity.ProtocolSet(nil), updated.Protocols...)
+			current = &copy
+			return nil
+		})
+		cachedRepo := proxy_svc.NewCachedUpstreamRepo(repo)
+		previousRepo := upstream_repo.Upstream()
+		upstream_repo.RegisterUpstream(cachedRepo)
+		t.Cleanup(func() { upstream_repo.RegisterUpstream(previousRepo) })
+		withDiskCache(t)
+		const path = "/packages.example.com/pool/main/p/package.deb"
+
+		first := cacheRequest(t, http.MethodGet, path, nil)
+		convey.So(first.Code, convey.ShouldEqual, http.StatusOK)
+		convey.So(first.Body.String(), convey.ShouldEqual, "cached package bytes")
+		convey.So(hits.Load(), convey.ShouldEqual, int64(1))
+
+		updated := *current
+		updated.Protocols = upstream_entity.ProtocolSet{upstream_entity.ProtocolRegistry}
+		convey.So(cachedRepo.Save(context.Background(), &updated), convey.ShouldBeNil)
+
+		second := cacheRequest(t, http.MethodGet, path, nil)
+		convey.So(second.Code, convey.ShouldEqual, http.StatusNotFound)
+		convey.So(second.Body.Len(), convey.ShouldEqual, 0)
+		convey.So(second.Header().Get("X-Katch-Cache"), convey.ShouldBeEmpty)
+		convey.So(hits.Load(), convey.ShouldEqual, int64(1))
 	})
 }

@@ -183,6 +183,35 @@ func TestGet_RegistryLegacyImmutableTagIsRefetched(t *testing.T) {
 	})
 }
 
+func TestGet_GenericImmutablePatternRemovalRefetchesAsMutable(t *testing.T) {
+	convey.Convey("不再命中 immutable_patterns 的旧永久对象会回源并改用 TTL", t, func() {
+		var o *originStub
+		o = newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = io.WriteString(w, fmt.Sprintf("current-%d", o.hits.Load()))
+		})
+		up := staticUpstream("packages.example.com")
+		up.ImmutablePatterns = upstream_entity.PatternList{"/pool/"}
+		up.MutableTTLSeconds = 300
+		svc, repo, _ := setupSvc(t, o, up, Options{})
+		const path = "/pool/main/p/package.deb"
+
+		convey.So(svc.Put(context.Background(), &PutRequest{
+			UpstreamID: up.ID, Key: path, Content: strings.NewReader("stale immutable"),
+			ContentType: "application/octet-stream", Immutable: true,
+		}), convey.ShouldBeNil)
+		up.ImmutablePatterns = nil
+
+		got, meta := pullWith(t, svc, target(up.Host, path))
+		convey.So(got, convey.ShouldEqual, "current-1")
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusMiss)
+		convey.So(o.hits.Load(), convey.ShouldEqual, int64(1))
+		row := repo.byKey(path)
+		convey.So(row.Immutable, convey.ShouldBeFalse)
+		convey.So(row.ExpiresAt, convey.ShouldBeGreaterThan, time.Now().Unix())
+	})
+}
+
 // TestGet_RegistryLegacyMutableDigestIsPromoted 升级前已经写下的错误记录也要自愈。
 // 命中时若只发出字节、不修正元数据，后台 Sweep 仍会在旧 TTL 到点后删掉它。
 func TestGet_RegistryLegacyMutableDigestIsPromoted(t *testing.T) {

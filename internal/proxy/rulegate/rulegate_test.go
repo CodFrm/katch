@@ -132,6 +132,104 @@ func setupPullPath(t *testing.T, rules []*rule_entity.AccessRule, origin string)
 	return engine, calls
 }
 
+func setupSumDBRulePath(t *testing.T, defaultPolicy string, rules []*rule_entity.AccessRule) (
+	*gin.Engine, *atomic.Int64,
+) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	ctrl := gomock.NewController(t)
+
+	upRepo := mock_upstream_repo.NewMockUpstreamRepo(ctrl)
+	upRepo.EXPECT().FindByHost(gomock.Any(), "sum.golang.org").Return(&upstream_entity.Upstream{
+		ID: 9, Host: "sum.golang.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+		Origin: "https://sum.golang.org", Enabled: true, DefaultPolicy: defaultPolicy,
+		PackageProfile: upstream_entity.PackageProfileGoProxy,
+	}, nil).AnyTimes()
+	upRepo.EXPECT().FindByHost(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+	previousUpstream := upstream_repo.Upstream()
+	upstream_repo.RegisterUpstream(upRepo)
+	t.Cleanup(func() { upstream_repo.RegisterUpstream(previousUpstream) })
+
+	ruleRepo := mock_rule_repo.NewMockAccessRuleRepo(ctrl)
+	ruleRepo.EXPECT().List(gomock.Any()).Return(rules, nil).AnyTimes()
+	previousRuleRepo := rule_repo.AccessRule()
+	rule_repo.RegisterAccessRule(ruleRepo)
+	t.Cleanup(func() { rule_repo.RegisterAccessRule(previousRuleRepo) })
+	previousRule := rule_svc.Rule()
+	rule_svc.Register(rule_svc.New())
+	t.Cleanup(func() { rule_svc.Register(previousRule) })
+
+	testMux := muxtest.NewTestMux()
+	engine := testMux.IRouter.(*gin.Engine)
+	downstream := &atomic.Int64{}
+	engine.NoRoute(func(c *gin.Context) {
+		downstream.Add(1)
+		kind, host, rest := dispatch.Classify(c.Request.URL.EscapedPath())
+		if kind != dispatch.KindStatic || host != "sum.golang.org" || rest != "/lookup/example.com/mod@v1.0.0" {
+			c.AbortWithStatus(http.StatusNotFound)
+			return
+		}
+		c.Status(http.StatusNoContent)
+	})
+	if err := api.Router(context.Background(), testMux.Router); err != nil {
+		t.Fatal(err)
+	}
+	return engine, downstream
+}
+
+func TestPull_SumDBAliasesUseCanonicalAccessRules(t *testing.T) {
+	aliases := []string{
+		"/sumdb/sum.golang.org/lookup/example.com/mod@v1.0.0",
+		"/proxy.golang.org/sumdb/sum.golang.org/lookup/example.com/mod@v1.0.0",
+	}
+
+	t.Run("default deny blocks both aliases before downstream", func(t *testing.T) {
+		engine, downstream := setupSumDBRulePath(t, upstream_entity.PolicyDenyUnlessMatched, nil)
+		for _, path := range aliases {
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("GET %s = %d, want 403", path, w.Code)
+			}
+		}
+		if downstream.Load() != 0 {
+			t.Fatalf("downstream calls = %d, want 0", downstream.Load())
+		}
+	})
+
+	t.Run("upstream deny matches canonical rest for both aliases", func(t *testing.T) {
+		engine, downstream := setupSumDBRulePath(t, upstream_entity.PolicyAllowAll, []*rule_entity.AccessRule{
+			{ID: 11, UpstreamID: 9, Action: rule_entity.ActionDeny, Pattern: "lookup/*"},
+		})
+		for _, path := range aliases {
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("GET %s = %d, want 403", path, w.Code)
+			}
+		}
+		if downstream.Load() != 0 {
+			t.Fatalf("downstream calls = %d, want 0", downstream.Load())
+		}
+	})
+
+	t.Run("allow rule is evaluated against sum.golang.org and stripped path", func(t *testing.T) {
+		engine, downstream := setupSumDBRulePath(t, upstream_entity.PolicyDenyUnlessMatched, []*rule_entity.AccessRule{
+			{ID: 12, UpstreamID: 9, Action: rule_entity.ActionAllow, Pattern: "lookup/example.com/mod@v1.0.0"},
+		})
+		for _, path := range aliases {
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+			if w.Code != http.StatusNoContent {
+				t.Fatalf("GET %s = %d, want 204", path, w.Code)
+			}
+		}
+		if downstream.Load() != int64(len(aliases)) {
+			t.Fatalf("downstream calls = %d, want %d", downstream.Load(), len(aliases))
+		}
+	})
+}
+
 // countFiles 数一数缓存目录里落了几个文件。
 func countFiles(t *testing.T, root string) int {
 	t.Helper()

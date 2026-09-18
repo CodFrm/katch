@@ -37,6 +37,17 @@ func TestClassify(t *testing.T) {
 		{"转义序列在上游路径里保持原样", "/raw.githubusercontent.com/a/b/main/x%20y.sh",
 			KindStatic, "raw.githubusercontent.com", "/a/b/main/x%20y.sh"},
 
+		// ── SumDB 的公开别名在分发层收敛成同一个目标 ──
+		{"顶层 SumDB 别名映射到固定主机", "/sumdb/sum.golang.org/lookup/example.com/mod@v1.0.0",
+			KindStatic, "sum.golang.org", "/lookup/example.com/mod@v1.0.0"},
+		{"GOPROXY 内嵌 SumDB 路由映射到固定主机", "/proxy.golang.org/sumdb/sum.golang.org/tile/8/1/000.p/16",
+			KindStatic, "sum.golang.org", "/tile/8/1/000.p/16"},
+		{"SumDB 顶层保留段不能选择任意主机", "/sumdb/other.example/lookup/x@y",
+			KindInvalid, "", ""},
+		{"空 SumDB 命名空间不会回落 SPA", "/sumdb", KindInvalid, "", ""},
+		{"畸形 GOPROXY SumDB 命名空间不会落回 proxy.golang.org", "/proxy.golang.org/sumdb/other.example/latest",
+			KindInvalid, "", ""},
+
 		// ── Homebrew 等会追加 /v2 的 registry base，边界必须显式 ──
 		{"registry base 去掉协议边界后返回上游路径",
 			"/registry/ghcr.io/v2/homebrew/core/jq/manifests/tag",
@@ -103,6 +114,9 @@ func TestClassify_NoHostLeaksOnInvalid(t *testing.T) {
 			"/v2/internal.corp.local/a/../../x",
 			"/registry/internal.corp.local/v2/a/../../x",
 			"/registry/internal%2Fcorp.local/v2/a",
+			"/sumdb",
+			"/sumdb/other.example/latest",
+			"/proxy.golang.org/sumdb/other.example/latest",
 		} {
 			kind, host, rest := Classify(path)
 			convey.So(kind.String(), convey.ShouldEqual, KindInvalid.String())
