@@ -1,6 +1,7 @@
 package proxy_svc_test
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -22,6 +23,17 @@ const fakeSumdbLookup = "github.com/foo/bar v1.0.0 h1:abc=\n" +
 	"github.com/foo/bar v1.0.0/go.mod h1:def=\n\n" +
 	"go.sum database tree\n42\n"
 
+type goProxyRewriteSource struct{}
+
+func (goProxyRewriteSource) Snapshot(context.Context) (*proxy_svc.RewriteSnapshot, error) {
+	return &proxy_svc.RewriteSnapshot{Upstreams: map[string]proxy_svc.RewriteUpstream{
+		"sum.golang.org": {
+			Profile:    upstream_entity.PackageProfileGoProxy,
+			Transports: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+		},
+	}}, nil
+}
+
 // useGoProxyUpstream 把 Go module proxy 与固定 checksum database 都装成进程内上游。
 // 两条公开路径会在 dispatch 收敛到各自真正的目标主机。
 func useGoProxyUpstream(t *testing.T, origin string) {
@@ -41,7 +53,9 @@ func useGoProxyUpstream(t *testing.T, origin string) {
 	upstream_repo.RegisterUpstream(proxy_svc.NewCachedUpstreamRepo(repo))
 
 	prevProxy := proxy_svc.Proxy()
-	proxy_svc.Register(proxy_svc.New(proxy_svc.Options{DestinationResolver: localDestinationResolver{}}))
+	proxy_svc.Register(proxy_svc.New(proxy_svc.Options{
+		RewriteConfig: goProxyRewriteSource{}, DestinationResolver: localDestinationResolver{},
+	}))
 	t.Cleanup(func() { proxy_svc.Register(prevProxy) })
 	// 缓存层用出厂的纯透传形态：这一组用例问的是路径有没有被改写，不是缓存。
 	prevCache := cache_svc.Cache()

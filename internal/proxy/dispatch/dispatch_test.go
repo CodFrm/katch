@@ -37,14 +37,22 @@ func TestClassify(t *testing.T) {
 		{"转义序列在上游路径里保持原样", "/raw.githubusercontent.com/a/b/main/x%20y.sh",
 			KindStatic, "raw.githubusercontent.com", "/a/b/main/x%20y.sh"},
 
-		// ── SumDB 的公开别名在分发层收敛成同一个目标 ──
+		// ── SumDB 的公开别名在分发层保留独立身份并收敛成同一个目标 ──
 		{"顶层 SumDB 别名映射到固定主机", "/sumdb/sum.golang.org/lookup/example.com/mod@v1.0.0",
-			KindStatic, "sum.golang.org", "/lookup/example.com/mod@v1.0.0"},
+			KindSumDB, "sum.golang.org", "/lookup/example.com/mod@v1.0.0"},
 		{"GOPROXY 内嵌 SumDB 路由映射到固定主机", "/proxy.golang.org/sumdb/sum.golang.org/tile/8/1/000.p/16",
-			KindStatic, "sum.golang.org", "/tile/8/1/000.p/16"},
+			KindSumDB, "sum.golang.org", "/tile/8/1/000.p/16"},
+		{"SumDB supported 保留独立身份", "/sumdb/sum.golang.org/supported",
+			KindSumDB, "sum.golang.org", "/supported"},
+		{"SumDB latest 保留独立身份", "/proxy.golang.org/sumdb/sum.golang.org/latest",
+			KindSumDB, "sum.golang.org", "/latest"},
+		{"直接 sum.golang.org 路径仍是通用 static", "/sum.golang.org/lookup/example.com/mod@v1.0.0",
+			KindStatic, "sum.golang.org", "/lookup/example.com/mod@v1.0.0"},
 		{"SumDB 顶层保留段不能选择任意主机", "/sumdb/other.example/lookup/x@y",
 			KindInvalid, "", ""},
 		{"空 SumDB 命名空间不会回落 SPA", "/sumdb", KindInvalid, "", ""},
+		{"SumDB 保留命名空间拒绝未知路由", "/sumdb/sum.golang.org/not-a-route",
+			KindInvalid, "", ""},
 		{"畸形 GOPROXY SumDB 命名空间不会落回 proxy.golang.org", "/proxy.golang.org/sumdb/other.example/latest",
 			KindInvalid, "", ""},
 
@@ -116,6 +124,7 @@ func TestClassify_NoHostLeaksOnInvalid(t *testing.T) {
 			"/registry/internal%2Fcorp.local/v2/a",
 			"/sumdb",
 			"/sumdb/other.example/latest",
+			"/sumdb/sum.golang.org/not-a-route",
 			"/proxy.golang.org/sumdb/other.example/latest",
 		} {
 			kind, host, rest := Classify(path)

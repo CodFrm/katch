@@ -45,10 +45,10 @@ func (s *sumDBSvc) Fetch(ctx context.Context, target *Target) (io.ReadCloser, *M
 	if target.Method != http.MethodGet && target.Method != http.MethodHead {
 		return sumDBResponse(http.StatusMethodNotAllowed)
 	}
+	if !s.configured(ctx) {
+		return sumDBResponse(http.StatusServiceUnavailable)
+	}
 	if supported {
-		if !s.configured(ctx) {
-			return sumDBResponse(http.StatusServiceUnavailable)
-		}
 		return sumDBResponse(http.StatusOK)
 	}
 	if s.fallback == nil {
@@ -77,7 +77,8 @@ func (s *sumDBSvc) configured(ctx context.Context) bool {
 }
 
 func canonicalSumDBTarget(target *Target) bool {
-	return target != nil && strings.EqualFold(strings.TrimSuffix(target.Host, "."), sumDBHost)
+	return target != nil && target.Kind == dispatch.KindSumDB &&
+		strings.EqualFold(strings.TrimSuffix(target.Host, "."), sumDBHost)
 }
 
 func sumDBRoute(target *Target) (upstreamPath string, supported, ok bool) {

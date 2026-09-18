@@ -36,6 +36,8 @@ const (
 	KindRegistry
 	// KindStatic 其余上游，第一段就是主机名。
 	KindStatic
+	// KindSumDB 仅用于两个公开 checksum database 别名，保留到策略与缓存边界。
+	KindSumDB
 	// KindInvalid 形如上游请求、却拿不出可用主机名或路径含 .. 回溯段。
 	// 它和「主机不在白名单里」一样返回 404，不给出任何区别。
 	KindInvalid
@@ -54,6 +56,8 @@ func (k Kind) String() string {
 		return "Registry"
 	case KindStatic:
 		return "Static"
+	case KindSumDB:
+		return "SumDB"
 	case KindInvalid:
 		return "Invalid"
 	}
@@ -124,10 +128,16 @@ func classifySumDB(path string) (Kind, string, string) {
 	if rest == "" {
 		rest = "/"
 	}
-	if !safeTail(strings.TrimPrefix(rest, "/")) {
+	if !safeTail(strings.TrimPrefix(rest, "/")) || !validSumDBRoute(rest) {
 		return KindInvalid, "", ""
 	}
-	return KindStatic, sumDBHost, rest
+	return KindSumDB, sumDBHost, rest
+}
+
+func validSumDBRoute(path string) bool {
+	return path == "/supported" || path == "/latest" ||
+		strings.HasPrefix(path, "/lookup/") && len(path) > len("/lookup/") ||
+		strings.HasPrefix(path, "/tile/") && len(path) > len("/tile/")
 }
 
 // classifyRegistryBase parses the one route whose /v2 segment is a delimiter

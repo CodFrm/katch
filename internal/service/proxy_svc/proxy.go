@@ -468,7 +468,7 @@ func SupportsTarget(target *Target, upstream *upstream_entity.Upstream) bool {
 	switch target.Kind {
 	case dispatch.KindRegistry:
 		return upstream.Protocols.Has(upstream_entity.ProtocolRegistry)
-	case dispatch.KindStatic:
+	case dispatch.KindStatic, dispatch.KindSumDB:
 		// git 的端点寄生在 static 的路径空间里，但要的是 git 那一种协议：
 		// 一条只开了 static 的 github.com 服务 release 资产，不服务 clone。
 		if target.Git.IsGit() {

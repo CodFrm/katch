@@ -65,7 +65,7 @@ func pullHandler(calls *atomic.Int64) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		calls.Add(1)
 		kind, host, rest := dispatch.Classify(c.Request.URL.EscapedPath())
-		if kind != dispatch.KindStatic && kind != dispatch.KindRegistry {
+		if kind != dispatch.KindStatic && kind != dispatch.KindRegistry && kind != dispatch.KindSumDB {
 			c.AbortWithStatus(http.StatusNotFound)
 			return
 		}
@@ -165,7 +165,7 @@ func setupSumDBRulePath(t *testing.T, defaultPolicy string, rules []*rule_entity
 	engine.NoRoute(func(c *gin.Context) {
 		downstream.Add(1)
 		kind, host, rest := dispatch.Classify(c.Request.URL.EscapedPath())
-		if kind != dispatch.KindStatic || host != "sum.golang.org" || rest != "/lookup/example.com/mod@v1.0.0" {
+		if kind != dispatch.KindSumDB || host != "sum.golang.org" || rest != "/lookup/example.com/mod@v1.0.0" {
 			c.AbortWithStatus(http.StatusNotFound)
 			return
 		}

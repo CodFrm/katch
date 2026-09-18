@@ -3,12 +3,15 @@ package web
 import (
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/smartystreets/goconvey/convey"
@@ -17,6 +20,7 @@ import (
 	"github.com/CodFrm/katch/internal/cache"
 	"github.com/CodFrm/katch/internal/model/entity/cache_entity"
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
+	"github.com/CodFrm/katch/internal/proxy/destination"
 	"github.com/CodFrm/katch/internal/repository/cache_repo"
 	mock_cache_repo "github.com/CodFrm/katch/internal/repository/cache_repo/mock"
 	"github.com/CodFrm/katch/internal/repository/upstream_repo"
@@ -103,13 +107,21 @@ func memoryCacheObjects(t *testing.T) {
 // main 一致。用完恢复成出厂的纯透传，免得它漏给同包里别的用例。
 func withDiskCache(t *testing.T) {
 	t.Helper()
+	withDiskCacheOptions(t, cache_svc.Options{})
+}
+
+func withDiskCacheOptions(t *testing.T, opt cache_svc.Options) cache_svc.CacheSvc {
+	t.Helper()
 	memoryCacheObjects(t)
 	store, err := cache.NewStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("建缓存目录失败：%v", err)
 	}
-	cache_svc.Register(cache_svc.New(store, cache_svc.Options{}))
-	t.Cleanup(func() { cache_svc.Register(cache_svc.New(nil, cache_svc.Options{})) })
+	svc := cache_svc.New(store, opt)
+	previous := cache_svc.Cache()
+	cache_svc.Register(svc)
+	t.Cleanup(func() { cache_svc.Register(previous) })
+	return svc
 }
 
 // cacheRequest 经**真实的** NoRoute 处理器发一次带方法/请求头的拉取。
@@ -327,6 +339,144 @@ func TestProxy_SecondPullIsServedFromDisk(t *testing.T) {
 		convey.So(second.Header().Get("X-Katch-Cache"), convey.ShouldEqual, "HIT")
 		convey.So(hits.Load(), convey.ShouldEqual, 1)
 	})
+}
+
+type mutableWebRewriteSource struct {
+	mu       sync.Mutex
+	snapshot *proxy_svc.RewriteSnapshot
+}
+
+func (s *mutableWebRewriteSource) Snapshot(context.Context) (*proxy_svc.RewriteSnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	copy := *s.snapshot
+	copy.Upstreams = make(map[string]proxy_svc.RewriteUpstream, len(s.snapshot.Upstreams))
+	for host, upstream := range s.snapshot.Upstreams {
+		upstream.Transports = append(upstream_entity.ProtocolSet(nil), upstream.Transports...)
+		copy.Upstreams[host] = upstream
+	}
+	return &copy, nil
+}
+
+func (s *mutableWebRewriteSource) setProfile(profile upstream_entity.PackageProfile) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	upstream := s.snapshot.Upstreams["sum.golang.org"]
+	upstream.Profile = profile
+	s.snapshot.Upstreams["sum.golang.org"] = upstream
+}
+
+func TestProxy_SumDBWarmCacheRequiresCurrentGoProxyProfile(t *testing.T) {
+	// warmHit 区分两条 sumdb 路径的暖形态：/supported 是合成应答，按约定压根不进
+	// 对象缓存；lookup 会落盘，撤销 profile 之前必须先证明它真的暖着——否则
+	// 「撤销后拿不到」可能只是因为它从来没被缓存过，这条用例就没有牙。
+	//
+	// lookup 那条还带上一条 immutable_patterns：撤销 profile 之后这条路径不再被
+	// go profile 认领，落回上游自己的不可变模式，缓存层若不显式复核当前 profile，
+	// 暖对象就会被当成内容寻址结果长期原样重放。
+	for _, tc := range []struct {
+		path              string
+		warmHit           bool
+		immutablePatterns upstream_entity.PatternList
+	}{
+		{path: "/sumdb/sum.golang.org/supported"},
+		{
+			path:    "/proxy.golang.org/sumdb/sum.golang.org/lookup/example.com/mod@v1.0.0",
+			warmHit: true, immutablePatterns: upstream_entity.PatternList{"/lookup/"},
+		},
+	} {
+		path := tc.path
+		t.Run(path, func(t *testing.T) {
+			srv, hits := countingOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/plain")
+				_, _ = io.WriteString(w, "checksum-record")
+			})
+			current := &upstream_entity.Upstream{
+				ID: 9, Host: "sum.golang.org", Origin: srv.URL, Enabled: true,
+				Protocols:         upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+				PackageProfile:    upstream_entity.PackageProfileGoProxy,
+				ImmutablePatterns: tc.immutablePatterns,
+			}
+			repo := mock_upstream_repo.NewMockUpstreamRepo(gomock.NewController(t))
+			repo.EXPECT().List(gomock.Any()).AnyTimes().DoAndReturn(func(context.Context) ([]*upstream_entity.Upstream, error) {
+				copy := *current
+				copy.Protocols = append(upstream_entity.ProtocolSet(nil), current.Protocols...)
+				return []*upstream_entity.Upstream{&copy}, nil
+			})
+			repo.EXPECT().Save(gomock.Any(), gomock.Any()).DoAndReturn(func(_ context.Context, updated *upstream_entity.Upstream) error {
+				copy := *updated
+				copy.Protocols = append(upstream_entity.ProtocolSet(nil), updated.Protocols...)
+				current = &copy
+				return nil
+			})
+			cachedRepo := proxy_svc.NewCachedUpstreamRepo(repo)
+			previousRepo := upstream_repo.Upstream()
+			upstream_repo.RegisterUpstream(cachedRepo)
+			t.Cleanup(func() { upstream_repo.RegisterUpstream(previousRepo) })
+
+			source := &mutableWebRewriteSource{snapshot: configuredWebSumDB()}
+			originURL, err := url.Parse(srv.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, port, err := net.SplitHostPort(originURL.Host)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resolver := webResolverFunc(func(_ context.Context, target *url.URL, _ destination.DestinationRequirement) (*destination.ResolvedTarget, error) {
+				mapped := *target
+				mapped.Scheme = "http"
+				return &destination.ResolvedTarget{
+					URL: &mapped, Authority: target.Host, Host: target.Host,
+					ServerName: target.Hostname(), DialAddress: net.JoinHostPort("127.0.0.1", port),
+				}, nil
+			})
+			previousProxy := proxy_svc.Proxy()
+			proxy_svc.Register(proxy_svc.New(proxy_svc.Options{RewriteConfig: source, DestinationResolver: resolver}))
+			t.Cleanup(func() { proxy_svc.Register(previousProxy) })
+			cacheSvc := withDiskCacheOptions(t, cache_svc.Options{RewriteConfig: source})
+
+			first := cacheRequest(t, http.MethodGet, path, nil)
+			if first.Code != http.StatusOK {
+				t.Fatalf("first GET %s = %d, body %q", path, first.Code, first.Body.String())
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := cacheSvc.Quiesce(ctx); err != nil {
+				t.Fatal(err)
+			}
+			originHits := hits.Load()
+
+			warm := cacheRequest(t, http.MethodGet, path, nil)
+			if warm.Code != http.StatusOK {
+				t.Fatalf("warm GET %s before revoke = %d, body %q", path, warm.Code, warm.Body.String())
+			}
+			if got := warm.Header().Get("X-Katch-Cache"); tc.warmHit && got != "HIT" {
+				t.Fatalf("warm GET %s before revoke X-Katch-Cache = %q, want HIT", path, got)
+			}
+			if hits.Load() != originHits {
+				t.Fatalf("origin hits before revoke = %d, want %d", hits.Load(), originHits)
+			}
+
+			updated := *current
+			updated.PackageProfile = upstream_entity.PackageProfileNone
+			if err := cachedRepo.Save(context.Background(), &updated); err != nil {
+				t.Fatal(err)
+			}
+			source.setProfile(upstream_entity.PackageProfileNone)
+
+			second := cacheRequest(t, http.MethodGet, path, nil)
+			if second.Code != http.StatusServiceUnavailable || second.Body.Len() != 0 {
+				t.Fatalf("warm GET %s after profile revoke = %d, body %q; want empty 503", path, second.Code, second.Body.String())
+			}
+			if second.Header().Get("X-Katch-Cache") == "HIT" {
+				t.Fatalf("warm GET %s replayed cache after profile revoke", path)
+			}
+			if hits.Load() != originHits {
+				t.Fatalf("origin hits after revoke = %d, want %d", hits.Load(), originHits)
+			}
+		})
+	}
 }
 
 func TestProxy_WarmHitRechecksCurrentTransport(t *testing.T) {

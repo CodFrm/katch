@@ -52,7 +52,7 @@ func TestNewComposesSumDBBeforeStaticFallback(t *testing.T) {
 		}),
 	})
 	body, meta, err := svc.Fetch(context.Background(), &Target{
-		Kind: dispatch.KindStatic, Host: "sum.golang.org", Path: "/supported", Method: http.MethodGet,
+		Kind: dispatch.KindSumDB, Host: "sum.golang.org", Path: "/supported", Method: http.MethodGet,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -86,7 +86,7 @@ func TestSumDBNonSyntheticRoutesDelegateCanonicalTarget(t *testing.T) {
 	})
 
 	body, meta, err := svc.Fetch(context.Background(), &Target{
-		Kind: dispatch.KindStatic, Host: "sum.golang.org", Path: "/lookup/example.com/mod@v1.0.0",
+		Kind: dispatch.KindSumDB, Host: "sum.golang.org", Path: "/lookup/example.com/mod@v1.0.0",
 		RawQuery: "x=1", Method: http.MethodHead, Header: header,
 	})
 	if err != nil {
@@ -95,6 +95,61 @@ func TestSumDBNonSyntheticRoutesDelegateCanonicalTarget(t *testing.T) {
 	defer body.Close()
 	if calls != 1 || meta.StatusCode != http.StatusNotModified {
 		t.Fatalf("fallback calls = %d, status = %d; want 1, 304", calls, meta.StatusCode)
+	}
+}
+
+func TestSumDBNonSyntheticRoutesRequireCurrentProfile(t *testing.T) {
+	fallbackCalls := 0
+	svc := NewSumDB(SumDBOptions{
+		RewriteConfig: configuredSumDBSource(upstream_entity.PackageProfileNone, upstream_entity.ProtocolStatic),
+		Fallback: proxyFunc(func(context.Context, *Target) (io.ReadCloser, *Meta, error) {
+			fallbackCalls++
+			return nil, nil, errors.New("revoked profile reached fallback")
+		}),
+	})
+
+	body, meta, err := svc.Fetch(context.Background(), &Target{
+		Kind: dispatch.KindSumDB, Host: sumDBHost, Path: "/lookup/example.com/mod@v1.0.0",
+		Method: http.MethodGet, Header: make(http.Header),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer body.Close()
+	if meta.StatusCode != http.StatusServiceUnavailable || fallbackCalls != 0 {
+		t.Fatalf("status = %d, fallback calls = %d; want 503, 0", meta.StatusCode, fallbackCalls)
+	}
+}
+
+func TestSumDBDoesNotInterceptDirectStaticHost(t *testing.T) {
+	fallbackCalls := 0
+	svc := NewSumDB(SumDBOptions{
+		RewriteConfig: configuredSumDBSource(upstream_entity.PackageProfileNone, upstream_entity.ProtocolStatic),
+		Fallback: proxyFunc(func(_ context.Context, target *Target) (io.ReadCloser, *Meta, error) {
+			fallbackCalls++
+			if target.Kind != dispatch.KindStatic || target.Host != sumDBHost || target.Path != "/supported" {
+				t.Fatalf("fallback target = %+v", target)
+			}
+			return io.NopCloser(strings.NewReader("generic-static")), &Meta{
+				StatusCode: http.StatusOK, Header: make(http.Header), ContentLength: 14,
+			}, nil
+		}),
+	})
+
+	body, meta, err := svc.Fetch(context.Background(), &Target{
+		Kind: dispatch.KindStatic, Host: sumDBHost, Path: "/supported",
+		Method: http.MethodGet, Header: make(http.Header),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer body.Close()
+	got, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.StatusCode != http.StatusOK || string(got) != "generic-static" || fallbackCalls != 1 {
+		t.Fatalf("status = %d, body = %q, fallback calls = %d", meta.StatusCode, got, fallbackCalls)
 	}
 }
 
@@ -123,7 +178,7 @@ func TestSumDBSupportedRequiresConfiguredUpstream(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			svc := NewSumDB(SumDBOptions{RewriteConfig: tc.source})
 			body, meta, err := svc.Fetch(context.Background(), &Target{
-				Kind: dispatch.KindStatic, Host: sumDBHost, Method: http.MethodGet, Path: tc.path,
+				Kind: dispatch.KindSumDB, Host: sumDBHost, Method: http.MethodGet, Path: tc.path,
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -204,7 +259,7 @@ func TestSumDBRoutesApprovedPathsAndPassesResponseThrough(t *testing.T) {
 				t.Fatal(err)
 			}
 			body, meta, err := svc.Fetch(context.Background(), &Target{
-				Kind: dispatch.KindStatic, Host: sumDBHost, Method: http.MethodGet,
+				Kind: dispatch.KindSumDB, Host: sumDBHost, Method: http.MethodGet,
 				Path: parsed.EscapedPath(), RawQuery: parsed.RawQuery,
 			})
 			if err != nil {
@@ -248,7 +303,7 @@ func TestSumDBRejectsUnknownPathsWithoutOriginAccess(t *testing.T) {
 	for _, path := range paths {
 		t.Run(strings.ReplaceAll(path, "/", "_"), func(t *testing.T) {
 			body, meta, err := svc.Fetch(context.Background(), &Target{
-				Kind: dispatch.KindStatic, Host: sumDBHost, Path: path, Method: http.MethodGet,
+				Kind: dispatch.KindSumDB, Host: sumDBHost, Path: path, Method: http.MethodGet,
 			})
 			if err != nil {
 				t.Fatal(err)

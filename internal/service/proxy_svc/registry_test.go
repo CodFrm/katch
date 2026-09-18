@@ -116,7 +116,7 @@ func useRegistryUpstream(t *testing.T, origin string, libraryCompletion bool) {
 func pullHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		kind, host, rest := dispatch.Classify(r.URL.EscapedPath())
-		if kind != dispatch.KindRegistry && kind != dispatch.KindStatic {
+		if kind != dispatch.KindRegistry && kind != dispatch.KindStatic && kind != dispatch.KindSumDB {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}

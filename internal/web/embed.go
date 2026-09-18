@@ -148,7 +148,7 @@ func serveUpstream(c *gin.Context, kind dispatch.Kind, host, rest string) bool {
 		// 拿不出主机名或带着回溯段的请求，和主机不在白名单里一样 404。
 		c.AbortWithStatus(http.StatusNotFound)
 		return true
-	case dispatch.KindRegistry, dispatch.KindStatic:
+	case dispatch.KindRegistry, dispatch.KindStatic, dispatch.KindSumDB:
 		serveProxy(c, kind, host, rest)
 		return true
 	case dispatch.KindSPA, dispatch.KindSelf:

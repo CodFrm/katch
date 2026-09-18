@@ -247,6 +247,16 @@ func (c *cacheSvc) Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCl
 		return proxy_svc.Proxy().Fetch(ctx, target)
 	}
 	upstream, err := upstream_svc.Upstream().FindByHost(ctx, target.Host)
+	if target.Kind == dispatch.KindSumDB {
+		if err != nil || !sumDBServable(upstream) {
+			return statusOnly(http.StatusServiceUnavailable)
+		}
+		// /supported 是合成应答，答案只取决于当前配置：不进对象缓存，撤销才能在
+		// 下一次请求就看得见，也不必为它造一个带代数的键。
+		if target.Path == "/supported" {
+			return proxy_svc.Proxy().Fetch(ctx, target)
+		}
+	}
 	if err != nil || upstream == nil {
 		return proxy_svc.Proxy().Fetch(ctx, target)
 	}
@@ -300,11 +310,24 @@ func (c *cacheSvc) Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCl
 	return body, m.stamp(meta), nil
 }
 
+// sumDBServable 复核 checksum database 这一条别名路由当前是否仍被授权。
+//
+// 放在读缓存之前：撤销 go profile 之后，这条路径不再被 profile 认领，会落回上游
+// 自己的 immutable_patterns，暖对象就能绕开 proxy_svc 那侧的配置检查被长期重放。
+// 判据只看上游记录本身——它就是 sumdb 桥那侧配置快照的同一份真相，不必在拉取路径
+// 上再开一个来源。
+func sumDBServable(upstream *upstream_entity.Upstream) bool {
+	return upstream != nil && upstream.Enabled &&
+		upstream.Protocols.Has(upstream_entity.ProtocolStatic) &&
+		upstream_entity.NormalizePackageProfile(upstream.PackageProfile) == upstream_entity.PackageProfileGoProxy
+}
+
 func (c *cacheSvc) classify(upstream *upstream_entity.Upstream,
 	target *proxy_svc.Target,
 ) (packageprofile.Representation, packageprofile.Profile) {
 	name := upstream_entity.NormalizePackageProfile(upstream.PackageProfile)
-	if target.Kind != dispatch.KindStatic || name == upstream_entity.PackageProfileNone {
+	if target.Kind != dispatch.KindStatic && target.Kind != dispatch.KindSumDB ||
+		name == upstream_entity.PackageProfileNone {
 		return packageprofile.Representation{}, nil
 	}
 	var profile packageprofile.Profile
