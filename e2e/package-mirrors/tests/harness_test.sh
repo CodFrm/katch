@@ -1313,6 +1313,94 @@ KATCH_ALLOW_BLOCKED_DNS_PROBE=1 KATCH_PORT=$capture_katch_port \
 cmp -s "$workdir/allowed-blocked-dns-probe.log" "$workdir/blocked-dns-probes.log" ||
   fail "accepted blocked DNS probes were not preserved as separate evidence"
 
+cat > "$workdir/split-blocked-dns-probe.log" <<EOF
+146 connect(3, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("$capture_katch_ip")}, 16 <unfinished ...>
+147 connect(3, {sa_family=AF_INET6, sin6_port=htons(53), inet_pton(AF_INET6, "::ffff:$capture_katch_ip", &sin6_addr), sin6_scope_id=0}, 28 <unfinished ...>
+148 connect(3, {sa_family=AF_INET, sin_addr=inet_addr("$capture_katch_ip"), sin_port=htons($capture_katch_port)}, 16) = 0
+146 <... connect resumed>) = 0
+147 <... connect resumed>) = 0
+149 connect(3, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("$capture_katch_ip")}, 16) = 0
+EOF
+cat > "$workdir/split-blocked-dns-probe.expected" <<EOF
+146 connect(3, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("$capture_katch_ip")}, 16 <unfinished ...>
+146 <... connect resumed>) = 0
+147 connect(3, {sa_family=AF_INET6, sin6_port=htons(53), inet_pton(AF_INET6, "::ffff:$capture_katch_ip", &sin6_addr), sin6_scope_id=0}, 28 <unfinished ...>
+147 <... connect resumed>) = 0
+149 connect(3, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("$capture_katch_ip")}, 16) = 0
+EOF
+KATCH_ALLOW_BLOCKED_DNS_PROBE=1 KATCH_PORT=$capture_katch_port \
+  "$ENTRYPOINT" --verify-capture "$workdir/split-blocked-dns-probe.log" "$capture_katch_ip" "$workdir/split-blocked-dns-probes.log" ||
+  fail "same-PID split blocked DNS probes were rejected"
+cmp -s "$workdir/split-blocked-dns-probe.expected" "$workdir/split-blocked-dns-probes.log" ||
+  fail "split blocked DNS probe evidence did not preserve both lines of each pair"
+
+if KATCH_PORT=$capture_katch_port \
+  "$ENTRYPOINT" --verify-capture "$workdir/split-blocked-dns-probe.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "default capture audit accepted split blocked DNS probes"
+fi
+
+cat > "$workdir/orphan-split-blocked-dns-probe.log" <<EOF
+150 connect(3, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("$capture_katch_ip")}, 16 <unfinished ...>
+EOF
+if KATCH_ALLOW_BLOCKED_DNS_PROBE=1 KATCH_PORT=$capture_katch_port \
+  "$ENTRYPOINT" --verify-capture "$workdir/orphan-split-blocked-dns-probe.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "explicit blocked DNS probe allowance accepted an orphan unfinished connect"
+fi
+grep -F '<unfinished ...>' "$workdir/out" >/dev/null || fail "orphan unfinished blocked DNS probe was not reported"
+
+cat > "$workdir/wrong-pid-split-blocked-dns-probe.log" <<EOF
+151 connect(3, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("$capture_katch_ip")}, 16 <unfinished ...>
+152 <... connect resumed>) = 0
+EOF
+if KATCH_ALLOW_BLOCKED_DNS_PROBE=1 KATCH_PORT=$capture_katch_port \
+  "$ENTRYPOINT" --verify-capture "$workdir/wrong-pid-split-blocked-dns-probe.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "explicit blocked DNS probe allowance paired a resumed connect from the wrong PID"
+fi
+grep -F '152 <... connect resumed>) = 0' "$workdir/out" >/dev/null ||
+  fail "wrong-PID blocked DNS completion was not reported"
+
+cat > "$workdir/failed-split-blocked-dns-probe.log" <<EOF
+153 connect(3, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("$capture_katch_ip")}, 16 <unfinished ...>
+153 <... connect resumed>) = -1 EPERM (Operation not permitted)
+EOF
+if KATCH_ALLOW_BLOCKED_DNS_PROBE=1 KATCH_PORT=$capture_katch_port \
+  "$ENTRYPOINT" --verify-capture "$workdir/failed-split-blocked-dns-probe.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "explicit blocked DNS probe allowance accepted a failed resumed connect"
+fi
+grep -F '= -1 EPERM' "$workdir/out" >/dev/null || fail "failed resumed blocked DNS probe was not reported"
+
+cat > "$workdir/wrong-syscall-split-blocked-dns-probe.log" <<EOF
+154 connect(3, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("$capture_katch_ip")}, 16 <unfinished ...>
+154 <... sendto resumed>) = 0
+EOF
+if KATCH_ALLOW_BLOCKED_DNS_PROBE=1 KATCH_PORT=$capture_katch_port \
+  "$ENTRYPOINT" --verify-capture "$workdir/wrong-syscall-split-blocked-dns-probe.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "explicit blocked DNS probe allowance accepted a resumed wrong syscall"
+fi
+grep -F '<... sendto resumed>) = 0' "$workdir/out" >/dev/null ||
+  fail "wrong resumed syscall for blocked DNS probe was not reported"
+
+cat > "$workdir/external-split-blocked-dns-probe.log" <<'EOF'
+155 connect(3, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, 16 <unfinished ...>
+155 <... connect resumed>) = 0
+EOF
+if KATCH_ALLOW_BLOCKED_DNS_PROBE=1 KATCH_PORT=$capture_katch_port \
+  "$ENTRYPOINT" --verify-capture "$workdir/external-split-blocked-dns-probe.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "explicit blocked DNS probe allowance accepted a split external destination"
+fi
+grep -F '8.8.8.8' "$workdir/out" >/dev/null || fail "split external blocked DNS probe was not reported"
+
+cat > "$workdir/wrong-port-split-blocked-dns-probe.log" <<EOF
+156 connect(3, {sa_family=AF_INET, sin_port=htons(5353), sin_addr=inet_addr("$capture_katch_ip")}, 16 <unfinished ...>
+156 <... connect resumed>) = 0
+EOF
+if KATCH_ALLOW_BLOCKED_DNS_PROBE=1 KATCH_PORT=$capture_katch_port \
+  "$ENTRYPOINT" --verify-capture "$workdir/wrong-port-split-blocked-dns-probe.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "explicit blocked DNS probe allowance accepted a split wrong-port destination"
+fi
+grep -F 'sin_port=htons(5353)' "$workdir/out" >/dev/null ||
+  fail "split wrong-port blocked DNS probe was not reported"
+
 cat > "$workdir/external-blocked-dns-probe.log" <<'EOF'
 141 connect(3, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, 16) = 0
 EOF

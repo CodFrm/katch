@@ -26,13 +26,33 @@ verify_capture() {
       print "non-katch connection attempt: " line > "/dev/stderr"
       bad = 1
     }
-    function audit(destination, port, line) {
+    function trace_pid(line, pid) {
+      pid = line
+      sub(/^[[:space:]]*/, "", pid)
+      sub(/[[:space:]].*$/, "", pid)
+      if (pid !~ /^[0-9]+$/) return ""
+      return pid
+    }
+    function preserve_blocked_dns_probe(line) {
+      if (blocked_dns_evidence != "") print line >> blocked_dns_evidence
+    }
+    function audit(destination, port, line, pid) {
       if (destination ~ /^127\./ || destination == "::1" || destination ~ /^::ffff:127\./) return
       if (destination == allowed || destination == "::ffff:" allowed) {
         if (port == 53) {
-          if (allow_blocked_dns_probe == 1 && line ~ /(^|[[:space:]])connect\(/ && line ~ /[[:space:]]=[[:space:]]0[[:space:]]*$/) {
-            if (blocked_dns_evidence != "") print line >> blocked_dns_evidence
-            return
+          if (allow_blocked_dns_probe == 1 && line ~ /(^|[[:space:]])connect\(/) {
+            if (line ~ /[[:space:]]=[[:space:]]0[[:space:]]*$/) {
+              preserve_blocked_dns_probe(line)
+              return
+            }
+            if (line ~ /<unfinished \.\.\.>[[:space:]]*$/) {
+              pid = trace_pid(line)
+              if (pid != "" && !(pid in pending_dns_probe)) {
+                pending_dns_probe[pid] = line
+                pending_dns_probe_count++
+                return
+              }
+            }
           }
           reject(line)
           return
@@ -41,6 +61,23 @@ verify_capture() {
         if (port == 65535 && line ~ /(^|[[:space:]])connect\(/ && line ~ /[[:space:]]=[[:space:]]0[[:space:]]*$/) return
       }
       reject(line)
+    }
+    allow_blocked_dns_probe == 1 && /<\.\.\.[[:space:]][^[:space:]]+[[:space:]]resumed>/ {
+      line = $0
+      pid = trace_pid(line)
+      if (pid in pending_dns_probe) {
+        if (line ~ /^[[:space:]]*[0-9]+[[:space:]]+<\.\.\.[[:space:]]+connect[[:space:]]+resumed>\)[[:space:]]*=[[:space:]]*0[[:space:]]*$/) {
+          preserve_blocked_dns_probe(pending_dns_probe[pid])
+          preserve_blocked_dns_probe(line)
+        } else {
+          reject(line)
+        }
+        delete pending_dns_probe[pid]
+        pending_dns_probe_count--
+      } else if (pending_dns_probe_count > 0) {
+        reject(line)
+      }
+      next
     }
     /sa_family=AF_INET,/ {
       line = $0
@@ -86,7 +123,10 @@ verify_capture() {
       sub(/^.*\./, "", port)
       audit(destination, port, line)
     }
-    END { exit bad }
+    END {
+      for (pid in pending_dns_probe) reject(pending_dns_probe[pid])
+      exit bad
+    }
   ' "$capture"; then
     return 0
   fi
