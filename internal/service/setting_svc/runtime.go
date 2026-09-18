@@ -104,6 +104,11 @@ type settingDef struct {
 	Min, Max int64
 	// MaxLen 字符串项的长度上限（字节）。
 	MaxLen int
+	// Canonical 字符串项的取值规范化，返回落库的形态或一条说明为什么不合法的错误。
+	//
+	// 挂在定义上而不是写进保存逻辑：读一行旧数据走的是同一个 normalize，于是
+	// 「库里已经躺着一个非法值」会自动退回默认值并留下日志，而不是被原样用出去。
+	Canonical func(string) (string, error)
 }
 
 // settingDefs 全部运行时设置，顺序即界面上的展示顺序。
@@ -115,7 +120,7 @@ var settingDefs = []*settingDef{
 		Default: json.RawMessage(`"katch"`), MaxLen: 64},
 	{Key: SiteDomainSetting, Type: admin.SettingTypeString,
 		// 253 是一个域名的长度上限，不是随手挑的数。
-		Default: json.RawMessage(`""`), MaxLen: 253},
+		Default: json.RawMessage(`""`), MaxLen: 253, Canonical: canonicalSiteDomain},
 	{Key: PublicHomepageSetting, Type: admin.SettingTypeBool,
 		Default: json.RawMessage(`true`)},
 	{Key: CacheQuotaBytesSetting, Type: admin.SettingTypeInt,
@@ -214,6 +219,13 @@ func (d *settingDef) normalize(raw json.RawMessage) (json.RawMessage, error) {
 		}
 		if len(v) > d.MaxLen {
 			return nil, fmt.Errorf("长度不能超过 %d 字节", d.MaxLen)
+		}
+		if d.Canonical != nil {
+			canonical, err := d.Canonical(v)
+			if err != nil {
+				return nil, err
+			}
+			v = canonical
 		}
 		return jsonMust(v), nil
 	}

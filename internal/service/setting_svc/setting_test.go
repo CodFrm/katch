@@ -112,6 +112,63 @@ func TestVerifyAdminKey(t *testing.T) {
 	})
 }
 
+func TestSiteDomainSettingValidation(t *testing.T) {
+	convey.Convey("site_domain 只接受可安全生成公开地址的值", t, func() {
+		repo := newMemorySettingRepo()
+		setting_repo.RegisterSetting(repo)
+		ctx := context.Background()
+
+		for _, value := range []string{
+			"https://mirror.example?x=1",
+			"https://user:pass@mirror.example",
+			"javascript:alert(1)",
+			"https:///missing-host",
+			"ftp://mirror.example",
+			"https://mirror.example/#fragment",
+			"https://mirror.example:\u000abad",
+			"https://mirror.example:99999",
+		} {
+			_, err := Setting().Save(ctx, saveRequest(map[string]json.RawMessage{
+				SiteDomainSetting: mustJSON(value),
+			}))
+			status, c := statusAndCode(t, err)
+			convey.So(status, convey.ShouldEqual, http.StatusBadRequest)
+			convey.So(c, convey.ShouldEqual, code.SettingValueInvalid)
+		}
+		convey.So(repo.findCount(SiteDomainSetting), convey.ShouldEqual, 0)
+
+		// 库里躺着的旧值不经过 Save，只能靠读的时候复核：坏值退回默认的空串，
+		// 于是 readiness 判据看到的是「还没配站点地址」，而不是一个拼不通的地址。
+		convey.Convey("库里已有的非法值按空处理", func() {
+			convey.So(repo.Save(ctx, &setting_entity.Setting{
+				Key: SiteDomainSetting, Value: `"https://mirror.example?x=1"`,
+			}), convey.ShouldBeNil)
+			got, err := Setting().BaseURL(ctx)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(got, convey.ShouldEqual, "")
+		})
+
+		for _, tc := range []struct {
+			value string
+			want  string
+		}{
+			{value: "", want: ""},
+			{value: "mirror.example", want: "https://mirror.example"},
+			{value: "http://localhost:8080", want: "http://localhost:8080"},
+			{value: "HTTP://mirror.example", want: "http://mirror.example"},
+			{value: "https://mirror.example/katch/", want: "https://mirror.example/katch"},
+		} {
+			_, err := Setting().Save(ctx, saveRequest(map[string]json.RawMessage{
+				SiteDomainSetting: mustJSON(tc.value),
+			}))
+			convey.So(err, convey.ShouldBeNil)
+			got, err := Setting().BaseURL(ctx)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(got, convey.ShouldEqual, tc.want)
+		}
+	})
+}
+
 // TestRecentRequestRetentionSetting 覆盖「最近请求保留时长」这一项：
 // 默认一天，闭区间一小时到七天，写进去下一次读就是新的。
 func TestRecentRequestRetentionSetting(t *testing.T) {
