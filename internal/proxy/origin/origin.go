@@ -84,6 +84,8 @@ var forwardedRequestHeaders = []string{
 	"Accept-Encoding",
 	"Range",
 	"If-Range",
+	"If-Match",
+	"If-Unmodified-Since",
 	"If-None-Match",
 	"If-Modified-Since",
 	"User-Agent",

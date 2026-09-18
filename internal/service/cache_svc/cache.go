@@ -597,24 +597,30 @@ func (c *cacheSvc) getTransformed(ctx context.Context, target *proxy_svc.Target,
 	}
 	key := cacheKeyForRepresentation(target, representation, snapshot.Generation)
 	immutable := representation.Class == packageprofile.ClassImmutable
+	attribution := &miss{reason: metrics.MissFirst}
 	if c.usable() {
-		if body, meta, miss := c.serveFromDisk(ctx, target, upstream, key, immutable,
-			representation.Class == packageprofile.ClassMutable, true); miss == nil {
-			return body, meta, nil
-		}
-		if wait, leader := c.beginTransform(key); !leader {
+		var firstMiss *miss
+		for {
+			body, meta, currentMiss := c.serveFromDisk(ctx, target, upstream, key, immutable,
+				representation.Class == packageprofile.ClassMutable, true)
+			if currentMiss == nil {
+				return body, meta, nil
+			}
+			if firstMiss == nil {
+				firstMiss = currentMiss
+			}
+			wait, leader := c.beginTransform(key)
+			if leader {
+				attribution = firstMiss
+				defer c.finishTransform(key)
+				break
+			}
 			select {
 			case <-wait:
 			case <-ctx.Done():
 				return nil, nil, ctx.Err()
 			}
-			if body, meta, miss := c.serveFromDisk(ctx, target, upstream, key, immutable,
-				representation.Class == packageprofile.ClassMutable, true); miss == nil {
-				return body, meta, nil
-			}
-			return c.getTransformed(ctx, target, upstream, profile, representation)
 		}
-		defer c.finishTransform(key)
 	}
 
 	fillCtx := context.WithoutCancel(ctx)
@@ -622,8 +628,8 @@ func (c *cacheSvc) getTransformed(ctx context.Context, target *proxy_svc.Target,
 	if err != nil {
 		return nil, nil, err
 	}
-	if meta.StatusCode == http.StatusNotFound || meta.StatusCode == http.StatusGone || meta.StatusCode >= 400 {
-		return body, meta, nil
+	if meta.StatusCode >= 400 {
+		return body, stampPassthroughMiss(meta, attribution), nil
 	}
 	if meta.StatusCode != http.StatusOK {
 		_ = body.Close()
@@ -681,7 +687,11 @@ func (c *cacheSvc) getTransformed(ctx context.Context, target *proxy_svc.Target,
 			logger.Ctx(ctx).Warn("写转换后缓存失败", zap.String("key", key), zap.Error(err))
 		}
 	}
-	return transformedResponse(target, result.Body, outMeta, cacheStatusMiss)
+	body, responseMeta, err := transformedResponse(target, result.Body, outMeta, cacheStatusMiss)
+	if err != nil {
+		return nil, nil, err
+	}
+	return body, attribution.stamp(responseMeta), nil
 }
 
 func (c *cacheSvc) beginTransform(key string) (<-chan struct{}, bool) {

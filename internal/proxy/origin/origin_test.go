@@ -97,6 +97,40 @@ func TestDo_DoesNotForwardClientCredentials(t *testing.T) {
 	})
 }
 
+func TestDo_ForwardsColdPreconditionsWithoutClientCredentials(t *testing.T) {
+	convey.Convey("冷缓存前置条件转发给上游但客户端凭据不外泄", t, func() {
+		var got http.Header
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			got = r.Header.Clone()
+			if r.Header.Get("If-Match") == `"current"` &&
+				r.Header.Get("If-Unmodified-Since") == "Wed, 21 Oct 2015 07:28:00 GMT" {
+				w.WriteHeader(http.StatusPreconditionFailed)
+			}
+		}))
+		defer srv.Close()
+
+		clientHeader := http.Header{}
+		clientHeader.Set("If-Match", `"current"`)
+		clientHeader.Set("If-Unmodified-Since", "Wed, 21 Oct 2015 07:28:00 GMT")
+		clientHeader.Set("Authorization", "Basic c2VjcmV0")
+		clientHeader.Set("Proxy-Authorization", "Basic c2VjcmV0")
+		clientHeader.Set("Cookie", "session=secret")
+
+		resp, err := New().Do(context.Background(), &Request{
+			Method: http.MethodGet, Origin: srv.URL, Path: "/x", Header: clientHeader,
+			Requirement: configuredGenericOrigin,
+		})
+		convey.So(err, convey.ShouldBeNil)
+		defer resp.Body.Close()
+		convey.So(resp.StatusCode, convey.ShouldEqual, http.StatusPreconditionFailed)
+		convey.So(got.Get("If-Match"), convey.ShouldEqual, `"current"`)
+		convey.So(got.Get("If-Unmodified-Since"), convey.ShouldEqual, "Wed, 21 Oct 2015 07:28:00 GMT")
+		convey.So(got.Get("Authorization"), convey.ShouldBeEmpty)
+		convey.So(got.Get("Proxy-Authorization"), convey.ShouldBeEmpty)
+		convey.So(got.Get("Cookie"), convey.ShouldBeEmpty)
+	})
+}
+
 // TestDo_FollowsSameHostRedirect
 //
 // 同一主机内的安全重定向由 katch 自己跟随；否则客户端在受限网络下仍会被迫直连源站。

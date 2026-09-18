@@ -88,11 +88,12 @@ func (composerProfile) Transform(
 	}
 
 	var body []byte
+	sourcePath := request.Source.Path
 	switch {
-	case request.Source.Path == "/packages.json":
-		body, err = rewriteComposerRoot(ctx, request.Body, request.RewriteURL)
-	case strings.HasPrefix(request.Source.Path, "/p2/") && strings.HasSuffix(request.Source.Path, ".json"):
-		body, err = rewriteComposerPackages(ctx, request.Body, request.RewriteURL)
+	case strings.HasSuffix(sourcePath, "/packages.json"):
+		body, err = rewriteComposerRoot(ctx, request.Body, request.Source, request.RewriteURL)
+	case strings.Contains(sourcePath, "/p2/") && strings.HasSuffix(sourcePath, ".json"):
+		body, err = rewriteComposerPackages(ctx, request.Body, request.Source, request.RewriteURL)
 	default:
 		return nil, packageprofile.ErrInvalidMetadata
 	}
@@ -124,6 +125,7 @@ func (composerProfile) Guidance() packageprofile.Guidance {
 func rewriteComposerRoot(
 	ctx context.Context,
 	body []byte,
+	source *url.URL,
 	rewrite packageprofile.RewriteURL,
 ) ([]byte, error) {
 	var document map[string]json.RawMessage
@@ -134,7 +136,7 @@ func rewriteComposerRoot(
 	if err := json.Unmarshal(document["metadata-url"], &metadataURL); err != nil {
 		return nil, packageprofile.ErrInvalidMetadata
 	}
-	rewritten, err := rewriteComposerTemplate(ctx, metadataURL, rewrite)
+	rewritten, err := rewriteComposerTemplate(ctx, metadataURL, source, rewrite)
 	if err != nil {
 		return nil, err
 	}
@@ -148,14 +150,17 @@ func rewriteComposerRoot(
 func rewriteComposerTemplate(
 	ctx context.Context,
 	template string,
+	source *url.URL,
 	rewrite packageprofile.RewriteURL,
 ) (string, error) {
 	if strings.Count(template, composerPackageToken) != 1 || strings.Contains(template, composerPackagePlaceholder) {
 		return "", packageprofile.ErrInvalidMetadata
 	}
-	parsed, err := url.Parse(strings.Replace(template, composerPackageToken, composerPackagePlaceholder, 1))
-	if err != nil || parsed.Hostname() == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-		return "", packageprofile.ErrInvalidMetadata
+	parsed, err := resolveComposerURL(
+		strings.Replace(template, composerPackageToken, composerPackagePlaceholder, 1), source,
+	)
+	if err != nil {
+		return "", err
 	}
 	rewritten, err := rewrite(ctx, parsed, composerCompanion(
 		parsed.Hostname(), upstream_entity.PackageProfileComposer,
@@ -176,6 +181,7 @@ func rewriteComposerTemplate(
 func rewriteComposerPackages(
 	ctx context.Context,
 	body []byte,
+	source *url.URL,
 	rewrite packageprofile.RewriteURL,
 ) ([]byte, error) {
 	var document map[string]json.RawMessage
@@ -188,7 +194,7 @@ func rewriteComposerPackages(
 	}
 	for name, versions := range packages {
 		for index, version := range versions {
-			rewritten, err := rewriteComposerVersion(ctx, version, rewrite)
+			rewritten, err := rewriteComposerVersion(ctx, version, source, rewrite)
 			if err != nil {
 				return nil, err
 			}
@@ -207,6 +213,7 @@ func rewriteComposerPackages(
 func rewriteComposerVersion(
 	ctx context.Context,
 	body json.RawMessage,
+	source *url.URL,
 	rewrite packageprofile.RewriteURL,
 ) (json.RawMessage, error) {
 	var version map[string]json.RawMessage
@@ -229,9 +236,9 @@ func rewriteComposerVersion(
 	if err := json.Unmarshal(urlBody, &rawURL); err != nil {
 		return nil, packageprofile.ErrInvalidMetadata
 	}
-	parsed, err := url.Parse(rawURL)
-	if err != nil || parsed.Hostname() == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-		return nil, packageprofile.ErrInvalidMetadata
+	parsed, err := resolveComposerURL(rawURL, source)
+	if err != nil {
+		return nil, err
 	}
 	rewritten, err := rewrite(ctx, parsed, composerCompanion(
 		parsed.Hostname(), upstream_entity.PackageProfileComposer,
@@ -254,6 +261,27 @@ func rewriteComposerVersion(
 		return nil, fmt.Errorf("marshal composer dist: %w", err)
 	}
 	return json.Marshal(version)
+}
+
+func resolveComposerURL(raw string, source *url.URL) (*url.URL, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, packageprofile.ErrInvalidMetadata
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return nil, packageprofile.ErrInvalidMetadata
+	}
+	if !parsed.IsAbs() {
+		if source == nil {
+			return nil, packageprofile.ErrInvalidMetadata
+		}
+		parsed = source.ResolveReference(parsed)
+	}
+	if parsed.User != nil || parsed.Hostname() == "" ||
+		(parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return nil, packageprofile.ErrInvalidMetadata
+	}
+	return parsed, nil
 }
 
 func composerCompanion(

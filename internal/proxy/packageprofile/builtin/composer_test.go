@@ -146,6 +146,126 @@ func TestComposerProfileRewritesOnlyDistURLAndPreservesPackageData(t *testing.T)
 	assertComposerEqual(t, "application/json", result.ContentType)
 }
 
+func TestComposerProfileResolvesRelativeRootTemplateAgainstFinalSource(t *testing.T) {
+	profile := composerProfile{}
+	body := []byte(`{
+		"packages":[],
+		"metadata-url":"./p2/%package%.json?format=full",
+		"notify-batch":"../downloads/"
+	}`)
+	result, err := profile.Transform(context.Background(), packageprofile.TransformRequest{
+		Body:        body,
+		ContentType: "application/json",
+		Source:      mustComposerURL(t, "https://repo.packagist.org/mirror/composer/packages.json"),
+		SiteBaseURL: "https://mirror.example",
+		RewriteURL: composerTestResolver("https://mirror.example", map[string]packageprofile.Companion{
+			"repo.packagist.org": {
+				Host:      "repo.packagist.org",
+				Profile:   upstream_entity.PackageProfileComposer,
+				Transport: upstream_entity.ProtocolStatic,
+			},
+		}),
+	})
+	requireComposerNoError(t, err)
+
+	var got map[string]any
+	requireComposerNoError(t, json.Unmarshal(result.Body, &got))
+	assertComposerEqual(t,
+		"https://mirror.example/repo.packagist.org/mirror/composer/p2/%package%.json?format=full",
+		got["metadata-url"])
+	assertComposerEqual(t, "../downloads/", got["notify-batch"])
+	assertComposerTrue(t, !strings.Contains(string(result.Body), "%25package%"))
+}
+
+func TestComposerProfileResolvesRelativeDistAgainstFinalSourceOnly(t *testing.T) {
+	profile := composerProfile{}
+	body := []byte(`{"packages":{"acme/widget":[{
+		"name":"acme/widget",
+		"version":"1.2.3",
+		"homepage":"../project",
+		"license":["MIT"],
+		"support":{"issues":"../issues"},
+		"dist":{"type":"zip","url":"../../dist/widget.zip?download=1","reference":"abc","shasum":"def"}
+	}]}}`)
+	result, err := profile.Transform(context.Background(), packageprofile.TransformRequest{
+		Body:        body,
+		ContentType: "application/json",
+		Source:      mustComposerURL(t, "https://repo.packagist.org/mirror/composer/p2/acme/widget.json"),
+		SiteBaseURL: "https://mirror.example",
+		RewriteURL: composerTestResolver("https://mirror.example", map[string]packageprofile.Companion{
+			"repo.packagist.org": {
+				Host:      "repo.packagist.org",
+				Profile:   upstream_entity.PackageProfileComposer,
+				Transport: upstream_entity.ProtocolStatic,
+			},
+		}),
+	})
+	requireComposerNoError(t, err)
+
+	var got map[string]any
+	requireComposerNoError(t, json.Unmarshal(result.Body, &got))
+	version := composerVersion(t, got)
+	dist := version["dist"].(map[string]any)
+	assertComposerEqual(t,
+		"https://mirror.example/repo.packagist.org/mirror/composer/dist/widget.zip?download=1",
+		dist["url"])
+	assertComposerEqual(t, "abc", dist["reference"])
+	assertComposerEqual(t, "def", dist["shasum"])
+	assertComposerEqual(t, "../project", version["homepage"])
+	assertComposerEqual(t, []any{"MIT"}, version["license"])
+	assertComposerEqual(t, map[string]any{"issues": "../issues"}, version["support"])
+}
+
+func TestComposerProfileRejectsUnsafeResolvedURLs(t *testing.T) {
+	profile := composerProfile{}
+	registered := map[string]packageprofile.Companion{
+		"repo.packagist.org": {
+			Host:      "repo.packagist.org",
+			Profile:   upstream_entity.PackageProfileComposer,
+			Transport: upstream_entity.ProtocolStatic,
+		},
+	}
+	for _, tc := range []struct {
+		name   string
+		body   string
+		source string
+	}{
+		{
+			name:   "metadata template userinfo",
+			body:   `{"packages":[],"metadata-url":"https://user@repo.packagist.org/p2/%package%.json"}`,
+			source: "https://repo.packagist.org/packages.json",
+		},
+		{
+			name:   "metadata template non HTTP scheme",
+			body:   `{"packages":[],"metadata-url":"ftp://repo.packagist.org/p2/%package%.json"}`,
+			source: "https://repo.packagist.org/packages.json",
+		},
+		{
+			name:   "dist userinfo",
+			body:   `{"packages":{"acme/widget":[{"dist":{"url":"https://user@repo.packagist.org/dist/widget.zip"}}]}}`,
+			source: "https://repo.packagist.org/p2/acme/widget.json",
+		},
+		{
+			name:   "dist non HTTP scheme",
+			body:   `{"packages":{"acme/widget":[{"dist":{"url":"ftp://repo.packagist.org/dist/widget.zip"}}]}}`,
+			source: "https://repo.packagist.org/p2/acme/widget.json",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := profile.Transform(context.Background(), packageprofile.TransformRequest{
+				Body:        []byte(tc.body),
+				ContentType: "application/json",
+				Source:      mustComposerURL(t, tc.source),
+				SiteBaseURL: "https://mirror.example",
+				RewriteURL:  composerTestResolver("https://mirror.example", registered),
+			})
+			if !errors.Is(err, packageprofile.ErrInvalidMetadata) {
+				t.Fatalf("Transform() error = %v, want ErrInvalidMetadata", err)
+			}
+		})
+	}
+}
+
 func TestComposerProfileFailsClosedOnCompanionProfileMismatch(t *testing.T) {
 	profile := composerProfile{}
 	tests := []struct {
