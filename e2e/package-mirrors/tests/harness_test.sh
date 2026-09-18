@@ -1062,7 +1062,26 @@ for registry_client in docker podman; do
     fail "$registry_client registry case accepts a digest without the sha256 algorithm"
   printf '%s\n' "$registry_commands" | grep -F "^sha256:[a-f0-9]{64}$" >/dev/null ||
     fail "$registry_client registry case does not require exact sha256 evidence"
+  for resolver_contract in \
+    'artifact_katch_ip=$(awk -v host="$KATCH_HOST"' \
+    '"$KATCH_ARTIFACTS/hosts")' \
+    'missing exact static Katch hosts evidence' \
+    'test -s "$KATCH_ARTIFACTS/resolv.conf.before"' \
+    'test -s "$KATCH_ARTIFACTS/hosts"' \
+    'nameserver 127.0.0.1' \
+    'options timeout:1 attempts:1' \
+    'cmp -s "$KATCH_ARTIFACTS/resolv.conf.after" /etc/resolv.conf'; do
+    printf '%s\n' "$registry_commands" | grep -F -- "$resolver_contract" >/dev/null ||
+      fail "$registry_client registry case lacks resolver evidence contract: $resolver_contract"
+  done
 done
+
+if awk '
+  /^(iptables|ip6tables)[[:space:]]/ && /-j[[:space:]]+ACCEPT/ && /(^|[^0-9])53([^0-9]|$)/ { found = 1 }
+  END { exit found ? 0 : 1 }
+' "$ENTRYPOINT"; then
+  fail "entrypoint allows DNS through the firewall"
+fi
 
 [ "$(find "$CASES" -maxdepth 1 -type f -name '*.yaml' -exec jq -r 'select(.privileged == true) | .name' {} + | LC_ALL=C sort)" = "$(printf '%s\n' docker-registry-regression podman-registry-regression)" ] ||
   fail "only Docker and Podman registry cases may opt into privileged containers"
@@ -1247,6 +1266,26 @@ if KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/dns-l
   fail "external DNS attempt was accepted"
 fi
 grep -q '8.8.8.8' "$workdir/out" || fail "external DNS attempt was not reported"
+
+cat > "$workdir/nested-dns-probe.log" <<'EOF'
+138 connect(3, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("172.17.0.1")}, 16) = 0
+EOF
+if KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/nested-dns-probe.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "successful nested daemon DNS probe outside loopback was accepted"
+fi
+grep -q '172.17.0.1' "$workdir/out" || fail "nested daemon DNS probe was not reported"
+
+resolver_file=$workdir/resolv.conf
+resolver_evidence=$workdir/resolver-evidence
+printf '%s\n' 'nameserver 172.17.0.1' 'search container.invalid' > "$resolver_file"
+"$ENTRYPOINT" --install-loopback-resolver "$resolver_file" "$resolver_evidence"
+expected_loopback_resolver=$(printf '%s\n' 'nameserver 127.0.0.1' 'options timeout:1 attempts:1')
+[ "$(cat "$resolver_file")" = "$expected_loopback_resolver" ] ||
+  fail "loopback resolver helper did not install the bounded resolver configuration"
+[ "$(cat "$resolver_evidence/resolv.conf.before")" = "$(printf '%s\n' 'nameserver 172.17.0.1' 'search container.invalid')" ] ||
+  fail "loopback resolver helper did not preserve the original resolver evidence"
+[ "$(cat "$resolver_evidence/resolv.conf.after")" = "$expected_loopback_resolver" ] ||
+  fail "loopback resolver helper did not preserve the active resolver evidence"
 
 hosts_file=$workdir/hosts
 cat > "$hosts_file" <<'EOF'
@@ -1577,6 +1616,9 @@ fi
 if grep -Fx 'ARG=--privileged' "$workdir/runtime.log"; then
   fail "standard cases unexpectedly run privileged"
 fi
+if grep -Fx 'ARG=KATCH_LOOPBACK_RESOLVER=1' "$workdir/runtime.log"; then
+  fail "standard cases unexpectedly enable the loopback resolver"
+fi
 
 : > "$workdir/runtime.log"
 printf '%s\n' 0 > "$workdir/metric-state"
@@ -1587,6 +1629,8 @@ env PATH="$harness_bin:$PATH" RUNTIME_LOG="$workdir/runtime.log" METRIC_STATE="$
   "$HARNESS" "$privileged_harness_case" >"$workdir/out" 2>&1
 [ "$(grep -Fxc 'ARG=--privileged' "$workdir/runtime.log")" -eq 2 ] ||
   fail "privileged cases do not pass --privileged in both phases"
+[ "$(grep -Fxc 'ARG=KATCH_LOOPBACK_RESOLVER=1' "$workdir/runtime.log")" -eq 2 ] ||
+  fail "privileged cases do not require the loopback resolver in both phases"
 if grep -E '^ARG=(--security-opt|no-new-privileges|--cap-add|NET_ADMIN|NET_RAW)$' "$workdir/runtime.log"; then
   fail "privileged cases retain incompatible standard isolation flags"
 fi

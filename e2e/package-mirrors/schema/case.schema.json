@@ -17,7 +17,8 @@
     },
     "privileged": {
       "type": "boolean",
-      "default": false
+      "default": false,
+      "description": "Run the pinned registry client with full container privileges and force its resolver to bounded loopback-only DNS."
     },
     "setup": {"type": "string", "minLength": 1},
     "run": {"type": "string", "minLength": 1},

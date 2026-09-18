@@ -142,7 +142,8 @@ run_phase() {
 
   set -- "$RUNTIME" run --rm
   if [ "$privileged" = true ]; then
-    set -- "$@" --privileged
+    set -- "$@" --privileged \
+      --env KATCH_LOOPBACK_RESOLVER=1
   else
     set -- "$@" \
       --cap-add NET_ADMIN --cap-add NET_RAW \

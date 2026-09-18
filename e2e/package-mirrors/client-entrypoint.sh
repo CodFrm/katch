@@ -105,6 +105,28 @@ install_host_mapping() {
   }
 }
 
+install_loopback_resolver() {
+  resolver_file=$1
+  evidence_dir=$2
+  [ -f "$resolver_file" ] && [ -r "$resolver_file" ] || {
+    printf '%s\n' "resolver config is not a readable regular file: $resolver_file" >&2
+    return 66
+  }
+  mkdir -p "$evidence_dir"
+  cat "$resolver_file" > "$evidence_dir/resolv.conf.before"
+  if ! printf '%s\n' 'nameserver 127.0.0.1' 'options timeout:1 attempts:1' > "$resolver_file"; then
+    printf '%s\n' "failed to install loopback resolver config: $resolver_file" >&2
+    return 73
+  fi
+  cat "$resolver_file" > "$evidence_dir/resolv.conf.after"
+}
+
+if [ "${1:-}" = "--install-loopback-resolver" ]; then
+  [ "$#" -eq 3 ] || exit 64
+  install_loopback_resolver "$2" "$3"
+  exit
+fi
+
 if [ "${1:-}" = "--install-host-mapping" ]; then
   [ "$#" -eq 4 ] || exit 64
   install_host_mapping "$2" "$3" "$4"
@@ -121,6 +143,14 @@ fi
 : "${KATCH_PORT:?KATCH_PORT is required}"
 : "${KATCH_ARTIFACTS:?KATCH_ARTIFACTS is required}"
 : "${KATCH_CLIENT_USER:=client}"
+: "${KATCH_LOOPBACK_RESOLVER:=0}"
+case $KATCH_LOOPBACK_RESOLVER in
+  0|1) ;;
+  *)
+    printf '%s\n' "KATCH_LOOPBACK_RESOLVER must be 0 or 1" >&2
+    exit 64
+    ;;
+esac
 
 [ "$(id -u)" -eq 0 ] || {
   printf '%s\n' "client entrypoint requires container root for trust and firewall setup" >&2
@@ -206,6 +236,10 @@ esac
 install_host_mapping /etc/hosts "$KATCH_HOST" "$katch_ip"
 
 mkdir -p "$KATCH_ARTIFACTS"
+if [ "$KATCH_LOOPBACK_RESOLVER" -eq 1 ]; then
+  cat /etc/hosts > "$KATCH_ARTIFACTS/hosts"
+  install_loopback_resolver /etc/resolv.conf "$KATCH_ARTIFACTS"
+fi
 connect_log=$KATCH_ARTIFACTS/connect.log
 firewall_before_v4=$KATCH_ARTIFACTS/iptables.before
 firewall_before_v6=$KATCH_ARTIFACTS/ip6tables.before
