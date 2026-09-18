@@ -1112,6 +1112,7 @@ printf '%s\n' "$docker_registry_commands" | grep -F "[ \"\$(cat results/version)
 printf '%s\n' "$docker_registry_commands" | grep -F 'docker run --rm --network none --dns 127.0.0.1 --entrypoint ./podinfo "$image_ref" --version' >/dev/null ||
   fail "Docker registry nested run does not combine network isolation with loopback DNS"
 
+podman_registry_assert=$(jq -r '.assert' "$CASES/podman-registry-regression.yaml")
 podman_registry_commands=$(jq -r '[.setup, .run, .assert] | join("\n")' "$CASES/podman-registry-regression.yaml")
 for contract in \
   '--root "$PWD/podman-root"' \
@@ -1126,6 +1127,11 @@ printf '%s\n' "$podman_registry_commands" | grep -F "[ \"\$(cat results/version)
   fail "Podman registry case does not require podinfo 6.9.1"
 printf '%s\n' "$podman_registry_commands" | grep -F 'podman_client run --rm --network none --entrypoint ./podinfo "$image_ref" --version' >/dev/null ||
   fail "Podman registry nested run does not retain network isolation without DNS options"
+if printf '%s\n' "$podman_registry_assert" | grep -F 'image_ref' >/dev/null; then
+  fail "Podman registry assert references run-local image_ref"
+fi
+printf '%s\n' "$podman_registry_assert" | grep -Fx 'expected_repo_name="${KATCH_HOST}:${KATCH_PORT}/ghcr.io/stefanprodan/podinfo"' >/dev/null ||
+  fail "Podman registry assert does not reconstruct the exact expected repository name"
 if printf '%s\n' "$podman_registry_commands" | grep -F -- '--dns' >/dev/null; then
   fail "Podman registry case configures DNS despite network mode none"
 fi
