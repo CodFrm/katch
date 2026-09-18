@@ -271,8 +271,15 @@ func (s *settingSvc) current(ctx context.Context, def *settingDef) (json.RawMess
 	}
 	value, err := def.normalize(json.RawMessage(row.Value))
 	if err != nil {
-		logger.Ctx(ctx).Warn("设置项的值读不懂，按默认值处理",
-			zap.String("key", def.Key), zap.String("value", row.Value), zap.Error(err))
+		fields := []zap.Field{zap.String("key", def.Key), zap.Error(err)}
+		if def.Canonical == nil {
+			// 需要规范化的字符串项正是可能带着结构的那一类——site_domain 被拒的
+			// 头号原因就是它带了用户名密码。校验把凭据挡在公开页面外面，读不懂时
+			// 再把原值抄进日志，只是换个地方泄漏（可观测性：不记完整凭据）。
+			// 其余项的值是整数、布尔或一段短文本，记下来才看得出坏在哪。
+			fields = append(fields, zap.String("value", row.Value))
+		}
+		logger.Ctx(ctx).Warn("设置项的值读不懂，按默认值处理", fields...)
 		return def.Default, nil
 	}
 	return value, nil

@@ -2,10 +2,6 @@ package proxy_svc
 
 import (
 	"context"
-	"strings"
-
-	"github.com/cago-frame/cago/pkg/logger"
-	"go.uber.org/zap"
 
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
 	"github.com/CodFrm/katch/internal/repository/upstream_repo"
@@ -42,16 +38,10 @@ func (s *rewriteConfigSource) Snapshot(ctx context.Context) (*RewriteSnapshot, e
 	if err != nil {
 		return nil, err
 	}
-	base := setting_svc.SiteBaseURL(stored.SiteDomain)
-	if base == "" && strings.TrimSpace(stored.SiteDomain) != "" {
-		// 拼不出可用地址的值一路失败下去都是「还没配站点地址」，那条路上谁也
-		// 不会再提这个值一次；不在这里把它念出来，运维就只能看着一个说没配、
-		// 库里却写着东西的设置项。
-		logger.Ctx(ctx).Warn("站点地址不是一个可用的地址，本次按未配置处理",
-			zap.String("site_domain", stored.SiteDomain))
-	}
+	// 坏值在这里就是「还没配」：这个快照每次回源都取一遍，不适合在这条路上
+	// 说话——真正念出原因的是设置服务读到坏值那一次（setting_svc.current）。
 	out := &RewriteSnapshot{
-		SiteBaseURL: base,
+		SiteBaseURL: setting_svc.SiteBaseURL(stored.SiteDomain),
 		Generation:  stored.Generation,
 		Upstreams:   make(map[string]RewriteUpstream, len(stored.Upstreams)),
 	}

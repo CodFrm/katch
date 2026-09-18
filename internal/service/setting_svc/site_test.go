@@ -4,8 +4,12 @@ import (
 	"context"
 	"testing"
 
+	"github.com/cago-frame/cago/pkg/logger"
 	"github.com/smartystreets/goconvey/convey"
 	"go.uber.org/mock/gomock"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/CodFrm/katch/internal/model/entity/setting_entity"
 	"github.com/CodFrm/katch/internal/repository/setting_repo"
@@ -47,5 +51,40 @@ func TestSiteBaseURLRefusesUnusableDomains(t *testing.T) {
 		convey.So(SiteBaseURL("mirror.example"), convey.ShouldEqual, "https://mirror.example")
 		convey.So(SiteBaseURL("HTTP://mirror.example/katch/"),
 			convey.ShouldEqual, "http://mirror.example/katch")
+	})
+}
+
+// TestBaseURLDoesNotLogRejectedCredentials
+//
+// 被拒的 site_domain 恰恰是可能带着用户名密码的那一类值——校验拒绝它就是为了
+// 不让凭据流到公开页面上去，读不懂时再把原值抄进日志，等于换了个地方泄漏
+// （可观测性：不要记完整的凭据）。日志只说原因。
+func TestBaseURLDoesNotLogRejectedCredentials(t *testing.T) {
+	convey.Convey("库里带凭据的旧值退回空串，且不进日志", t, func() {
+		core, logs := observer.New(zapcore.WarnLevel)
+		logger.SetLogger(zap.New(core))
+		t.Cleanup(func() { logger.SetLogger(zap.NewNop()) })
+
+		repo := newMemorySettingRepo()
+		setting_repo.RegisterSetting(repo)
+		ctx := context.Background()
+		convey.So(repo.Save(ctx, &setting_entity.Setting{
+			Key: SiteDomainSetting, Value: `"https://operator:password@mirror.example"`,
+		}), convey.ShouldBeNil)
+
+		got, err := Setting().BaseURL(ctx)
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(got, convey.ShouldEqual, "")
+
+		entries := logs.All()
+		convey.So(entries, convey.ShouldNotBeEmpty)
+		for _, entry := range entries {
+			line := entry.Message
+			for _, field := range entry.Context {
+				line += " " + field.String
+			}
+			convey.So(line, convey.ShouldNotContainSubstring, "password")
+			convey.So(line, convey.ShouldNotContainSubstring, "operator")
+		}
 	})
 }
