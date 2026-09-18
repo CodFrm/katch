@@ -535,20 +535,28 @@ func TestProxy_SumDBAliasStopsAtRevokedUpstream(t *testing.T) {
 // 通用路径一起劫持掉，"撤销后连通用路径也 503" 看起来像更安全的行为，实际是
 // 把一条合法的 static 上游连带关掉。
 func TestProxy_GenericStaticHostOutlivesTheSumDBAlias(t *testing.T) {
-	const generic = "/sum.golang.org/lookup/example.com/mod@v1.0.0"
 	fixture := newSumDBFixture(t, upstream_entity.PatternList{"/lookup/"})
-	fixture.warm(t, generic, true)
+	fixture.warm(t, "/sum.golang.org/lookup/example.com/mod@v1.0.0", true)
 
 	fixture.save(t, func(u *upstream_entity.Upstream) {
 		u.PackageProfile = upstream_entity.PackageProfileNone
 	})
 
-	after := cacheRequest(t, http.MethodGet, generic, nil)
-	if after.Code != http.StatusOK || after.Body.String() != "checksum-record" {
-		t.Fatalf("generic GET after revoke = %d, body %q; want 200 checksum-record",
-			after.Code, after.Body.String())
+	// 换一条没被缓存过的路径：暖对象由磁盘直接应答，压根到不了桥那一层，
+	// 拿它断言「桥没有劫持通用路径」等于什么都没断言。冷的这一次必须真的
+	// 回源，回源次数是唯一能证明它走完整条链路的东西。
+	cold := cacheRequest(t, http.MethodGet, "/sum.golang.org/lookup/example.com/other@v2.0.0", nil)
+	if cold.Code != http.StatusOK || cold.Body.String() != "checksum-record" {
+		t.Fatalf("cold generic GET after revoke = %d, body %q; want 200 checksum-record",
+			cold.Code, cold.Body.String())
 	}
-	fixture.mustBeUnavailable(t, "/sumdb/sum.golang.org/lookup/example.com/mod@v1.0.0", fixture.hits.Load())
+	if cold.Header().Get("X-Katch-Cache") == "HIT" {
+		t.Fatal("cold generic GET 本该未命中")
+	}
+	if got := fixture.hits.Load(); got != 2 {
+		t.Fatalf("origin hits = %d, want 2（暖那一次 + 这一次冷的）", got)
+	}
+	fixture.mustBeUnavailable(t, "/sumdb/sum.golang.org/lookup/example.com/mod@v1.0.0", 2)
 }
 
 func TestProxy_WarmHitRechecksCurrentTransport(t *testing.T) {

@@ -65,3 +65,22 @@ func TestRewriteConfigSourceSnapshot(t *testing.T) {
 			convey.ShouldEqual, upstream_entity.PackageProfileNone)
 	})
 }
+
+// TestRewriteConfigSourceRejectsUnusableSiteDomain
+//
+// 改写快照自己从库里读原始的 site_domain，不经过设置服务。库里一行拼不出可用
+// 地址的旧值，若在这里被原样接受，会一路拼进改写出去的 metadata——而设置页上
+// 这一项此刻已经显示成「没配」，运维连是谁在作怪都看不见。
+func TestRewriteConfigSourceRejectsUnusableSiteDomain(t *testing.T) {
+	convey.Convey("库里坏掉的 site_domain 在快照里就是没配", t, func() {
+		repo := mock_upstream_repo.NewMockRewriteConfigRepo(gomock.NewController(t))
+		upstream_repo.RegisterRewriteConfig(repo)
+		repo.EXPECT().Snapshot(gomock.Any()).Return(&upstream_repo.RewriteConfigSnapshot{
+			SiteDomain: "https://mirror.example?x=1",
+		}, nil)
+
+		got, err := NewRewriteConfigSource().Snapshot(context.Background())
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(got.SiteBaseURL, convey.ShouldEqual, "")
+	})
+}

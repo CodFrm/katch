@@ -43,7 +43,6 @@ const (
 	KindInvalid
 )
 
-// String 让表驱动用例的失败信息可读。
 // IsPull 这一类请求是不是一次上游拉取。
 //
 // 三处要按同一条判据分流：访问规则只约束拉取、拉取指标只数拉取、web 只把拉取交给
@@ -58,6 +57,7 @@ func IsPull(kind Kind) bool {
 	}
 }
 
+// String 让表驱动用例的失败信息可读。
 func (k Kind) String() string {
 	switch k {
 	case KindSPA:

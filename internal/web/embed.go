@@ -137,21 +137,21 @@ func newNoRouteHandlerFS(sub fs.FS) gin.HandlerFunc {
 // 以及将来任何一条真实路由抢同一段前缀，而 NoRoute 天然是「所有已注册路由都没
 // 命中之后」，顺序问题不存在。
 func serveUpstream(c *gin.Context, kind dispatch.Kind, host, rest string) bool {
-	switch kind {
-	case dispatch.KindRegistryPing:
+	switch {
+	case kind == dispatch.KindRegistryPing:
 		// registry 客户端拿这个探测「对面是不是一个 v2 registry」，它固定发在
 		// /v2/ 上、不带上游主机名，所以不查白名单也无从查起。
 		c.Header("Docker-Distribution-Api-Version", "registry/2.0")
 		c.Data(http.StatusOK, "application/json; charset=utf-8", []byte("{}"))
 		return true
-	case dispatch.KindInvalid:
+	case kind == dispatch.KindInvalid:
 		// 拿不出主机名或带着回溯段的请求，和主机不在白名单里一样 404。
 		c.AbortWithStatus(http.StatusNotFound)
 		return true
-	case dispatch.KindRegistry, dispatch.KindStatic, dispatch.KindSumDB:
+	case dispatch.IsPull(kind):
 		serveProxy(c, kind, host, rest)
 		return true
-	case dispatch.KindSPA, dispatch.KindSelf:
+	case kind == dispatch.KindSPA, kind == dispatch.KindSelf:
 		return false
 	}
 	return false

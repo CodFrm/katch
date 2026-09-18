@@ -128,6 +128,29 @@ func TestRecorder_SumDBAliasPullsAreCounted(t *testing.T) {
 	})
 }
 
+// TestRecorder_SumDBAliasIsNeverGit
+//
+// git 端点寄生在 static 的路径空间里，所以只有 static 会按路径形态认 git
+// （web/embed.go 里的同一条判据）。sumdb 的保留命名空间下不存在 git 端点：
+// 拿它当 git 记，等于任何人都能拼一个 /sumdb/... 的路径往 git 那一维里灌数。
+func TestRecorder_SumDBAliasIsNeverGit(t *testing.T) {
+	convey.Convey("sumdb 别名下形如 git 的路径仍记成 static", t, func() {
+		reg := prometheus.NewRegistry()
+		rec := New(Options{Registerer: reg})
+		hooks := Hooks{Lookup: knownUpstreams("sum.golang.org")}
+		miss := &upstreamResponse{status: http.StatusOK, cache: "MISS",
+			miss: string(MissFirst), body: "checksum"}
+
+		get(newTestEngine(rec, hooks, miss),
+			"/sumdb/sum.golang.org/lookup/example.com/info/refs?service=git-upload-pack")
+
+		body := scrape(reg)
+		convey.So(body, convey.ShouldContainSubstring,
+			`katch_requests_total{kind="static",result="miss",upstream="sum.golang.org"} 1`)
+		convey.So(body, convey.ShouldNotContainSubstring, `kind="git"`)
+	})
+}
+
 func TestRecorder_DeniedAndUnknownHost(t *testing.T) {
 	convey.Convey("白名单之外的主机计成 denied，且不把主机名变成新的标签值", t, func() {
 		reg := prometheus.NewRegistry()

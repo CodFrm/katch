@@ -671,7 +671,10 @@ func kindLabel(kind dispatch.Kind, git dispatch.GitEndpoint) string {
 	switch {
 	case kind == dispatch.KindRegistry:
 		return "registry"
-	case git.IsGit():
+	// 只有 static 认 git，和服务侧同一条判据（web.serveProxy）：git 的端点只寄生
+	// 在 static 的路径空间里。放开到别的 Kind，任何人都能拼一条 /sumdb/... 的
+	// 路径，让它在服务侧按 sumdb 走、却在这里记进 git 那一维。
+	case kind == dispatch.KindStatic && git.IsGit():
 		return "git"
 	default:
 		return "static"
