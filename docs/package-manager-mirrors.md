@@ -93,9 +93,10 @@ lockfile/registry-host 约束、Go 与 Homebrew no-fallback、DNF/YUM 固定 `ba
 | composer-dist | `composer` | 3 / 0 |
 | homebrew-bottle | `homebrew` | 7 / 0 |
 
-共享回归用例还以 5 / 0 的冷暖源站请求完成了真实 Git clone、`git fsck` 和本地镜像应答
-验证。该用例里的 Docker、Podman `version` 只用于记录“不可用”或“daemon 被阻断”的诊断，
-没有执行镜像拉取，**不构成 Docker 或 Podman runtime 验证**。完整现场记录写在忽略目录
+共享链路还有三个各自独立的回归用例，同样在阻断公网下跑真实客户端：Docker 29.2.1
+（11 / 0）与 Podman 5.6.2（9 / 0）各用一套嵌套运行时和全新存储，真实拉取固定的
+podinfo OCI 镜像、校验摘要归属并在 `--network none` 的容器里执行它；Git 用例以 5 / 0
+完成真实 clone、`git fsck` 与本地镜像应答验证。完整现场记录写在忽略目录
 `.dev-kit/runtime/2026-09-16-public-package-mirrors/report.md`。
 
 ## 2026-09-16 真实客户端调研（实现前基线）
