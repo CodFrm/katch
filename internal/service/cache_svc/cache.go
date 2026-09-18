@@ -141,9 +141,10 @@ type CacheSvc interface {
 	// Get 取一个对象：命中由磁盘服务，未命中回源并边转发边写入缓存。
 	// 与 proxy_svc.Fetch 的返回约定一致，上游的 4xx/5xx 是正常返回值。
 	//
-	// HEAD、条件与范围请求也走这里：新鲜完整副本可在本地回答 200/206/304/412/416，
-	// 答不了就完整透传，绝不把 partial 或无实体响应写成完整对象。返回的响应体始终可以
-	// 安全关闭——无实体时是 http.NoBody。
+	// HEAD、条件与范围请求也走这里：新鲜完整副本可在本地回答 200/206/304/412/416。
+	// 普通 registry manifest HEAD 在冷缓存时以同变体的 canonical GET 填充后返回；其余
+	// 答不了的请求完整透传，绝不把 partial 或无实体响应写成完整对象。返回的响应体始终
+	// 可以安全关闭——无实体时是 http.NoBody。
 	Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCloser, *proxy_svc.Meta, error)
 	Put(ctx context.Context, req *PutRequest) error
 	Search(ctx context.Context, req *SearchRequest) (*SearchResponse, error)
@@ -279,6 +280,14 @@ func (c *cacheSvc) Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCl
 	if m == nil {
 		return body, meta, nil
 	}
+	variants := declaredVariants(target, representation)
+	if promotableManifestHead(target) {
+		body, meta, err = c.fetchAndCache(ctx, canonicalMetadataTarget(target), upstream, key, immutable, variants)
+		if err != nil {
+			return nil, nil, err
+		}
+		return drainPromotedHead(body, stampPassthroughMiss(meta, m))
+	}
 	if !writableRequest(target) {
 		body, meta, err = proxy_svc.Proxy().Fetch(ctx, target)
 		if err != nil {
@@ -286,8 +295,7 @@ func (c *cacheSvc) Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCl
 		}
 		return body, stampPassthroughMiss(meta, m), nil
 	}
-	body, meta, err = c.fetchAndCache(ctx, target, upstream, key, immutable,
-		declaredVariants(target, representation))
+	body, meta, err = c.fetchAndCache(ctx, target, upstream, key, immutable, variants)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -382,11 +390,52 @@ func stampPassthroughMiss(meta *proxy_svc.Meta, m *miss) *proxy_svc.Meta {
 	return m.stamp(meta)
 }
 
-// writableRequest 未命中时这次请求能不能写缓存。
+// promotableManifestHead 判断一次 HEAD 是否应该以 canonical GET 填充缓存。
 //
-// 只有不带条件或范围的 GET 才留下一份完整对象：HEAD 没有响应体，条件请求拿到的
+// 只认 registry 协议定义的 tag/digest manifest。blob 即使按摘要寻址也不能走这里：
+// 对一个 layer 的 HEAD 悄悄改成 GET 会把本来只取元数据的请求放大成整层下载。
+// 条件与范围头同样排除，它们要求上游按原请求求值，不能被无条件 GET 替代。
+func promotableManifestHead(target *proxy_svc.Target) bool {
+	if target.Method != http.MethodHead || !isManifestRequest(target.Path) {
+		return false
+	}
+	_, recognized := registryRequestImmutability(target)
+	if !recognized {
+		return false
+	}
+	for _, name := range []string{
+		"Range", "If-Range", "If-Match", "If-Unmodified-Since", "If-None-Match", "If-Modified-Since",
+	} {
+		if target.Header.Get(name) != "" {
+			return false
+		}
+	}
+	return true
+}
+
+// drainPromotedHead 等 canonical GET 完整读完并落盘，再把同一份元数据投影成 HEAD。
+// 读取或关闭失败时不返回一个看似成功的 HEAD：pump 会放弃记录，调用方收到回源错误。
+func drainPromotedHead(body io.ReadCloser, meta *proxy_svc.Meta) (io.ReadCloser, *proxy_svc.Meta, error) {
+	_, readErr := io.Copy(io.Discard, body)
+	closeErr := body.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		return nil, nil, err
+	}
+	header := meta.Header.Clone()
+	if meta.ContentLength >= 0 {
+		header.Set("Content-Length", strconv.FormatInt(meta.ContentLength, 10))
+	}
+	return http.NoBody, &proxy_svc.Meta{
+		StatusCode: meta.StatusCode, Header: header, ContentLength: meta.ContentLength,
+	}, nil
+}
+
+// writableRequest 未命中时这次原请求能不能直接写缓存。
+//
+// 只有不带条件或范围的 GET 才直接留下一份完整对象：HEAD 没有响应体，条件请求拿到的
 // 可能是 304/412，范围请求可能拿到 206。把这种结果当成对象存下来，下一次普通 GET
-// 就会拿到无实体或半截内容。
+// 就会拿到无实体或半截内容。registry manifest HEAD 的 canonical GET 提升在调用本函数
+// 之前单独处理；这里仍然不允许任何 HEAD 响应本身入库。
 func writableRequest(target *proxy_svc.Target) bool {
 	if target.Method != http.MethodGet {
 		return false

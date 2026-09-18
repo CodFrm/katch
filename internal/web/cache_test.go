@@ -252,7 +252,7 @@ func TestProxy_HeadAndConditionalRequestsServedLocally(t *testing.T) {
 // 响应头归为未命中。只靠「没有 HIT」不是「归为 MISS」——运维验证以 X-Katch-Cache
 // 为准，README 也把缺 validator 的那次透传写成 MISS。
 func TestProxy_MissPassthroughCarriesMissHeader(t *testing.T) {
-	convey.Convey("HEAD 无副本与条件请求缺 validator 的透传标 MISS", t, func() {
+	convey.Convey("static HEAD 无副本与条件请求缺 validator 的透传标 MISS", t, func() {
 		srv, hits := countingOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "text/plain")
 			_, _ = io.WriteString(w, "hello world")
@@ -266,7 +266,7 @@ func TestProxy_MissPassthroughCarriesMissHeader(t *testing.T) {
 		withDiskCache(t)
 		const path = "/deb.debian.org/pool/n/nginx.deb"
 
-		// 无副本的 HEAD：真实回源，标 MISS，但不写缓存记录。
+		// 无副本的 static HEAD：真实回源，标 MISS，但不写缓存记录。
 		head := cacheRequest(t, http.MethodHead, path, nil)
 		convey.So(head.Code, convey.ShouldEqual, http.StatusOK)
 		convey.So(head.Header().Get("X-Katch-Cache"), convey.ShouldEqual, "MISS")

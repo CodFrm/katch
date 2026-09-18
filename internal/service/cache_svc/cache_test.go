@@ -349,7 +349,7 @@ func TestGet_UncacheableResponsesArePassThrough(t *testing.T) {
 			convey.So(len(repo.all()), convey.ShouldEqual, 0)
 		})
 
-		convey.Convey("HEAD 不进缓存", func() {
+		convey.Convey("static HEAD 不进缓存", func() {
 			o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Length", "12")
 			})
@@ -569,12 +569,14 @@ func TestGet_HeadServedFromDisk(t *testing.T) {
 	})
 }
 
-// TestGet_HeadWithoutCopyPassesThrough 没有可用副本时 HEAD 继续透传，也不写缓存。
+// TestGet_HeadWithoutCopyPassesThrough 验证没有可用副本时 static HEAD 继续透传，
+// 也不写缓存。
 //
-// HEAD 没有响应体，把它「下」进缓存只会留下一条零字节、却声称自己是一份完整
-// 对象的记录。
+// HEAD 响应本身没有响应体，把它「下」进缓存只会留下一条零字节、却声称自己是一份
+// 完整对象的记录。registry manifest 的冷 HEAD 由专门分支发 canonical GET 填充，
+// 不改变这里守住的 generic/static HEAD 透传行为。
 func TestGet_HeadWithoutCopyPassesThrough(t *testing.T) {
-	convey.Convey("无副本的 HEAD 透传且不创建记录", t, func() {
+	convey.Convey("无副本的 static HEAD 透传且不创建记录", t, func() {
 		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Length", "12")
 		})
