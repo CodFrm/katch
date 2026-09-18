@@ -1101,6 +1101,8 @@ for contract in \
 done
 printf '%s\n' "$docker_registry_commands" | grep -F "[ \"\$(cat results/version)\" = '6.9.2' ]" >/dev/null ||
   fail "Docker registry case does not require podinfo 6.9.2"
+printf '%s\n' "$docker_registry_commands" | grep -F 'docker run --rm --network none --dns 127.0.0.1 --entrypoint ./podinfo "$image_ref" --version' >/dev/null ||
+  fail "Docker registry nested run does not combine network isolation with loopback DNS"
 
 podman_registry_commands=$(jq -r '[.setup, .run, .assert] | join("\n")' "$CASES/podman-registry-regression.yaml")
 for contract in \
@@ -1114,6 +1116,24 @@ for contract in \
 done
 printf '%s\n' "$podman_registry_commands" | grep -F "[ \"\$(cat results/version)\" = '6.9.1' ]" >/dev/null ||
   fail "Podman registry case does not require podinfo 6.9.1"
+printf '%s\n' "$podman_registry_commands" | grep -F 'podman_client run --rm --network none --dns 127.0.0.1 --entrypoint ./podinfo "$image_ref" --version' >/dev/null ||
+  fail "Podman registry nested run does not combine network isolation with loopback DNS"
+for contract in \
+  "--format '{{range .RepoDigests}}{{printf \"%s\\n\" .}}{{end}}'" \
+  'LC_ALL=C sort > results/repo-digests' \
+  'source_index_digest=' \
+  'selected_manifest_digest=' \
+  'assert_sha256 results/source-index-digest' \
+  'assert_sha256 results/selected-manifest-digest' \
+  '[ "$(cat results/source-index-digest)" != "$(cat results/selected-manifest-digest)" ]' \
+  'grep -Fxc "$selected_manifest_reference" results/repo-digests' \
+  'grep -Fxc "$source_index_reference" results/repo-digests'; do
+  printf '%s\n' "$podman_registry_commands" | grep -F -- "$contract" >/dev/null ||
+    fail "Podman registry case lacks multi-digest evidence contract: $contract"
+done
+if printf '%s\n' "$podman_registry_commands" | grep -F '{{index .RepoDigests 0}}' >/dev/null; then
+  fail "Podman registry case still treats RepoDigests index zero as the selected manifest"
+fi
 
 if grep -R -n -E '^[[:space:]]*(docker|podman)[[:space:]].*(-v|--volume)[= ]?/var/run/(docker|podman)\.sock' "$ROOT/e2e/package-mirrors"; then
   fail "harness mounts a host container socket"
