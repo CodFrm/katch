@@ -650,13 +650,45 @@ printf '%s\n' "$npm_run" | grep -Fx '(cd yarn-berry && yarn-berry config set npm
 printf '%s\n' "$npm_run" | grep -Fx '(cd bun && bun install --ignore-scripts --registry "$registry")' >/dev/null ||
   fail "npm mirror case does not run Bun through the configured registry"
 
-pypi_run=$(jq -r '.run' "$CASES/pypi.yaml")
-printf '%s\n' "$pypi_run" | grep -Fx 'pip/.venv/bin/python -m pip install --disable-pip-version-check --no-cache-dir --trusted-host "$KATCH_HOST" --index-url "$index" idna==3.10' >/dev/null ||
-  fail "pip mirror case does not trust HTTP only for the configured Katch host"
-printf '%s\n' "$pypi_run" | grep -Fx 'uv pip install --no-cache --python uv/.venv/bin/python --allow-insecure-host "$KATCH_HOST" --index-url "$index" idna==3.10' >/dev/null ||
-  fail "uv mirror case does not allow HTTP only for the configured Katch host"
-if printf '%s\n' "$pypi_run" | grep -E -- '(^|[[:space:]])(--trusted-host|--allow-insecure-host)(=|[[:space:]])[^[:space:]]*(\*|pypi[.]org|files[.]pythonhosted[.]org)|(^|[[:space:]])(PIP_TRUSTED_HOST|UV_INSECURE_HOST|UV_ALLOW_INSECURE_HOST|PYTHONHTTPSVERIFY|CURL_CA_BUNDLE|REQUESTS_CA_BUNDLE)='; then
-  fail "PyPI mirror case broadens HTTP or TLS trust beyond the configured Katch host"
+pypi_case=$CASES/pypi.yaml
+pypi_run=$(jq -r '.run' "$pypi_case")
+pypi_assert=$(jq -r '.assert' "$pypi_case")
+pypi_commands=$(jq -r '[.setup, .run, .assert] | join("\n")' "$pypi_case")
+pypi_ca_guard='[ "${KATCH_CLIENT_CA_CERT:-}" = /run/katch-test-ca.crt ] || { echo '\''pypi-family requires mounted test CA at /run/katch-test-ca.crt'\'' >&2; exit 69; }'
+pypi_ca_readable='[ -f "$KATCH_CLIENT_CA_CERT" ] && [ -r "$KATCH_CLIENT_CA_CERT" ] || { echo '\''pypi-family test CA is not a readable regular file'\'' >&2; exit 69; }'
+printf '%s\n' "$pypi_run" | grep -Fx "$pypi_ca_guard" >/dev/null ||
+  fail "PyPI mirror case does not require the exact mounted test CA path"
+printf '%s\n' "$pypi_run" | grep -Fx "$pypi_ca_readable" >/dev/null ||
+  fail "PyPI mirror case does not require the mounted test CA to be a readable regular file"
+printf '%s\n' "$pypi_run" | grep -Fx 'pip/.venv/bin/python -m pip install --disable-pip-version-check --no-cache-dir --cert "$KATCH_CLIENT_CA_CERT" --index-url "$index" idna==3.10' >/dev/null ||
+  fail "pip mirror case does not validate TLS with the exact mounted test CA"
+printf '%s\n' "$pypi_run" | grep -Fx 'uv --native-tls pip install --no-cache --python uv/.venv/bin/python --index-url "$index" idna==3.10' >/dev/null ||
+  fail "uv mirror case does not use native TLS trust with the global option in the correct position"
+printf '%s\n' "$pypi_run" | grep -Fx 'poetry source add --priority=primary katch "$index"' >/dev/null ||
+  fail "Poetry mirror case does not use the katch source name"
+printf '%s\n' "$pypi_run" | grep -Fx 'poetry config certificates.katch.cert "$KATCH_CLIENT_CA_CERT"' >/dev/null ||
+  fail "Poetry mirror case does not validate TLS with the exact mounted test CA"
+[ "$(printf '%s\n' "$pypi_commands" | grep -Ec -- '(^|[[:space:]])--cert([=[:space:]]|$)')" -eq 1 ] ||
+  fail "PyPI mirror case has an additional or missing pip certificate option"
+[ "$(printf '%s\n' "$pypi_commands" | grep -Foc -- '--native-tls')" -eq 1 ] ||
+  fail "PyPI mirror case has an additional or missing uv native TLS option"
+[ "$(printf '%s\n' "$pypi_commands" | grep -Ec 'poetry config certificates[.][^[:space:]]+[.]cert([[:space:]]|$)')" -eq 1 ] ||
+  fail "PyPI mirror case has an additional or missing Poetry certificate setting"
+pypi_ca_guard_line=$(printf '%s\n' "$pypi_run" | awk -v expected="$pypi_ca_guard" '$0 == expected { print NR }')
+pypi_pip_line=$(printf '%s\n' "$pypi_run" | awk '$0 == "pip/.venv/bin/python -m pip install --disable-pip-version-check --no-cache-dir --cert \"$KATCH_CLIENT_CA_CERT\" --index-url \"$index\" idna==3.10" { print NR }')
+pypi_uv_line=$(printf '%s\n' "$pypi_run" | awk '$0 == "uv --native-tls pip install --no-cache --python uv/.venv/bin/python --index-url \"$index\" idna==3.10" { print NR }')
+pypi_poetry_cert_line=$(printf '%s\n' "$pypi_run" | awk '$0 == "poetry config certificates.katch.cert \"$KATCH_CLIENT_CA_CERT\"" { print NR }')
+pypi_poetry_install_line=$(printf '%s\n' "$pypi_run" | awk '$0 == "poetry install --no-interaction --no-root)" { print NR }')
+[ "$pypi_ca_guard_line" -lt "$pypi_pip_line" ] && [ "$pypi_ca_guard_line" -lt "$pypi_uv_line" ] && [ "$pypi_ca_guard_line" -lt "$pypi_poetry_cert_line" ] ||
+  fail "PyPI mirror case configures a client before requiring the exact mounted test CA"
+[ "$pypi_poetry_cert_line" -lt "$pypi_poetry_install_line" ] ||
+  fail "Poetry mirror case installs before configuring its exact source certificate"
+printf '%s\n' "$pypi_assert" | grep -Fx '[ ! -e poetry/poetry.toml ] || { echo '\''generated Poetry project metadata contains phase-local certificate configuration'\'' >&2; exit 1; }' >/dev/null ||
+  fail "Poetry mirror case permits certificate configuration in project-local poetry.toml"
+printf '%s\n' "$pypi_assert" | grep -F 'poetry/poetry.lock poetry/pyproject.toml' >/dev/null ||
+  fail "Poetry mirror case does not check generated project metadata for a leaked CA path"
+if printf '%s\n' "$pypi_commands" | grep -i -E -- '(^|[[:space:]])--trusted-host([=[:space:]]|$)|(^|[[:space:]])--allow-insecure-host([=[:space:]]|$)|(^|[[:space:]])(PIP_TRUSTED_HOST|PIP_CERT|UV_INSECURE_HOST|UV_ALLOW_INSECURE_HOST|PYTHONHTTPSVERIFY|SSL_CERT_FILE|SSL_CERT_DIR|CURL_CA_BUNDLE|REQUESTS_CA_BUNDLE)=|POETRY_CERTIFICATES_[^=[:space:]]+_CERT[[:space:]]*=[[:space:]]*(false|/dev/null|[^[:space:]]*[?*][^[:space:]]*)|certificates[.][^[:space:]]+[.]cert[[:space:]]+(false|/dev/null|[^[:space:]]*[?*][^[:space:]]*)|(^|[[:space:]])(--?insecure|--disable-tls|--no-verify|--no-ssl-verify)([=[:space:]]|$)|TLS[^=[:space:]]*[[:space:]]*=[[:space:]]*(0|false)|(^|[=[:space:]"'\''])(/dev/null|[*])([[:space:]"'\'']|$)|trust[-_]?all|poetry[[:space:]]+config[[:space:]]+--local[[:space:]]+certificates[.]'; then
+  fail "PyPI mirror case disables TLS verification or broadens CA trust"
 fi
 
 composer_setup=$(jq -r '.setup' "$CASES/composer.yaml")
