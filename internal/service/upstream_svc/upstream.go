@@ -166,20 +166,29 @@ func (u *upstreamSvc) write(ctx context.Context, id int64, spec *admin.UpstreamS
 	spec.PackageProfile = profile
 
 	var savedID int64
+	transactionalRepo := upstream_repo.UncachedUpstream()
 	err := upstream_repo.RewriteConfig().Transaction(ctx, func(txCtx context.Context) error {
 		var err error
-		savedID, err = u.writeTx(txCtx, id, spec)
+		savedID, err = u.writeTx(txCtx, transactionalRepo, id, spec)
 		return err
 	})
+	if err == nil {
+		upstream_repo.InvalidateUpstreamCache()
+	}
 	return savedID, err
 }
 
-func (u *upstreamSvc) writeTx(ctx context.Context, id int64, spec *admin.UpstreamSpec) (int64, error) {
+func (u *upstreamSvc) writeTx(
+	ctx context.Context,
+	repo upstream_repo.UpstreamRepo,
+	id int64,
+	spec *admin.UpstreamSpec,
+) (int64, error) {
 	now := time.Now().Unix()
 	upstream := &upstream_entity.Upstream{Createtime: now}
 	var before *upstream_entity.Upstream
 	if id != 0 {
-		exist, err := upstream_repo.Upstream().Find(ctx, id)
+		exist, err := repo.Find(ctx, id)
 		if err != nil {
 			return 0, err
 		}
@@ -195,7 +204,7 @@ func (u *upstreamSvc) writeTx(ctx context.Context, id int64, spec *admin.Upstrea
 	}
 	// host 是白名单的 key，重复注册必须挡住：同一个 host 有两条记录时，
 	// 分发命中哪条取决于查询顺序，停用其中一条看起来会毫无效果。
-	byHost, err := upstream_repo.Upstream().FindByHost(ctx, spec.Host)
+	byHost, err := repo.FindByHost(ctx, spec.Host)
 	if err != nil {
 		return 0, err
 	}
@@ -219,7 +228,7 @@ func (u *upstreamSvc) writeTx(ctx context.Context, id int64, spec *admin.Upstrea
 	upstream.LibraryCompletion = spec.LibraryCompletion
 	upstream.Note = spec.Note
 	upstream.Updatetime = now
-	if err := upstream_repo.Upstream().Save(ctx, upstream); err != nil {
+	if err := repo.Save(ctx, upstream); err != nil {
 		return 0, err
 	}
 	if rewriteUpstreamChanged(before, upstream) {
@@ -258,8 +267,9 @@ func sameProtocols(a, b upstream_entity.ProtocolSet) bool {
 
 func (u *upstreamSvc) Delete(ctx context.Context, req *admin.DeleteUpstreamRequest) (*admin.DeleteUpstreamResponse, error) {
 	var resp *admin.DeleteUpstreamResponse
+	transactionalRepo := upstream_repo.UncachedUpstream()
 	err := upstream_repo.RewriteConfig().Transaction(ctx, func(txCtx context.Context) error {
-		exist, err := upstream_repo.Upstream().Find(txCtx, req.ID)
+		exist, err := transactionalRepo.Find(txCtx, req.ID)
 		if err != nil {
 			return err
 		}
@@ -269,7 +279,7 @@ func (u *upstreamSvc) Delete(ctx context.Context, req *admin.DeleteUpstreamReque
 		if err := rule_repo.AccessRule().DeleteByUpstream(txCtx, req.ID); err != nil {
 			return err
 		}
-		if err := upstream_repo.Upstream().Delete(txCtx, req.ID); err != nil {
+		if err := transactionalRepo.Delete(txCtx, req.ID); err != nil {
 			return err
 		}
 		if exist.Enabled {
@@ -280,6 +290,9 @@ func (u *upstreamSvc) Delete(ctx context.Context, req *admin.DeleteUpstreamReque
 		resp = &admin.DeleteUpstreamResponse{}
 		return nil
 	})
+	if err == nil {
+		upstream_repo.InvalidateUpstreamCache()
+	}
 	return resp, err
 }
 

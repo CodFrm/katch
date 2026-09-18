@@ -77,6 +77,100 @@ func (m *memorySettingRepo) findCount(key string) int {
 	return m.finds[key]
 }
 
+type settingTxContextKey struct{}
+
+type commitAwareSettingRepo struct {
+	mu             sync.Mutex
+	committed      map[string]*setting_entity.Setting
+	staged         map[string]*setting_entity.Setting
+	committedFinds int
+}
+
+func cloneSettingRows(src map[string]*setting_entity.Setting) map[string]*setting_entity.Setting {
+	dst := make(map[string]*setting_entity.Setting, len(src))
+	for key, row := range src {
+		copied := *row
+		dst[key] = &copied
+	}
+	return dst
+}
+
+func (r *commitAwareSettingRepo) begin() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.staged = cloneSettingRows(r.committed)
+}
+
+func (r *commitAwareSettingRepo) finish(commit bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if commit {
+		r.committed = cloneSettingRows(r.staged)
+	}
+	r.staged = nil
+}
+
+func (r *commitAwareSettingRepo) rows(ctx context.Context) map[string]*setting_entity.Setting {
+	if inTx, _ := ctx.Value(settingTxContextKey{}).(bool); inTx {
+		return r.staged
+	}
+	return r.committed
+}
+
+func (r *commitAwareSettingRepo) Find(ctx context.Context, key string) (*setting_entity.Setting, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if inTx, _ := ctx.Value(settingTxContextKey{}).(bool); !inTx {
+		r.committedFinds++
+	}
+	row := r.rows(ctx)[key]
+	if row == nil {
+		return nil, nil
+	}
+	copied := *row
+	return &copied, nil
+}
+
+func (r *commitAwareSettingRepo) Save(ctx context.Context, row *setting_entity.Setting) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if inTx, _ := ctx.Value(settingTxContextKey{}).(bool); !inTx {
+		return errors.New("test write escaped transaction")
+	}
+	copied := *row
+	r.staged[row.Key] = &copied
+	return nil
+}
+
+type barrierSettingRewriteRepo struct {
+	settings     *commitAwareSettingRepo
+	callbackDone chan struct{}
+	finish       chan struct{}
+	rollback     bool
+}
+
+func (r *barrierSettingRewriteRepo) Transaction(ctx context.Context, fn func(context.Context) error) error {
+	r.settings.begin()
+	err := fn(context.WithValue(ctx, settingTxContextKey{}, true))
+	close(r.callbackDone)
+	<-r.finish
+	if err != nil || r.rollback {
+		r.settings.finish(false)
+		if err != nil {
+			return err
+		}
+		return errors.New("forced rollback")
+	}
+	r.settings.finish(true)
+	return nil
+}
+
+func (r *barrierSettingRewriteRepo) AdvanceGeneration(context.Context) error { return nil }
+
+func (r *barrierSettingRewriteRepo) Snapshot(context.Context) (*upstream_repo.RewriteConfigSnapshot, error) {
+	return &upstream_repo.RewriteConfigSnapshot{}, nil
+}
+
 // TestRuntime_FallsBackToDefaults 库里一条都没写过时，读到的是出厂值。
 func TestRuntime_FallsBackToDefaults(t *testing.T) {
 	convey.Convey("没写过的运行时项给出厂值", t, func() {
@@ -176,6 +270,71 @@ func TestSiteDomainAdvancesRewriteGenerationOnlyWhenChanged(t *testing.T) {
 		save("new.example.com")
 		convey.So(rewrite.advances, convey.ShouldEqual, 2)
 	})
+}
+
+// TestSiteDomainSave_InvalidatesOnlyAfterCommit reproduces the setting-cache
+// variant of the pre-commit invalidation race with transaction barriers.
+func TestSiteDomainSave_InvalidatesOnlyAfterCommit(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		rollback bool
+	}{
+		{name: "commit"},
+		{name: "rollback", rollback: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inner := &commitAwareSettingRepo{committed: map[string]*setting_entity.Setting{
+				SiteDomainSetting: {Key: SiteDomainSetting, Value: `"old.example"`},
+			}}
+			rewrite := &barrierSettingRewriteRepo{
+				settings: inner, callbackDone: make(chan struct{}), finish: make(chan struct{}), rollback: tc.rollback,
+			}
+			previousSetting := setting_repo.Setting()
+			previousRewrite := upstream_repo.RewriteConfig()
+			setting_repo.RegisterSetting(NewCachedSettingRepo(inner))
+			upstream_repo.RegisterRewriteConfig(rewrite)
+			t.Cleanup(func() {
+				setting_repo.RegisterSetting(previousSetting)
+				upstream_repo.RegisterRewriteConfig(previousRewrite)
+			})
+
+			ctx := context.Background()
+			primed, err := Setting().BaseURL(ctx)
+			if err != nil || primed != "https://old.example" {
+				t.Fatalf("prime site domain: got %q, err %v", primed, err)
+			}
+
+			writeDone := make(chan error, 1)
+			go func() {
+				_, err := Setting().Save(ctx, saveRequest(map[string]json.RawMessage{
+					SiteDomainSetting: json.RawMessage(`"new.example"`),
+				}))
+				writeDone <- err
+			}()
+			<-rewrite.callbackDone
+
+			during, err := Setting().BaseURL(ctx)
+			if err != nil || during != "https://old.example" {
+				t.Fatalf("uncommitted site domain became visible: got %q, err %v", during, err)
+			}
+			close(rewrite.finish)
+			err = <-writeDone
+
+			after, readErr := Setting().BaseURL(ctx)
+			if tc.rollback {
+				if err == nil || readErr != nil || after != "https://old.example" {
+					t.Fatalf("rollback changed visible domain: write err %v, got %q, read err %v", err, after, readErr)
+				}
+				if inner.committedFinds != 1 {
+					t.Fatalf("rollback invalidated valid cache: committed Find called %d times, want 1", inner.committedFinds)
+				}
+				return
+			}
+			if err != nil || readErr != nil || after != "https://new.example" {
+				t.Fatalf("committed site domain not visible: write err %v, got %q, read err %v", err, after, readErr)
+			}
+		})
+	}
 }
 
 // TestCachedSettingRepo_AnswersFromMemory 进程内缓存：同一个键不该每次都查库。

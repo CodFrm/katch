@@ -30,9 +30,30 @@ type UpstreamRepo interface {
 
 var defaultUpstream UpstreamRepo
 
+type cacheManagedUpstreamRepo interface {
+	UpstreamRepo
+	Uncached() UpstreamRepo
+	Invalidate()
+}
+
 // Upstream 返回已注册的实现。
 func Upstream() UpstreamRepo {
 	return defaultUpstream
+}
+
+// UncachedUpstream 返回事务回调使用的底层仓储，避免在提交前失效进程缓存。
+func UncachedUpstream() UpstreamRepo {
+	if managed, ok := defaultUpstream.(cacheManagedUpstreamRepo); ok {
+		return managed.Uncached()
+	}
+	return defaultUpstream
+}
+
+// InvalidateUpstreamCache 在事务成功提交后失效进程缓存。
+func InvalidateUpstreamCache() {
+	if managed, ok := defaultUpstream.(cacheManagedUpstreamRepo); ok {
+		managed.Invalidate()
+	}
 }
 
 // RegisterUpstream 注册实现，由 main 装配、由测试注入 mock。

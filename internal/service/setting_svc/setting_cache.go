@@ -15,11 +15,10 @@ import (
 // 镜像站的吞吐绑在 sqlite 上。这和上游表那层缓存（proxy_svc.NewCachedUpstreamRepo）
 // 是同一个理由，也用同一个形状。
 //
-// 为什么包在 repository 外面而不是在 service 里各存一份：失效点只有「设置被写过」
-// 这一件事，而所有写入都要经过这个接口。装在这里，管理接口保存设置、轮换密钥、
-// 首次落初始密钥全都会自动让缓存失效，将来多一个写入口也不会漏——靠每个写入方
-// 自己记得调一次 Invalidate 的方案，漏掉的那次表现为「界面上改了但没生效」，
-// 而那正是决策 3/4 要保证不会发生的事。
+// 为什么包在 repository 外面而不是在 service 里各存一份：非事务写直接经过这个
+// 接口，写成功立即失效；包含 site_domain 的事务写使用 Uncached 取得底层仓储，并在
+// 外层提交成功后调用 Invalidate。这样各写入口都能共享缓存，同时不会在提交前开放
+// 旧数据重新发布进缓存的窗口。
 //
 // 缓存是逐键的（SettingRepo 没有列出整表的方法），**包括「这一行不存在」**：
 // 站长没配过的项在库里没有行，不把「没有」也记下来，那些项就会每次请求都查一次库。
@@ -88,6 +87,16 @@ func (c *cachedSettingRepo) invalidate() {
 	c.rows = map[string]*setting_entity.Setting{}
 	c.generation++
 	c.mu.Unlock()
+}
+
+// Uncached 返回事务回调使用的底层仓储。
+func (c *cachedSettingRepo) Uncached() setting_repo.SettingRepo {
+	return c.inner
+}
+
+// Invalidate 在外层事务成功提交后失效快照。
+func (c *cachedSettingRepo) Invalidate() {
+	c.invalidate()
 }
 
 // cloneSetting 复制一份再交出去：调用方改了手上那份，不该改到缓存里的。

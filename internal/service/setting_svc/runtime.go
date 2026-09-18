@@ -283,11 +283,11 @@ func (s *settingSvc) Save(ctx context.Context, req *admin.SaveSettingsRequest) (
 		hasSiteDomain = hasSiteDomain || key == SiteDomainSetting
 	}
 
-	save := func(txCtx context.Context) error {
+	save := func(txCtx context.Context, repo setting_repo.SettingRepo) error {
 		now := time.Now().Unix()
 		siteDomainChanged := false
 		for _, row := range pending {
-			exist, err := setting_repo.Setting().Find(txCtx, row.Key)
+			exist, err := repo.Find(txCtx, row.Key)
 			if err != nil {
 				return err
 			}
@@ -299,7 +299,7 @@ func (s *settingSvc) Save(ctx context.Context, req *admin.SaveSettingsRequest) (
 				siteDomainChanged = storedSettingValue(settingDefIndex[row.Key], exist) != row.Value
 			}
 			row.Updatetime = now
-			if err := setting_repo.Setting().Save(txCtx, row); err != nil {
+			if err := repo.Save(txCtx, row); err != nil {
 				return err
 			}
 		}
@@ -310,9 +310,15 @@ func (s *settingSvc) Save(ctx context.Context, req *admin.SaveSettingsRequest) (
 	}
 	var err error
 	if hasSiteDomain {
-		err = upstream_repo.RewriteConfig().Transaction(ctx, save)
+		transactionalRepo := setting_repo.UncachedSetting()
+		err = upstream_repo.RewriteConfig().Transaction(ctx, func(txCtx context.Context) error {
+			return save(txCtx, transactionalRepo)
+		})
+		if err == nil {
+			setting_repo.InvalidateSettingCache()
+		}
 	} else {
-		err = save(ctx)
+		err = save(ctx, setting_repo.Setting())
 	}
 	if err != nil {
 		return nil, err
