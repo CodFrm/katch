@@ -138,10 +138,12 @@ curl -X POST http://localhost:8080/api/v1/admin/upstreams \
 profile 不匹配的主机。npm/PyPI/Cargo/NuGet 等元数据会跳到附属域名，只给主上游选
 profile 不算配置完成。
 
-客户端配置只能从已保存的 `site_domain` 生成，不能从请求 Host 或转发头猜。最终真实
-客户端矩阵尚待在 `coding.local` 的阻断公网环境执行；在对应客户端获得运行时证据前，
-公开页和后台只显示“待验证”，不提供可复制配置，也不把它表述成完整支持。实现边界、
-companion 清单与验收方法见[公开包镜像加速兼容性](docs/package-manager-mirrors.md)。
+客户端配置只从已保存的 `site_domain` 生成，不能从请求 Host 或转发头猜。12 个内建
+package profile 已在 `coding.local` 的阻断公网矩阵中通过，API 返回
+`runtime_verified=true`；公开页和后台仅在 profile 已验证且当前 `site_domain`、主上游及
+companion 全部就绪时提供可复制配置。Docker、Podman 与 Git 的共享链路回归也使用真实客户端
+完成。实现边界、companion 清单、精确客户端版本与验收方法见
+[公开包镜像加速兼容性](docs/package-manager-mirrors.md)。
 
 ### 缓存策略
 
