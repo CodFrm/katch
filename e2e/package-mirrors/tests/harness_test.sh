@@ -1450,19 +1450,37 @@ if KATCH_ROUTE_PROBE_RESOLVERS=$workdir/no-such-resolvers KATCH_PORT=$capture_ka
   fail "Go route probe was accepted without a readable resolver snapshot"
 fi
 
-cat > "$workdir/go-route-probe-rejects.log" <<EOF
-161 connect(7, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("$capture_katch_ip")}, 16) = -1 EPERM (Operation not permitted)
-162 sendto(7, "query", 5, MSG_NOSIGNAL, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("$capture_katch_ip")}, 16) = 5
-163 connect(7, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, 16) = 0
-164 connect(7, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("$capture_katch_ip")}, 16 <unfinished ...>
-164 <... connect resumed>)            = 0
+# Concurrent Go threads make strace split a probe; its result arrives on the same
+# pid after unrelated threads' resumed lines. This interleaving is copied from a
+# real warm goproxy capture. Unrelated resumed lines carry only a result for a
+# destination already audited on their own unfinished half.
+cat > "$workdir/go-route-probe-split.log" <<EOF
+1147 connect(9, {sa_family=AF_INET, sin_port=htons($capture_katch_port), sin_addr=inet_addr("$capture_katch_ip")}, 16 <unfinished ...>
+1146 <... connect resumed>)            = -1 EINPROGRESS (Operation now in progress)
+1145 connect(10, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("$capture_katch_ip")}, 16 <unfinished ...>
+1147 <... connect resumed>)            = -1 EINPROGRESS (Operation now in progress)
+1138 connect(11, {sa_family=AF_INET, sin_port=htons($capture_katch_port), sin_addr=inet_addr("$capture_katch_ip")}, 16 <unfinished ...>
+1149 connect(12, {sa_family=AF_INET, sin_port=htons($capture_katch_port), sin_addr=inet_addr("$capture_katch_ip")}, 16 <unfinished ...>
+1145 <... connect resumed>)            = 0
 EOF
-if KATCH_ROUTE_PROBE_RESOLVERS=$workdir/resolvers-without-katch KATCH_PORT=$capture_katch_port \
-  "$ENTRYPOINT" --verify-capture "$workdir/go-route-probe-rejects.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
-  fail "route probe allowance accepted a failed, sent, external or split Katch:53 attempt"
-fi
-for expected in '= -1 EPERM' 'sendto(' '8.8.8.8' '<unfinished ...>'; do
-  grep -F "$expected" "$workdir/out" >/dev/null || fail "route probe allowance did not report: $expected"
+KATCH_ROUTE_PROBE_RESOLVERS=$workdir/resolvers-without-katch KATCH_PORT=$capture_katch_port \
+  "$ENTRYPOINT" --verify-capture "$workdir/go-route-probe-split.log" "$capture_katch_ip" ||
+  fail "split Go route probe paired by pid across interleaved threads was rejected"
+
+for rejected in \
+  "161 connect(7, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr(\"$capture_katch_ip\")}, 16) = -1 EPERM (Operation not permitted)" \
+  "162 sendto(7, \"query\", 5, MSG_NOSIGNAL, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr(\"$capture_katch_ip\")}, 16) = 5" \
+  "163 connect(7, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr(\"8.8.8.8\")}, 16) = 0" \
+  "164 connect(7, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr(\"$capture_katch_ip\")}, 16 <unfinished ...>
+164 <... connect resumed>)            = -1 ECONNREFUSED (Connection refused)" \
+  "165 connect(7, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr(\"$capture_katch_ip\")}, 16 <unfinished ...>"
+do
+  printf '%s\n' "$rejected" > "$workdir/go-route-probe-reject.log"
+  if KATCH_ROUTE_PROBE_RESOLVERS=$workdir/resolvers-without-katch KATCH_PORT=$capture_katch_port \
+    "$ENTRYPOINT" --verify-capture "$workdir/go-route-probe-reject.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+    fail "route probe allowance accepted: $rejected"
+  fi
+  grep -F 'non-katch connection attempt' "$workdir/out" >/dev/null || fail "route probe allowance did not report: $rejected"
 done
 
 cat > "$workdir/allowed-blocked-dns-probe.log" <<EOF

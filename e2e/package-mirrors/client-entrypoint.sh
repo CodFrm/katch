@@ -65,10 +65,18 @@ verify_capture() {
       if (destination ~ /^127\./ || destination == "::1" || destination ~ /^::ffff:127\./) return
       if (destination == allowed || destination == "::ffff:" allowed) {
         if (port == 53) {
-          # Only complete connects qualify: a split probe cannot be paired here
-          # without the Docker evidence path below, so it stays a rejection.
-          if (katch_route_probe == 1 && line ~ /(^|[[:space:]])connect\(/ &&
-            line ~ /[[:space:]]=[[:space:]]0[[:space:]]*$/) return
+          if (katch_route_probe == 1 && line ~ /(^|[[:space:]])connect\(/) {
+            if (line ~ /[[:space:]]=[[:space:]]0[[:space:]]*$/) return
+            # Concurrent threads make strace split the probe; its result arrives
+            # later on the same pid and is checked by the resumed rule below.
+            if (line ~ /<unfinished \.\.\.>[[:space:]]*$/) {
+              pid = trace_pid(line)
+              if (pid != "" && !(pid in pending_route_probe)) {
+                pending_route_probe[pid] = line
+                return
+              }
+            }
+          }
           if (allow_blocked_dns_probe == 1 && line ~ /(^|[[:space:]])connect\(/) {
             if (line ~ /[[:space:]]=[[:space:]]0[[:space:]]*$/) {
               preserve_blocked_dns_probe(line)
@@ -94,6 +102,21 @@ verify_capture() {
         if (port == allowed_port || port == 0) return
       }
       reject(line)
+    }
+    # A thread has at most one syscall in flight, so a resumed line pairs with the
+    # unfinished half on its own pid. Resumed lines of other threads only carry the
+    # result of a destination already audited on their unfinished half.
+    katch_route_probe == 1 && /<\.\.\.[[:space:]][^[:space:]]+[[:space:]]resumed>/ {
+      line = $0
+      pid = trace_pid(line)
+      if (pid in pending_route_probe) {
+        if (line !~ /^[[:space:]]*[0-9]+[[:space:]]+<\.\.\.[[:space:]]+connect[[:space:]]+resumed>\)[[:space:]]*=[[:space:]]*0[[:space:]]*$/) {
+          reject(pending_route_probe[pid])
+          reject(line)
+        }
+        delete pending_route_probe[pid]
+        next
+      }
     }
     allow_blocked_dns_probe == 1 && /<\.\.\.[[:space:]][^[:space:]]+[[:space:]]resumed>/ {
       line = $0
@@ -158,6 +181,7 @@ verify_capture() {
     }
     END {
       for (pid in pending_dns_probe) reject(pending_dns_probe[pid])
+      for (pid in pending_route_probe) reject(pending_route_probe[pid])
       exit bad
     }
   ' "$capture"; then
