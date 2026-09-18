@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/CodFrm/katch/internal/cache"
+	"github.com/CodFrm/katch/internal/metrics"
 	"github.com/CodFrm/katch/internal/service/proxy_svc"
 )
 
@@ -132,6 +133,9 @@ func (f *flight) metaFor(status string) *proxy_svc.Meta {
 		header[k] = append([]string(nil), v...)
 	}
 	header.Set(cacheStatusHeader, status)
+	if status == cacheStatusHit {
+		header.Del(metrics.MissHeader)
+	}
 	return &proxy_svc.Meta{
 		StatusCode:    f.meta.StatusCode,
 		Header:        header,

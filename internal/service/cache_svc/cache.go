@@ -258,18 +258,10 @@ func (c *cacheSvc) Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCl
 		return c.getTransformed(ctx, target, upstream, profile, representation)
 	}
 	if !identityAccepted(target.Header) {
-		body, meta, err := proxy_svc.Proxy().Fetch(ctx, target)
-		if err != nil {
-			return nil, nil, err
-		}
-		return body, stampPassthroughMiss(meta, &miss{reason: metrics.MissFirst}), nil
+		return fetchOriginMiss(ctx, target)
 	}
 	if !c.usable() {
-		body, meta, err := proxy_svc.Proxy().Fetch(ctx, target)
-		if err != nil {
-			return nil, nil, err
-		}
-		return body, rangePassthroughMiss(target, meta), nil
+		return fetchOriginMiss(ctx, target)
 	}
 	key := cacheKeyForRepresentation(target, representation, 0)
 	immutable, protocolDefined := registryRequestImmutability(target)
@@ -293,11 +285,11 @@ func (c *cacheSvc) Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCl
 		return drainPromotedHead(body, stampPassthroughMiss(meta, m))
 	}
 	if !writableRequest(target) {
-		body, meta, err = proxy_svc.Proxy().Fetch(ctx, target)
+		body, meta, err = fetchOriginMiss(ctx, target)
 		if err != nil {
 			return nil, nil, err
 		}
-		return body, stampPassthroughMiss(meta, m), nil
+		return body, m.stamp(meta), nil
 	}
 	body, meta, err = c.fetchAndCache(ctx, target, upstream, key, immutable, variants)
 	if err != nil {
@@ -354,35 +346,19 @@ func (c *cacheSvc) usable() bool {
 	return c.store != nil && cache_repo.CacheObject() != nil
 }
 
-// rangeRequest reports whether passthrough attribution should identify a partial request.
-// It is not an eligibility decision: fresh full objects answer ranges locally.
-func rangeRequest(target *proxy_svc.Target) bool {
-	for _, h := range []string{"Range", "If-Range"} {
-		if target.Header.Get(h) != "" {
-			return true
-		}
+// fetchOriginMiss 是缓存层唯一的直接回源入口。响应头一到手就覆盖成当前这一跳的
+// MISS/first，避免上游 katch 的归因在不可缓存、磁盘降级或 waiter 回退分支冒充本地
+// 命中。调用方随后可以用实际的缓存状态把 first 细化成 TTL、淘汰或内容变更。
+func fetchOriginMiss(ctx context.Context, target *proxy_svc.Target) (io.ReadCloser, *proxy_svc.Meta, error) {
+	body, meta, err := proxy_svc.Proxy().Fetch(ctx, target)
+	if err != nil {
+		return nil, nil, err
 	}
-	return false
-}
-
-// rangePassthroughMiss 给一次未命中后带 Range/If-Range 的透传补上未命中归因。
-//
-// 新鲜完整副本会在本地回答范围；走到这里说明缓存不可用或没有可用副本，因而是真实
-// 回源。X-Katch-Cache 是运维验证与客户端判定「这一次有没有回源」的唯一依据：
-// 少了它，客户端只看得到「没有 HIT」，无从区分「回源了」和「被本地回答但没标」。
-//
-// git 的应答不在这里标：它自己带 X-Katch-Git，一次协商结果不是一个对象（见 web
-// 包的同名说明）。上游带来的缓存状态必须覆盖：这里确实发生了真实回源，本跳只能
-// 归为 MISS，否则上游的 HIT 会冒充成本地回答。
-func rangePassthroughMiss(target *proxy_svc.Target, meta *proxy_svc.Meta) *proxy_svc.Meta {
-	if meta == nil || target.Git.IsGit() || !rangeRequest(target) {
-		return meta
-	}
-	return stampPassthroughMiss(meta, &miss{reason: metrics.MissFirst})
+	return body, stampPassthroughMiss(meta, &miss{reason: metrics.MissFirst}), nil
 }
 
 // stampPassthroughMiss 给本跳直接回源的响应写入 MISS 与未命中原因。
-// 上游 katch 自带的缓存状态描述的是上游那一跳，不能冒充本地命中。
+// 只覆盖归因头：其余上游响应头仍按原透传规则交给客户端。
 func stampPassthroughMiss(meta *proxy_svc.Meta, m *miss) *proxy_svc.Meta {
 	if meta == nil {
 		return nil
@@ -624,7 +600,7 @@ func (c *cacheSvc) getTransformed(ctx context.Context, target *proxy_svc.Target,
 	}
 
 	fillCtx := context.WithoutCancel(ctx)
-	body, meta, err := proxy_svc.Proxy().Fetch(fillCtx, canonicalMetadataTarget(target))
+	body, meta, err := fetchOriginMiss(fillCtx, canonicalMetadataTarget(target))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1013,7 +989,7 @@ func (c *cacheSvc) fetchAndCache(ctx context.Context, target *proxy_svc.Target,
 	// 仍要写完缓存——下一个请求就能命中，否则一次断线就白白浪费整趟回源。
 	fetchCtx := context.WithoutCancel(ctx)
 	fetchTarget := canonicalTarget(target)
-	body, meta, err := proxy_svc.Proxy().Fetch(fetchCtx, fetchTarget)
+	body, meta, err := fetchOriginMiss(fetchCtx, fetchTarget)
 	if err != nil {
 		c.forget(flightKey)
 		current.startFailed(err)
@@ -1049,7 +1025,7 @@ func (c *cacheSvc) attachOrFetch(ctx context.Context, current *flight,
 		return body, meta, nil
 	}
 	if errors.Is(err, errNotCoalescable) {
-		return proxy_svc.Proxy().Fetch(ctx, target)
+		return fetchOriginMiss(ctx, target)
 	}
 	return nil, nil, err
 }
