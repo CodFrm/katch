@@ -1124,8 +1124,11 @@ for contract in \
 done
 printf '%s\n' "$podman_registry_commands" | grep -F "[ \"\$(cat results/version)\" = '6.9.1' ]" >/dev/null ||
   fail "Podman registry case does not require podinfo 6.9.1"
-printf '%s\n' "$podman_registry_commands" | grep -F 'podman_client run --rm --network none --dns 127.0.0.1 --entrypoint ./podinfo "$image_ref" --version' >/dev/null ||
-  fail "Podman registry nested run does not combine network isolation with loopback DNS"
+printf '%s\n' "$podman_registry_commands" | grep -F 'podman_client run --rm --network none --entrypoint ./podinfo "$image_ref" --version' >/dev/null ||
+  fail "Podman registry nested run does not retain network isolation without DNS options"
+if printf '%s\n' "$podman_registry_commands" | grep -F -- '--dns' >/dev/null; then
+  fail "Podman registry case configures DNS despite network mode none"
+fi
 for contract in \
   "--format '{{range .RepoDigests}}{{printf \"%s\\n\" .}}{{end}}'" \
   'LC_ALL=C sort > results/repo-digests' \
