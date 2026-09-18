@@ -24,6 +24,10 @@
       "type": "boolean",
       "description": "Accept Docker's blocked route probe only when it connects to the exact Katch IP on DNS port 53 and returns zero."
     },
+    "allow_musl_route_probe": {
+      "type": "boolean",
+      "description": "Accept APK's musl route probe only when connect targets the exact Katch IP on port 65535 and returns zero."
+    },
     "setup": {"type": "string", "minLength": 1},
     "run": {"type": "string", "minLength": 1},
     "assert": {"type": "string", "minLength": 1},
@@ -49,6 +53,19 @@
       },
       "else": {
         "not": {"required": ["allow_blocked_dns_probe"]}
+      }
+    },
+    {
+      "if": {
+        "properties": {"name": {"const": "apk"}},
+        "required": ["name"]
+      },
+      "then": {
+        "properties": {"allow_musl_route_probe": {"const": true}},
+        "required": ["allow_musl_route_probe"]
+      },
+      "else": {
+        "not": {"required": ["allow_musl_route_probe"]}
       }
     }
   ]

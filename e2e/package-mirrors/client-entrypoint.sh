@@ -9,6 +9,14 @@ case $KATCH_ALLOW_BLOCKED_DNS_PROBE in
     exit 64
     ;;
 esac
+KATCH_ALLOW_MUSL_ROUTE_PROBE=${KATCH_ALLOW_MUSL_ROUTE_PROBE-0}
+case $KATCH_ALLOW_MUSL_ROUTE_PROBE in
+  0|1) ;;
+  *)
+    printf '%s\n' "KATCH_ALLOW_MUSL_ROUTE_PROBE must be 0 or 1" >&2
+    exit 64
+    ;;
+esac
 
 verify_capture() {
   capture=$1
@@ -21,6 +29,7 @@ verify_capture() {
   [ -z "$blocked_dns_evidence" ] || : > "$blocked_dns_evidence"
   if awk -v allowed="$katch_ip" -v allowed_port="${KATCH_PORT:-}" \
     -v allow_blocked_dns_probe="$KATCH_ALLOW_BLOCKED_DNS_PROBE" \
+    -v allow_musl_route_probe="$KATCH_ALLOW_MUSL_ROUTE_PROBE" \
     -v blocked_dns_evidence="$blocked_dns_evidence" '
     function reject(line) {
       print "non-katch connection attempt: " line > "/dev/stderr"
@@ -57,8 +66,12 @@ verify_capture() {
           reject(line)
           return
         }
+        if (port == 65535) {
+          if (allow_musl_route_probe == 1 && line ~ /(^|[[:space:]])connect\(/ && line ~ /[[:space:]]=[[:space:]]0[[:space:]]*$/) return
+          reject(line)
+          return
+        }
         if (port == allowed_port || port == 0) return
-        if (port == 65535 && line ~ /(^|[[:space:]])connect\(/ && line ~ /[[:space:]]=[[:space:]]0[[:space:]]*$/) return
       }
       reject(line)
     }

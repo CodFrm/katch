@@ -23,10 +23,12 @@ validate_case() {
   case_file=$1
   jq -e '
     type == "object" and
-    (keys - ["allow_blocked_dns_probe", "privileged"] | sort) == (["assert", "image", "name", "required_upstreams", "run", "setup"] | sort) and
+    (keys - ["allow_blocked_dns_probe", "allow_musl_route_probe", "privileged"] | sort) == (["assert", "image", "name", "required_upstreams", "run", "setup"] | sort) and
     ((has("privileged") | not) or (.privileged | type == "boolean")) and
     ((.name == "docker-registry-regression" and .allow_blocked_dns_probe == true) or
       (.name != "docker-registry-regression" and (has("allow_blocked_dns_probe") | not))) and
+    ((.name == "apk" and .allow_musl_route_probe == true) or
+      (.name != "apk" and (has("allow_musl_route_probe") | not))) and
     (.name | type == "string" and test("^[a-z0-9][a-z0-9-]{0,62}$")) and
     (.image | type == "string" and test("^[A-Za-z0-9./_-]+(:[A-Za-z0-9._-]+|@sha256:[a-f0-9]{64})$") and (endswith(":latest") | not)) and
     (.setup | type == "string" and length > 0) and
@@ -132,6 +134,7 @@ run_phase() {
   image=$(jq -r '.image' "$case_file")
   privileged=$(jq -r '.privileged // false' "$case_file")
   allow_blocked_dns_probe=$(jq -r '.allow_blocked_dns_probe // false' "$case_file")
+  allow_musl_route_probe=$(jq -r '.allow_musl_route_probe // false' "$case_file")
   phase_root=$case_root/$phase
   shared=$case_root/shared
   scripts=$phase_root/case
@@ -154,6 +157,9 @@ run_phase() {
   fi
   if [ "$allow_blocked_dns_probe" = true ]; then
     set -- "$@" --env KATCH_ALLOW_BLOCKED_DNS_PROBE=1
+  fi
+  if [ "$allow_musl_route_probe" = true ]; then
+    set -- "$@" --env KATCH_ALLOW_MUSL_ROUTE_PROBE=1
   fi
   set -- "$@" \
     --add-host "$KATCH_HOST:${KATCH_ADD_HOST:-host-gateway}" \

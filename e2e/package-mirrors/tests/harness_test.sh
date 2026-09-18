@@ -1142,12 +1142,24 @@ done
   fail "only the Docker registry case may declare the blocked DNS route probe allowance"
 jq -e '.properties.allow_blocked_dns_probe.type == "boolean"' "$CASE_SCHEMA" >/dev/null ||
   fail "case schema does not define the blocked DNS route probe allowance as boolean"
+[ "$(jq -r '.allow_musl_route_probe' "$CASES/apk.yaml")" = true ] ||
+  fail "APK case does not explicitly allow its musl route probe"
+[ "$(find "$CASES" -maxdepth 1 -type f -name '*.yaml' -exec jq -r 'select(has("allow_musl_route_probe")) | .name' {} +)" = apk ] ||
+  fail "only the APK case may declare the musl route probe allowance"
+jq -e '.properties.allow_musl_route_probe.type == "boolean"' "$CASE_SCHEMA" >/dev/null ||
+  fail "case schema does not define the musl route probe allowance as boolean"
 
 if awk '
   /^(iptables|ip6tables)[[:space:]]/ && /-j[[:space:]]+ACCEPT/ && /(^|[^0-9])53([^0-9]|$)/ { found = 1 }
   END { exit found ? 0 : 1 }
 ' "$ENTRYPOINT"; then
   fail "entrypoint allows DNS through the firewall"
+fi
+if awk '
+  /^(iptables|ip6tables)[[:space:]]/ && /-j[[:space:]]+ACCEPT/ && /(^|[^0-9])65535([^0-9]|$)/ { found = 1 }
+  END { exit found ? 0 : 1 }
+' "$ENTRYPOINT"; then
+  fail "entrypoint allows the musl route probe through the firewall"
 fi
 
 [ "$(find "$CASES" -maxdepth 1 -type f -name '*.yaml' -exec jq -r 'select(.privileged == true) | .name' {} + | LC_ALL=C sort)" = "$(printf '%s\n' docker-registry-regression podman-registry-regression)" ] ||
@@ -1248,15 +1260,26 @@ cat > "$workdir/katch-musl-route-probe-success.log" <<EOF
 127 connect(3, {sa_family=AF_INET, sin_port=htons(65535), sin_addr=inet_addr("$capture_katch_ip")}, 16) = 0
 128 connect(3, {sa_family=AF_INET6, sin6_port=htons(65535), inet_pton(AF_INET6, "::ffff:$capture_katch_ip", &sin6_addr), sin6_scope_id=0}, 28) = 0
 EOF
-KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/katch-musl-route-probe-success.log" "$capture_katch_ip" ||
-  fail "successful musl route probe to exact IPv4 or IPv4-mapped Katch IP was rejected"
+if KATCH_PORT=$capture_katch_port \
+  "$ENTRYPOINT" --verify-capture "$workdir/katch-musl-route-probe-success.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "default capture audit accepted valid-looking musl route probes"
+fi
+grep -F 'sa_family=AF_INET, sin_port=htons(65535)' "$workdir/out" >/dev/null ||
+  fail "default capture audit did not report the IPv4 musl route probe"
+grep -F 'sa_family=AF_INET6, sin6_port=htons(65535)' "$workdir/out" >/dev/null ||
+  fail "default capture audit did not report the IPv4-mapped musl route probe"
+
+KATCH_ALLOW_MUSL_ROUTE_PROBE=1 KATCH_PORT=$capture_katch_port \
+  "$ENTRYPOINT" --verify-capture "$workdir/katch-musl-route-probe-success.log" "$capture_katch_ip" ||
+  fail "explicit APK musl route probe allowance rejected exact successful probes"
 
 cat > "$workdir/katch-musl-route-probe-failure.log" <<EOF
 129 connect(3, {sa_family=AF_INET, sin_port=htons(65535), sin_addr=inet_addr("$capture_katch_ip")}, 16) = -1 EPERM (Operation not permitted)
-130 connect(3, {sa_family=AF_INET6, sin6_port=htons(65535), inet_pton(AF_INET6, "::ffff:$capture_katch_ip", &sin6_addr), sin6_scope_id=0}, 28) = -1 EINPROGRESS (Operation now in progress)
+130 connect(3, {sa_family=AF_INET6, sin6_port=htons(65535), inet_pton(AF_INET6, "::ffff:$capture_katch_ip", &sin6_addr), sin6_scope_id=0}, 28) = 1
 EOF
-if KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/katch-musl-route-probe-failure.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
-  fail "failed musl route probe to exact IPv4 or IPv4-mapped Katch IP was accepted"
+if KATCH_ALLOW_MUSL_ROUTE_PROBE=1 KATCH_PORT=$capture_katch_port \
+  "$ENTRYPOINT" --verify-capture "$workdir/katch-musl-route-probe-failure.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "explicit musl route probe allowance accepted a failed or nonzero result"
 fi
 grep -F 'sa_family=AF_INET, sin_port=htons(65535)' "$workdir/out" >/dev/null ||
   fail "failed IPv4 musl route probe was not reported"
@@ -1267,13 +1290,39 @@ cat > "$workdir/other-musl-route-probe.log" <<'EOF'
 131 connect(3, {sa_family=AF_INET, sin_port=htons(65535), sin_addr=inet_addr("192.0.2.10")}, 16) = 0
 132 connect(3, {sa_family=AF_INET6, sin6_port=htons(65535), inet_pton(AF_INET6, "::ffff:192.0.2.11", &sin6_addr), sin6_scope_id=0}, 28) = 0
 EOF
-if KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/other-musl-route-probe.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
-  fail "musl route probe to a non-Katch IPv4 or IPv4-mapped destination was accepted"
+if KATCH_ALLOW_MUSL_ROUTE_PROBE=1 KATCH_PORT=$capture_katch_port \
+  "$ENTRYPOINT" --verify-capture "$workdir/other-musl-route-probe.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "explicit musl route probe allowance accepted a non-Katch destination"
 fi
 grep -F '192.0.2.10' "$workdir/out" >/dev/null ||
   fail "IPv4 musl route probe to another IP was not reported"
 grep -F '::ffff:192.0.2.11' "$workdir/out" >/dev/null ||
   fail "IPv4-mapped musl route probe to another IP was not reported"
+
+cat > "$workdir/sendto-musl-route-probe.log" <<EOF
+133 sendto(3, "probe", 5, MSG_NOSIGNAL, {sa_family=AF_INET, sin_port=htons(65535), sin_addr=inet_addr("$capture_katch_ip")}, 16) = 0
+EOF
+if KATCH_ALLOW_MUSL_ROUTE_PROBE=1 KATCH_PORT=$capture_katch_port \
+  "$ENTRYPOINT" --verify-capture "$workdir/sendto-musl-route-probe.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "explicit musl route probe allowance accepted a non-connect syscall"
+fi
+grep -F 'sendto(' "$workdir/out" >/dev/null || fail "non-connect musl route probe was not reported"
+
+cat > "$workdir/wrong-port-musl-route-probe.log" <<EOF
+134 connect(3, {sa_family=AF_INET, sin_port=htons(65534), sin_addr=inet_addr("$capture_katch_ip")}, 16) = 0
+EOF
+if KATCH_ALLOW_MUSL_ROUTE_PROBE=1 KATCH_PORT=$capture_katch_port \
+  "$ENTRYPOINT" --verify-capture "$workdir/wrong-port-musl-route-probe.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "explicit musl route probe allowance accepted the wrong port"
+fi
+grep -F 'sin_port=htons(65534)' "$workdir/out" >/dev/null || fail "wrong-port musl route probe was not reported"
+
+if KATCH_ALLOW_MUSL_ROUTE_PROBE=true KATCH_PORT=$capture_katch_port \
+  "$ENTRYPOINT" --verify-capture "$workdir/katch-musl-route-probe-success.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "entrypoint accepted a non-binary musl route probe setting"
+fi
+grep -F 'KATCH_ALLOW_MUSL_ROUTE_PROBE must be 0 or 1' "$workdir/out" >/dev/null ||
+  fail "entrypoint did not report the invalid musl route probe setting"
 
 cat > "$workdir/loopback.log" <<'EOF'
 127 connect(3, {sa_family=AF_INET, sin_port=htons(49152), sin_addr=inet_addr("127.0.0.1")}, 16) = 0
@@ -1813,10 +1862,12 @@ chmod 0555 "$harness_bin/fake-runtime" "$harness_bin/curl"
 harness_case=$workdir/harness-case.yaml
 privileged_harness_case=$workdir/privileged-harness-case.yaml
 blocked_dns_harness_case=$workdir/blocked-dns-harness-case.yaml
+musl_route_harness_case=$workdir/musl-route-harness-case.yaml
 second_harness_case=$workdir/second-harness-case.yaml
 printf '%s\n' '{"name":"ca-contract","image":"example/client:1","setup":"true","run":"true","assert":"true","required_upstreams":["example.invalid"]}' > "$harness_case"
 printf '%s\n' '{"name":"privileged-contract","image":"example/client:1","privileged":true,"setup":"true","run":"true","assert":"true","required_upstreams":["example.invalid"]}' > "$privileged_harness_case"
 printf '%s\n' '{"name":"docker-registry-regression","image":"example/client:1","privileged":true,"allow_blocked_dns_probe":true,"setup":"true","run":"true","assert":"true","required_upstreams":["example.invalid"]}' > "$blocked_dns_harness_case"
+printf '%s\n' '{"name":"apk","image":"example/client:1","allow_musl_route_probe":true,"setup":"true","run":"true","assert":"true","required_upstreams":["example.invalid"]}' > "$musl_route_harness_case"
 printf '%s\n' '{"name":"shared-isolation","image":"example/client:1","setup":"true","run":"true","assert":"true","required_upstreams":["example.invalid"]}' > "$second_harness_case"
 run_harness() {
   artifact_dir=$1
@@ -1863,6 +1914,9 @@ fi
 if grep -Fx 'ARG=KATCH_ALLOW_BLOCKED_DNS_PROBE=1' "$workdir/runtime.log"; then
   fail "standard cases unexpectedly allow blocked DNS probes"
 fi
+if grep -Fx 'ARG=KATCH_ALLOW_MUSL_ROUTE_PROBE=1' "$workdir/runtime.log"; then
+  fail "standard cases unexpectedly allow musl route probes"
+fi
 
 : > "$workdir/runtime.log"
 printf '%s\n' 0 > "$workdir/metric-state"
@@ -1881,6 +1935,9 @@ fi
 if grep -Fx 'ARG=KATCH_ALLOW_BLOCKED_DNS_PROBE=1' "$workdir/runtime.log"; then
   fail "privilege alone enables the blocked DNS probe allowance"
 fi
+if grep -Fx 'ARG=KATCH_ALLOW_MUSL_ROUTE_PROBE=1' "$workdir/runtime.log"; then
+  fail "privilege alone enables the musl route probe allowance"
+fi
 
 : > "$workdir/runtime.log"
 printf '%s\n' 0 > "$workdir/metric-state"
@@ -1891,6 +1948,22 @@ env PATH="$harness_bin:$PATH" RUNTIME_LOG="$workdir/runtime.log" METRIC_STATE="$
   "$HARNESS" "$blocked_dns_harness_case" >"$workdir/out" 2>&1
 [ "$(grep -Fxc 'ARG=KATCH_ALLOW_BLOCKED_DNS_PROBE=1' "$workdir/runtime.log")" -eq 2 ] ||
   fail "case field does not enable blocked DNS probe auditing in both phases"
+if grep -Fx 'ARG=KATCH_ALLOW_MUSL_ROUTE_PROBE=1' "$workdir/runtime.log"; then
+  fail "Docker DNS probe allowance also enables the APK musl route probe allowance"
+fi
+
+: > "$workdir/runtime.log"
+printf '%s\n' 0 > "$workdir/metric-state"
+env PATH="$harness_bin:$PATH" RUNTIME_LOG="$workdir/runtime.log" METRIC_STATE="$workdir/metric-state" \
+  CONTAINER_RUNTIME=fake-runtime ARTIFACT_ROOT="$workdir/harness-musl-route" \
+  KATCH_URL=https://katch.invalid KATCH_METRICS_URL=http://metrics.invalid \
+  KATCH_HOST=katch.invalid KATCH_PORT=443 \
+  "$HARNESS" "$musl_route_harness_case" >"$workdir/out" 2>&1
+[ "$(grep -Fxc 'ARG=KATCH_ALLOW_MUSL_ROUTE_PROBE=1' "$workdir/runtime.log")" -eq 2 ] ||
+  fail "APK case field does not enable musl route probe auditing in both phases"
+if grep -Fx 'ARG=KATCH_ALLOW_BLOCKED_DNS_PROBE=1' "$workdir/runtime.log"; then
+  fail "APK musl route probe allowance also enables the Docker DNS probe allowance"
+fi
 
 : > "$workdir/runtime.log"
 if run_harness "$workdir/harness-relative" env KATCH_CA_CERT=relative/ca.crt >"$workdir/out" 2>&1; then
@@ -1960,6 +2033,26 @@ fi
 printf '%s\n' '{"name":"docker-registry-regression","image":"busybox:1","allow_blocked_dns_probe":"yes","setup":"true","run":"true","assert":"true","required_upstreams":["example.invalid"]}' > "$bad_case"
 if "$HARNESS" --check "$bad_case" >"$workdir/out" 2>&1; then
   fail "case schema accepted a non-boolean blocked DNS probe allowance"
+fi
+
+printf '%s\n' '{"name":"not-apk","image":"busybox:1","allow_musl_route_probe":true,"setup":"true","run":"true","assert":"true","required_upstreams":["example.invalid"]}' > "$bad_case"
+if "$HARNESS" --check "$bad_case" >"$workdir/out" 2>&1; then
+  fail "case schema allowed a non-APK case to opt into musl route probes"
+fi
+
+printf '%s\n' '{"name":"apk","image":"busybox:1","setup":"true","run":"true","assert":"true","required_upstreams":["example.invalid"]}' > "$bad_case"
+if "$HARNESS" --check "$bad_case" >"$workdir/out" 2>&1; then
+  fail "case schema allowed APK to omit the musl route probe allowance"
+fi
+
+printf '%s\n' '{"name":"apk","image":"busybox:1","allow_musl_route_probe":false,"setup":"true","run":"true","assert":"true","required_upstreams":["example.invalid"]}' > "$bad_case"
+if "$HARNESS" --check "$bad_case" >"$workdir/out" 2>&1; then
+  fail "case schema accepted a false APK musl route probe allowance"
+fi
+
+printf '%s\n' '{"name":"apk","image":"busybox:1","allow_musl_route_probe":"yes","setup":"true","run":"true","assert":"true","required_upstreams":["example.invalid"]}' > "$bad_case"
+if "$HARNESS" --check "$bad_case" >"$workdir/out" 2>&1; then
+  fail "case schema accepted a non-boolean musl route probe allowance"
 fi
 
 printf '%s\n' "harness self-tests passed"
