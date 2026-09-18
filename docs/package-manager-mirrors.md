@@ -71,10 +71,32 @@ lockfile/registry-host 约束、Go 与 Homebrew no-fallback、DNF/YUM 固定 `ba
 `static / composer`；GitHub 完整 commit SHA dist 才按不可变对象缓存，tag/ref 仍按可变或
 未知路径处理。Homebrew 的 GHCR blob 会重定向到签名 CDN URL，因此必须显式注册精确主机
 `pkg-containers.githubusercontent.com` 为 `static / none`；不会自动新增该记录，也不接受
-通配的 `githubusercontent.com` 主机。前端只翻译和展示这些 DTO，不复制兼容规则。**可复制配置还有第二道门：
-对应真实客户端必须在阻断公网的 runtime matrix 中通过。最终矩阵仍待 `coding.local`
-执行，当前所有 profile 的 `runtime_verified` 都是 `false`，因此公开页和后台只显示待验证
-状态，不显示可复制片段，也不宣称完整支持。**
+通配的 `githubusercontent.com` 主机。前端只翻译和展示这些 DTO，不复制兼容规则。可复制
+配置有两道同时生效的门：profile 必须有阻断公网 runtime matrix 证据，并且当前上游的
+`package_readiness.ready` 必须为 `true`。2026-09-17 至 2026-09-18 在 `coding.local`
+完成的矩阵覆盖全部 12 个 profile，冷缓存源站请求均大于 0、暖缓存源站请求均为 0，
+连接审计没有发现非 katch 目标，因此这些 profile 的 `runtime_verified` 为 `true`；缺少
+`site_domain`、主上游或 companion 时配置仍然保持锁定。
+
+| runtime case | profile | 冷 / 暖源站请求 |
+| --- | --- | ---: |
+| npm-family | `npm` | 4 / 0 |
+| pypi-family | `pypi` | 5 / 0 |
+| goproxy | `goproxy` | 9 / 0 |
+| maven-gradle-sbt | `maven` | 267 / 0 |
+| cargo | `cargo` | 3 / 0 |
+| nuget | `nuget` | 5 / 0 |
+| rubygems-bundler | `rubygems` | 6 / 0 |
+| apt-update-install-signature | `apt` | 3 / 0 |
+| rpm-dnf-yum | `rpm` | 10 / 0 |
+| apk | `apk` | 2 / 0 |
+| composer-dist | `composer` | 3 / 0 |
+| homebrew-bottle | `homebrew` | 7 / 0 |
+
+共享回归用例还以 5 / 0 的冷暖源站请求完成了真实 Git clone、`git fsck` 和本地镜像应答
+验证。该用例里的 Docker、Podman `version` 只用于记录“不可用”或“daemon 被阻断”的诊断，
+没有执行镜像拉取，**不构成 Docker 或 Podman runtime 验证**。完整现场记录写在忽略目录
+`.dev-kit/runtime/2026-09-16-public-package-mirrors/report.md`。
 
 ## 2026-09-16 真实客户端调研（实现前基线）
 
@@ -110,8 +132,8 @@ lockfile/registry-host 约束、Go 与 Homebrew no-fallback、DNF/YUM 固定 `ba
 ## 调研时的兼容性与所需处理（历史基线）
 
 下表记录上述调研时发现的缺口，用来解释各 profile 为什么需要当前实现；表中的“需要
-增加适配器”等措辞不是当前代码状态。实现是否存在看上一节，完整支持是否成立只看尚待
-执行的阻断公网 runtime matrix。
+增加适配器”等措辞不是当前代码状态。实现是否存在看上一节，完整支持的运行时证据看
+上一节已完成的阻断公网矩阵。
 
 | 生态 / 客户端           | 公开仓库特点与当前边界                                                                                                                                                                                             | 要做到完整支持需要的处理                                                                                                                                                                                             | 缓存边界                                                                                                                                               | 建议优先级 / 工作量         |
 | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------- |
@@ -160,6 +182,7 @@ lockfile/registry-host 约束、Go 与 Homebrew no-fallback、DNF/YUM 固定 `ba
 7. 对带签名或摘要的生态执行原生校验，确认代理没有改变受保护的字节。
 
 当前各 profile 的适配器、缓存分类、结构化改写和 runtime case 已实现并由协议级测试
-覆盖；这不替代真实客户端证据。下一步是在 `coding.local` 运行全量阻断公网矩阵，核对
-冷/暖缓存、源站计数、签名/摘要以及拒绝的非 katch 连接。矩阵通过前不得把任何对应行
-标成完整支持，也不得把配置片段开放为可复制状态。
+覆盖；`coding.local` 上的全量阻断公网矩阵进一步验证了真实客户端、冷/暖缓存、源站计数、
+签名/摘要以及没有非 katch 连接。运行时证据只打开 `runtime_verified` 这一道门；部署现场
+仍必须让 `site_domain`、主上游和全部 companion 满足 readiness，界面才会开放配置片段。
+Docker、Podman 不在本次通过项内；Git 的真实 clone 回归已通过。

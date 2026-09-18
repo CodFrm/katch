@@ -391,7 +391,7 @@ func packageGuidance(
 	guidance := api_upstream.PackageGuidance{
 		Clients:         packageClients(profileName),
 		Constraints:     packageConstraints(profileName, baseURL),
-		RuntimeVerified: false,
+		RuntimeVerified: packageRuntimeVerified(profileName),
 	}
 	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if baseURL == "" {
@@ -485,6 +485,26 @@ func expandDeclaredGuidance(lines []string, prefix, baseURL, host string) []stri
 		expanded = append(expanded, line)
 	}
 	return expanded
+}
+
+func packageRuntimeVerified(profile upstream_entity.PackageProfile) bool {
+	switch profile {
+	case upstream_entity.PackageProfileNPM,
+		upstream_entity.PackageProfilePyPI,
+		upstream_entity.PackageProfileGoProxy,
+		upstream_entity.PackageProfileMaven,
+		upstream_entity.PackageProfileCargo,
+		upstream_entity.PackageProfileNuGet,
+		upstream_entity.PackageProfileRubyGems,
+		upstream_entity.PackageProfileAPT,
+		upstream_entity.PackageProfileRPM,
+		upstream_entity.PackageProfileAPK,
+		upstream_entity.PackageProfileComposer,
+		upstream_entity.PackageProfileHomebrew:
+		return true
+	default:
+		return false
+	}
 }
 
 func packageClients(profile upstream_entity.PackageProfile) []string {

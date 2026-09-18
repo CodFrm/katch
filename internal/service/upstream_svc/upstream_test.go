@@ -45,7 +45,7 @@ func TestPackageProfileReadiness(t *testing.T) {
 			"poetry source add --priority=primary katch https://mirror.example.com/pypi.org/simple/",
 		})
 		convey.So(ready.Guidance.Constraints, convey.ShouldContain, "trailing_slash")
-		convey.So(ready.Guidance.RuntimeVerified, convey.ShouldBeFalse)
+		convey.So(ready.Guidance.RuntimeVerified, convey.ShouldBeTrue)
 
 		files.Enabled = false
 		blocked := packageReadiness("", []*upstream_entity.Upstream{primary, files}, primary)
@@ -222,6 +222,39 @@ func TestPackageProfilesComeFromRegisteredBackendAdapters(t *testing.T) {
 			upstream_entity.PackageProfileComposer, upstream_entity.PackageProfileHomebrew,
 		} {
 			convey.So(seen[profile], convey.ShouldBeTrue)
+		}
+	})
+}
+
+func TestPackageGuidanceRuntimeVerificationMatchesCompletedMatrix(t *testing.T) {
+	profiles := Upstream().PackageProfiles()
+	convey.Convey("已注册的 package profile 都有阻断公网 runtime 证据", t, func() {
+		convey.So(profiles, convey.ShouldHaveLength, 13)
+		for _, profile := range profiles {
+			guidance := packageGuidance(profile.Profile, profileHost(profile.Profile), "https://mirror.example.com")
+			if profile.Profile == upstream_entity.PackageProfileNone {
+				convey.So(guidance.RuntimeVerified, convey.ShouldBeFalse)
+				continue
+			}
+			convey.So(guidance.RuntimeVerified, convey.ShouldBeTrue)
+		}
+	})
+
+	convey.Convey("none、空值和未来未知 profile 不伪造运行时就绪", t, func() {
+		for _, profile := range []upstream_entity.PackageProfile{
+			upstream_entity.PackageProfileNone,
+			"",
+			"future-profile",
+		} {
+			guidance := packageGuidance(profile, "packages.example.com", "https://mirror.example.com")
+			convey.So(guidance.RuntimeVerified, convey.ShouldBeFalse)
+		}
+		for _, profile := range []upstream_entity.PackageProfile{
+			upstream_entity.PackageProfileNone,
+			"",
+		} {
+			candidate := &upstream_entity.Upstream{PackageProfile: profile}
+			convey.So(packageReadiness("https://mirror.example.com", nil, candidate), convey.ShouldBeNil)
 		}
 	})
 }

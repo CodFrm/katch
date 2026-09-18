@@ -154,8 +154,13 @@ git 因为要处理带请求体的协商，是另一个适配器（见下）。
 
 `Guidance` 只描述已实现的只读客户端配置和限制，所有 URL 都从数据库里的
 `site_domain` 派生。`runtime_verified` 是独立的证据门：只有客户端在阻断公网的运行时
-矩阵中通过后才允许界面显示可复制配置。协议单测或 harness case 存在不能把这个值置真；
-当前最终矩阵仍待 `coding.local` 执行，所以界面必须保留待验证状态。
+矩阵中通过后才置真；协议单测或 harness case 存在本身不能置真。2026-09-17 至
+2026-09-18 在 `coding.local` 完成的矩阵已经覆盖 `npm`、`pypi`、`goproxy`、`maven`、
+`cargo`、`nuget`、`rubygems`、`apt`、`rpm`、`apk`、`composer`、`homebrew` 全部内建
+package profile，因此这些明确 allowlist 的 profile 返回 `runtime_verified=true`；`none`、
+空值和未来未知 profile 仍返回 `false`。界面只有在 `runtime_verified` 和当次数据库快照
+算出的 `package_readiness.ready` 同时为真时才显示可复制配置。共享回归中的真实 Git
+clone 已验证；Docker、Podman 只有 blocked/version 诊断，没有 runtime 成功结论。
 
 git 的适配器走的是**穿透 + 本地镜像双路径**：镜像还没建成、或者请求带着 shallow、
 `--filter` 这类本地给不了的形态时，请求原样转给上游，同时在后台把这个仓库镜像
