@@ -20,6 +20,10 @@
       "default": false,
       "description": "Run the pinned registry client with full container privileges and force its resolver to bounded loopback-only DNS."
     },
+    "allow_blocked_dns_probe": {
+      "type": "boolean",
+      "description": "Accept Docker's blocked route probe only when it connects to the exact Katch IP on DNS port 53 and returns zero."
+    },
     "setup": {"type": "string", "minLength": 1},
     "run": {"type": "string", "minLength": 1},
     "assert": {"type": "string", "minLength": 1},
@@ -32,5 +36,20 @@
         "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$"
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"name": {"const": "docker-registry-regression"}},
+        "required": ["name"]
+      },
+      "then": {
+        "properties": {"allow_blocked_dns_probe": {"const": true}},
+        "required": ["allow_blocked_dns_probe"]
+      },
+      "else": {
+        "not": {"required": ["allow_blocked_dns_probe"]}
+      }
+    }
+  ]
 }

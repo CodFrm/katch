@@ -7,6 +7,7 @@ ENTRYPOINT=$ROOT/e2e/package-mirrors/client-entrypoint.sh
 IMAGE_SMOKE=$ROOT/e2e/package-mirrors/images/client-smoke.sh
 IMAGE_BUILD=$ROOT/e2e/package-mirrors/images/build.sh
 IMAGE_CONTRACT=$ROOT/e2e/package-mirrors/images/contract.json
+CASE_SCHEMA=$ROOT/e2e/package-mirrors/schema/case.schema.json
 DOCKER_CLIENT_DOCKERFILE=$ROOT/e2e/package-mirrors/images/docker.Dockerfile
 PODMAN_CLIENT_DOCKERFILE=$ROOT/e2e/package-mirrors/images/podman.Dockerfile
 CASES=$ROOT/e2e/package-mirrors/cases
@@ -1076,6 +1077,13 @@ for registry_client in docker podman; do
   done
 done
 
+[ "$(jq -r '.allow_blocked_dns_probe' "$CASES/docker-registry-regression.yaml")" = true ] ||
+  fail "Docker registry case does not explicitly allow its blocked DNS route probe"
+[ "$(find "$CASES" -maxdepth 1 -type f -name '*.yaml' -exec jq -r 'select(has("allow_blocked_dns_probe")) | .name' {} +)" = docker-registry-regression ] ||
+  fail "only the Docker registry case may declare the blocked DNS route probe allowance"
+jq -e '.properties.allow_blocked_dns_probe.type == "boolean"' "$CASE_SCHEMA" >/dev/null ||
+  fail "case schema does not define the blocked DNS route probe allowance as boolean"
+
 if awk '
   /^(iptables|ip6tables)[[:space:]]/ && /-j[[:space:]]+ACCEPT/ && /(^|[^0-9])53([^0-9]|$)/ { found = 1 }
   END { exit found ? 0 : 1 }
@@ -1294,6 +1302,61 @@ if KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/neste
   fail "successful nested daemon DNS probe outside loopback was accepted"
 fi
 grep -q '172.17.0.1' "$workdir/out" || fail "nested daemon DNS probe was not reported"
+
+cat > "$workdir/allowed-blocked-dns-probe.log" <<EOF
+139 connect(3, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("$capture_katch_ip")}, 16) = 0
+140 connect(3, {sa_family=AF_INET6, sin6_port=htons(53), inet_pton(AF_INET6, "::ffff:$capture_katch_ip", &sin6_addr), sin6_scope_id=0}, 28) = 0
+EOF
+KATCH_ALLOW_BLOCKED_DNS_PROBE=1 KATCH_PORT=$capture_katch_port \
+  "$ENTRYPOINT" --verify-capture "$workdir/allowed-blocked-dns-probe.log" "$capture_katch_ip" "$workdir/blocked-dns-probes.log" ||
+  fail "explicit Docker blocked DNS probes to the exact Katch IP were rejected"
+cmp -s "$workdir/allowed-blocked-dns-probe.log" "$workdir/blocked-dns-probes.log" ||
+  fail "accepted blocked DNS probes were not preserved as separate evidence"
+
+cat > "$workdir/external-blocked-dns-probe.log" <<'EOF'
+141 connect(3, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, 16) = 0
+EOF
+if KATCH_ALLOW_BLOCKED_DNS_PROBE=1 KATCH_PORT=$capture_katch_port \
+  "$ENTRYPOINT" --verify-capture "$workdir/external-blocked-dns-probe.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "explicit blocked DNS probe allowance accepted an external destination"
+fi
+grep -F '8.8.8.8' "$workdir/out" >/dev/null || fail "external blocked DNS probe was not reported"
+
+cat > "$workdir/failed-blocked-dns-probe.log" <<EOF
+142 connect(3, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("$capture_katch_ip")}, 16) = -1 EPERM (Operation not permitted)
+143 connect(3, {sa_family=AF_INET6, sin6_port=htons(53), inet_pton(AF_INET6, "::ffff:$capture_katch_ip", &sin6_addr)}, 28) = 1
+EOF
+if KATCH_ALLOW_BLOCKED_DNS_PROBE=1 KATCH_PORT=$capture_katch_port \
+  "$ENTRYPOINT" --verify-capture "$workdir/failed-blocked-dns-probe.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "explicit blocked DNS probe allowance accepted a nonzero or failed result"
+fi
+grep -F '= -1 EPERM' "$workdir/out" >/dev/null || fail "failed blocked DNS probe was not reported"
+grep -F '= 1' "$workdir/out" >/dev/null || fail "nonzero blocked DNS probe was not reported"
+
+cat > "$workdir/wrong-port-blocked-dns-probe.log" <<EOF
+144 connect(3, {sa_family=AF_INET, sin_port=htons(5353), sin_addr=inet_addr("$capture_katch_ip")}, 16) = 0
+EOF
+if KATCH_ALLOW_BLOCKED_DNS_PROBE=1 KATCH_PORT=$capture_katch_port \
+  "$ENTRYPOINT" --verify-capture "$workdir/wrong-port-blocked-dns-probe.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "explicit blocked DNS probe allowance accepted the wrong port"
+fi
+grep -F 'sin_port=htons(5353)' "$workdir/out" >/dev/null || fail "wrong-port blocked DNS probe was not reported"
+
+cat > "$workdir/sendto-blocked-dns-probe.log" <<EOF
+145 sendto(3, "query", 5, MSG_NOSIGNAL, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("$capture_katch_ip")}, 16) = 0
+EOF
+if KATCH_ALLOW_BLOCKED_DNS_PROBE=1 KATCH_PORT=$capture_katch_port \
+  "$ENTRYPOINT" --verify-capture "$workdir/sendto-blocked-dns-probe.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "explicit blocked DNS probe allowance accepted a non-connect syscall"
+fi
+grep -F 'sendto(' "$workdir/out" >/dev/null || fail "non-connect blocked DNS probe was not reported"
+
+if KATCH_ALLOW_BLOCKED_DNS_PROBE=true KATCH_PORT=$capture_katch_port \
+  "$ENTRYPOINT" --verify-capture "$workdir/allowed-blocked-dns-probe.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "entrypoint accepted a non-binary blocked DNS probe setting"
+fi
+grep -F 'KATCH_ALLOW_BLOCKED_DNS_PROBE must be 0 or 1' "$workdir/out" >/dev/null ||
+  fail "entrypoint did not report the invalid blocked DNS probe setting"
 
 resolver_file=$workdir/resolv.conf
 resolver_evidence=$workdir/resolver-evidence
@@ -1593,9 +1656,11 @@ chmod 0555 "$harness_bin/fake-runtime" "$harness_bin/curl"
 
 harness_case=$workdir/harness-case.yaml
 privileged_harness_case=$workdir/privileged-harness-case.yaml
+blocked_dns_harness_case=$workdir/blocked-dns-harness-case.yaml
 second_harness_case=$workdir/second-harness-case.yaml
 printf '%s\n' '{"name":"ca-contract","image":"example/client:1","setup":"true","run":"true","assert":"true","required_upstreams":["example.invalid"]}' > "$harness_case"
 printf '%s\n' '{"name":"privileged-contract","image":"example/client:1","privileged":true,"setup":"true","run":"true","assert":"true","required_upstreams":["example.invalid"]}' > "$privileged_harness_case"
+printf '%s\n' '{"name":"docker-registry-regression","image":"example/client:1","privileged":true,"allow_blocked_dns_probe":true,"setup":"true","run":"true","assert":"true","required_upstreams":["example.invalid"]}' > "$blocked_dns_harness_case"
 printf '%s\n' '{"name":"shared-isolation","image":"example/client:1","setup":"true","run":"true","assert":"true","required_upstreams":["example.invalid"]}' > "$second_harness_case"
 run_harness() {
   artifact_dir=$1
@@ -1639,6 +1704,9 @@ fi
 if grep -Fx 'ARG=KATCH_LOOPBACK_RESOLVER=1' "$workdir/runtime.log"; then
   fail "standard cases unexpectedly enable the loopback resolver"
 fi
+if grep -Fx 'ARG=KATCH_ALLOW_BLOCKED_DNS_PROBE=1' "$workdir/runtime.log"; then
+  fail "standard cases unexpectedly allow blocked DNS probes"
+fi
 
 : > "$workdir/runtime.log"
 printf '%s\n' 0 > "$workdir/metric-state"
@@ -1654,6 +1722,19 @@ env PATH="$harness_bin:$PATH" RUNTIME_LOG="$workdir/runtime.log" METRIC_STATE="$
 if grep -E '^ARG=(--security-opt|no-new-privileges|--cap-add|NET_ADMIN|NET_RAW)$' "$workdir/runtime.log"; then
   fail "privileged cases retain incompatible standard isolation flags"
 fi
+if grep -Fx 'ARG=KATCH_ALLOW_BLOCKED_DNS_PROBE=1' "$workdir/runtime.log"; then
+  fail "privilege alone enables the blocked DNS probe allowance"
+fi
+
+: > "$workdir/runtime.log"
+printf '%s\n' 0 > "$workdir/metric-state"
+env PATH="$harness_bin:$PATH" RUNTIME_LOG="$workdir/runtime.log" METRIC_STATE="$workdir/metric-state" \
+  CONTAINER_RUNTIME=fake-runtime ARTIFACT_ROOT="$workdir/harness-blocked-dns" \
+  KATCH_URL=https://katch.invalid KATCH_METRICS_URL=http://metrics.invalid \
+  KATCH_HOST=katch.invalid KATCH_PORT=443 \
+  "$HARNESS" "$blocked_dns_harness_case" >"$workdir/out" 2>&1
+[ "$(grep -Fxc 'ARG=KATCH_ALLOW_BLOCKED_DNS_PROBE=1' "$workdir/runtime.log")" -eq 2 ] ||
+  fail "case field does not enable blocked DNS probe auditing in both phases"
 
 : > "$workdir/runtime.log"
 if run_harness "$workdir/harness-relative" env KATCH_CA_CERT=relative/ca.crt >"$workdir/out" 2>&1; then
@@ -1713,6 +1794,16 @@ fi
 printf '%s\n' '{"name":"bad-privileged","image":"busybox:1","privileged":"yes","setup":"true","run":"true","assert":"true","required_upstreams":["example.invalid"]}' > "$bad_case"
 if "$HARNESS" --check "$bad_case" >"$workdir/out" 2>&1; then
   fail "case schema accepted a non-boolean privileged value"
+fi
+
+printf '%s\n' '{"name":"bad-dns-probe","image":"busybox:1","allow_blocked_dns_probe":true,"setup":"true","run":"true","assert":"true","required_upstreams":["example.invalid"]}' > "$bad_case"
+if "$HARNESS" --check "$bad_case" >"$workdir/out" 2>&1; then
+  fail "case schema allowed a non-Docker case to opt into blocked DNS probes"
+fi
+
+printf '%s\n' '{"name":"docker-registry-regression","image":"busybox:1","allow_blocked_dns_probe":"yes","setup":"true","run":"true","assert":"true","required_upstreams":["example.invalid"]}' > "$bad_case"
+if "$HARNESS" --check "$bad_case" >"$workdir/out" 2>&1; then
+  fail "case schema accepted a non-boolean blocked DNS probe allowance"
 fi
 
 printf '%s\n' "harness self-tests passed"

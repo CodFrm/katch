@@ -1,14 +1,27 @@
 #!/bin/sh
 set -eu
 
+KATCH_ALLOW_BLOCKED_DNS_PROBE=${KATCH_ALLOW_BLOCKED_DNS_PROBE-0}
+case $KATCH_ALLOW_BLOCKED_DNS_PROBE in
+  0|1) ;;
+  *)
+    printf '%s\n' "KATCH_ALLOW_BLOCKED_DNS_PROBE must be 0 or 1" >&2
+    exit 64
+    ;;
+esac
+
 verify_capture() {
   capture=$1
   katch_ip=$2
+  blocked_dns_evidence=${3:-}
   [ -f "$capture" ] || {
     printf '%s\n' "missing connection record: $capture" >&2
     return 1
   }
-  awk -v allowed="$katch_ip" -v allowed_port="${KATCH_PORT:-}" '
+  [ -z "$blocked_dns_evidence" ] || : > "$blocked_dns_evidence"
+  if awk -v allowed="$katch_ip" -v allowed_port="${KATCH_PORT:-}" \
+    -v allow_blocked_dns_probe="$KATCH_ALLOW_BLOCKED_DNS_PROBE" \
+    -v blocked_dns_evidence="$blocked_dns_evidence" '
     function reject(line) {
       print "non-katch connection attempt: " line > "/dev/stderr"
       bad = 1
@@ -16,6 +29,14 @@ verify_capture() {
     function audit(destination, port, line) {
       if (destination ~ /^127\./ || destination == "::1" || destination ~ /^::ffff:127\./) return
       if (destination == allowed || destination == "::ffff:" allowed) {
+        if (port == 53) {
+          if (allow_blocked_dns_probe == 1 && line ~ /(^|[[:space:]])connect\(/ && line ~ /[[:space:]]=[[:space:]]0[[:space:]]*$/) {
+            if (blocked_dns_evidence != "") print line >> blocked_dns_evidence
+            return
+          }
+          reject(line)
+          return
+        }
         if (port == allowed_port || port == 0) return
         if (port == 65535 && line ~ /(^|[[:space:]])connect\(/ && line ~ /[[:space:]]=[[:space:]]0[[:space:]]*$/) return
       }
@@ -66,7 +87,11 @@ verify_capture() {
       audit(destination, port, line)
     }
     END { exit bad }
-  ' "$capture"
+  ' "$capture"; then
+    return 0
+  fi
+  [ -z "$blocked_dns_evidence" ] || rm -f "$blocked_dns_evidence"
+  return 1
 }
 
 install_host_mapping() {
@@ -134,8 +159,8 @@ if [ "${1:-}" = "--install-host-mapping" ]; then
 fi
 
 if [ "${1:-}" = "--verify-capture" ]; then
-  [ "$#" -eq 3 ] || exit 64
-  verify_capture "$2" "$3"
+  [ "$#" -eq 3 ] || [ "$#" -eq 4 ] || exit 64
+  verify_capture "$2" "$3" "${4:-}"
   exit
 fi
 
@@ -291,7 +316,11 @@ strace -f -qq -e trace=connect,sendto -s 256 -o "$connect_log" \
 
 iptables -nvxL OUTPUT > "$KATCH_ARTIFACTS/iptables.after"
 ip6tables -nvxL OUTPUT > "$KATCH_ARTIFACTS/ip6tables.after"
-if ! verify_capture "$connect_log" "$katch_ip"; then
+blocked_dns_evidence=
+if [ "$KATCH_ALLOW_BLOCKED_DNS_PROBE" -eq 1 ]; then
+  blocked_dns_evidence=$KATCH_ARTIFACTS/blocked-dns-probes.log
+fi
+if ! verify_capture "$connect_log" "$katch_ip" "$blocked_dns_evidence"; then
   status=70
 fi
 exit "$status"
