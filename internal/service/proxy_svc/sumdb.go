@@ -84,6 +84,7 @@ func (s *sumDBSvc) Fetch(ctx context.Context, target *Target) (io.ReadCloser, *M
 		StatusCode:    resp.StatusCode,
 		Header:        resp.Header,
 		ContentLength: resp.ContentLength,
+		SourceURL:     cloneURL(resp.SourceURL),
 	}, nil
 }
 

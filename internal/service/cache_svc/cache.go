@@ -258,7 +258,11 @@ func (c *cacheSvc) Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCl
 		return c.getTransformed(ctx, target, upstream, profile, representation)
 	}
 	if !identityAccepted(target.Header) {
-		return proxy_svc.Proxy().Fetch(ctx, target)
+		body, meta, err := proxy_svc.Proxy().Fetch(ctx, target)
+		if err != nil {
+			return nil, nil, err
+		}
+		return body, stampPassthroughMiss(meta, &miss{reason: metrics.MissFirst}), nil
 	}
 	if !c.usable() {
 		body, meta, err := proxy_svc.Proxy().Fetch(ctx, target)
@@ -644,13 +648,12 @@ func (c *cacheSvc) getTransformed(ctx context.Context, target *proxy_svc.Target,
 	if readErr != nil || closeErr != nil || len(originBody) > maxTransformBytes {
 		return statusOnly(http.StatusBadGateway)
 	}
-	source, err := url.Parse("https://" + target.Host + target.Path)
-	if err != nil {
+	if meta.SourceURL == nil {
 		return statusOnly(http.StatusBadGateway)
 	}
-	source.RawQuery = target.RawQuery
+	source := *meta.SourceURL
 	result, err := profile.Transform(fillCtx, packageprofile.TransformRequest{
-		Body: originBody, ContentType: mediaType, Source: source, SiteBaseURL: snapshot.SiteBaseURL,
+		Body: originBody, ContentType: mediaType, Source: &source, SiteBaseURL: snapshot.SiteBaseURL,
 		RewriteURL: c.urlRewriter(snapshot),
 	})
 	if err != nil || result == nil || len(result.Body) > maxTransformBytes {
@@ -733,8 +736,20 @@ func (c *cacheSvc) urlRewriter(snapshot *proxy_svc.RewriteSnapshot) packageprofi
 			return nil, packageprofile.ErrInvalidMetadata
 		}
 		configured, ok := snapshot.Upstreams[host]
-		if !ok || (companion.Transport != "" && !configured.Transports.Has(companion.Transport)) ||
-			(companion.Profile != "" && upstream_entity.NormalizePackageProfile(configured.Profile) != companion.Profile) {
+		if !ok {
+			logger.Ctx(ctx).Warn("metadata rewrite companion unavailable",
+				zap.String("host", host), zap.String("reason", "not_configured_or_disabled"))
+			return nil, packageprofile.ErrUnavailable
+		}
+		if companion.Transport != "" && !configured.Transports.Has(companion.Transport) {
+			logger.Ctx(ctx).Warn("metadata rewrite companion unavailable",
+				zap.String("host", host), zap.String("reason", "transport_incompatible"))
+			return nil, packageprofile.ErrUnavailable
+		}
+		if companion.Profile != "" &&
+			upstream_entity.NormalizePackageProfile(configured.Profile) != companion.Profile {
+			logger.Ctx(ctx).Warn("metadata rewrite companion unavailable",
+				zap.String("host", host), zap.String("reason", "profile_incompatible"))
 			return nil, packageprofile.ErrUnavailable
 		}
 		if _, err := c.resolver.Resolve(ctx, target, destination.DestinationRequirement{

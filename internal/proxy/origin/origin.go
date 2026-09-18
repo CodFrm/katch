@@ -59,7 +59,10 @@ type Response struct {
 	StatusCode    int
 	Header        http.Header
 	ContentLength int64
-	Body          io.ReadCloser
+	// SourceURL is the final origin response URL after redirects. It is internal
+	// transform context and must never be copied into anonymous response headers.
+	SourceURL *url.URL
+	Body      io.ReadCloser
 }
 
 // forwardedRequestHeaders 唯一会被转发给上游的请求头。
@@ -257,10 +260,16 @@ func (c *Client) Do(ctx context.Context, req *Request) (*Response, error) {
 		}
 		return nil, fmt.Errorf("回源失败: %w", err)
 	}
+	var sourceURL *url.URL
+	if resp.Request != nil && resp.Request.URL != nil {
+		cloned := *resp.Request.URL
+		sourceURL = &cloned
+	}
 	return &Response{
 		StatusCode:    resp.StatusCode,
 		Header:        cleanResponseHeader(resp.Header),
 		ContentLength: resp.ContentLength,
+		SourceURL:     sourceURL,
 		Body:          resp.Body,
 	}, nil
 }

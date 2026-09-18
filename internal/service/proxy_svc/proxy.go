@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -67,6 +68,9 @@ type Meta struct {
 	StatusCode    int
 	Header        http.Header
 	ContentLength int64
+	// SourceURL is the final origin response URL used only by metadata transforms.
+	// Response writers must not expose it to anonymous clients.
+	SourceURL *url.URL
 }
 
 // ProxySvc 拉取路径的业务操作。
@@ -269,7 +273,16 @@ func (p *proxySvc) Fetch(ctx context.Context, target *Target) (io.ReadCloser, *M
 		StatusCode:    resp.StatusCode,
 		Header:        resp.Header,
 		ContentLength: resp.ContentLength,
+		SourceURL:     cloneURL(resp.SourceURL),
 	}, nil
+}
+
+func cloneURL(source *url.URL) *url.URL {
+	if source == nil {
+		return nil
+	}
+	cloned := *source
+	return &cloned
 }
 
 // upstreamAccountHeaders 上游用来描述**katch 这个调用方**、而不是这次内容的响应头。

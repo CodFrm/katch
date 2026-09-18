@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -414,8 +415,14 @@ func (p localOriginProxy) Fetch(ctx context.Context, target *proxy_svc.Target) (
 	if err != nil {
 		return nil, nil, err
 	}
+	var sourceURL *url.URL
+	if response.Request != nil && response.Request.URL != nil {
+		cloned := *response.Request.URL
+		sourceURL = &cloned
+	}
 	return response.Body, &proxy_svc.Meta{
 		StatusCode: response.StatusCode, Header: response.Header.Clone(), ContentLength: response.ContentLength,
+		SourceURL: sourceURL,
 	}, nil
 }
 
