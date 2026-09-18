@@ -87,10 +87,10 @@ func sumDBRoute(target *Target) (upstreamPath string, supported, ok bool) {
 	}
 	path := target.Path
 	if path == "/supported" {
+		// 唯一一条合成应答：能力问答由本地配置回答，不打上游。
 		return "", true, true
 	}
-	if path == "/latest" || strings.HasPrefix(path, "/lookup/") && len(path) > len("/lookup/") ||
-		strings.HasPrefix(path, "/tile/") && len(path) > len("/tile/") {
+	if dispatch.ValidSumDBRoute(path) {
 		return path, false, true
 	}
 	return "", false, false

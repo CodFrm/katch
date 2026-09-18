@@ -44,6 +44,20 @@ const (
 )
 
 // String 让表驱动用例的失败信息可读。
+// IsPull 这一类请求是不是一次上游拉取。
+//
+// 三处要按同一条判据分流：访问规则只约束拉取、拉取指标只数拉取、web 只把拉取交给
+// 缓存与代理。各写各的条件，加一个新的 Kind 时必定漏掉其中一处——sumdb 别名就是
+// 这么从 /metrics 和最近请求里消失过一次的。
+func IsPull(kind Kind) bool {
+	switch kind {
+	case KindRegistry, KindStatic, KindSumDB:
+		return true
+	default:
+		return false
+	}
+}
+
 func (k Kind) String() string {
 	switch k {
 	case KindSPA:
@@ -79,7 +93,7 @@ func (k Kind) String() string {
 //  5. 第一段含 . 的，该段即主机名（决策 2：公网主机名必然含点）；
 //  6. 其余交给 SPA。
 //
-// 只有 KindRegistry 与 KindStatic 会带回 host/rest，其余两项都是空串。
+// 只有 KindRegistry、KindStatic 与 KindSumDB 会带回 host/rest，其余都是空串。
 // KindRegistry 的 rest **不含** /v2 前缀——那是 registry 的协议前缀，由回源侧
 // 按上游类别补回，不属于「上游路径」。
 //
@@ -128,13 +142,17 @@ func classifySumDB(path string) (Kind, string, string) {
 	if rest == "" {
 		rest = "/"
 	}
-	if !safeTail(strings.TrimPrefix(rest, "/")) || !validSumDBRoute(rest) {
+	if !safeTail(strings.TrimPrefix(rest, "/")) || !ValidSumDBRoute(rest) {
 		return KindInvalid, "", ""
 	}
 	return KindSumDB, sumDBHost, rest
 }
 
-func validSumDBRoute(path string) bool {
+// ValidSumDBRoute checksum database 协议认得的那几条路由。
+//
+// 导出给桥那一侧复用：路由表写两份，加一条路由时就会有一处留在旧表上——分发层
+// 放行而桥 404，或者反过来。
+func ValidSumDBRoute(path string) bool {
 	return path == "/supported" || path == "/latest" ||
 		strings.HasPrefix(path, "/lookup/") && len(path) > len("/lookup/") ||
 		strings.HasPrefix(path, "/tile/") && len(path) > len("/tile/")

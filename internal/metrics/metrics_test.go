@@ -102,6 +102,32 @@ func TestRecorder_RequestsTotal(t *testing.T) {
 	})
 }
 
+// TestRecorder_SumDBAliasPullsAreCounted
+//
+// checksum database 的两条公开别名也是拉取：它们照常打上游、照常占缓存，
+// 只是路径上多了一段保留命名空间。漏掉它们，命中率会被冲淡成另一个数，
+// 最近请求页上也再看不到 go 的校验流量。
+func TestRecorder_SumDBAliasPullsAreCounted(t *testing.T) {
+	convey.Convey("sumdb 别名路径按 static 记在 sum.golang.org 名下", t, func() {
+		reg := prometheus.NewRegistry()
+		rec := New(Options{Registerer: reg})
+		hooks := Hooks{Lookup: knownUpstreams("sum.golang.org")}
+		miss := &upstreamResponse{status: http.StatusOK, cache: "MISS",
+			miss: string(MissFirst), body: "checksum"}
+
+		get(newTestEngine(rec, hooks, miss), "/sumdb/sum.golang.org/lookup/example.com/mod@v1.0.0")
+		get(newTestEngine(rec, hooks, miss),
+			"/proxy.golang.org/sumdb/sum.golang.org/tile/8/1/000.p/16")
+
+		body := scrape(reg)
+		convey.So(body, convey.ShouldContainSubstring,
+			`katch_requests_total{kind="static",result="miss",upstream="sum.golang.org"} 2`)
+		convey.So(body, convey.ShouldContainSubstring,
+			`katch_bytes_served_total{source="origin",upstream="sum.golang.org"} 16`)
+		convey.So(rec.DrainRecent(), convey.ShouldHaveLength, 2)
+	})
+}
+
 func TestRecorder_DeniedAndUnknownHost(t *testing.T) {
 	convey.Convey("白名单之外的主机计成 denied，且不把主机名变成新的标签值", t, func() {
 		reg := prometheus.NewRegistry()

@@ -32,7 +32,7 @@ func Middleware() gin.HandlerFunc {
 		// 只有拉取才受访问规则约束。管理接口、前端路由、静态产物与 /v2/ 探测
 		// 都原样通过——否则一条 deny "*" 会把界面本身一起关掉，连进去把它删了
 		// 都做不到。
-		if kind != dispatch.KindRegistry && kind != dispatch.KindStatic && kind != dispatch.KindSumDB {
+		if !dispatch.IsPull(kind) {
 			c.Next()
 			return
 		}

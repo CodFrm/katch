@@ -526,7 +526,7 @@ const PullLogMessage = "拉取"
 func (r *Recorder) Middleware(hooks Hooks) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		kind, host, object := dispatch.Classify(c.Request.URL.EscapedPath())
-		if hooks.Lookup == nil || (kind != dispatch.KindRegistry && kind != dispatch.KindStatic) {
+		if hooks.Lookup == nil || !dispatch.IsPull(kind) {
 			// 界面、静态产物和 katch 自身的端点不是拉取，计进来只会把命中率冲淡。
 			c.Next()
 			return

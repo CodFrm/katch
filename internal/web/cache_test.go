@@ -366,117 +366,189 @@ func (s *mutableWebRewriteSource) setProfile(profile upstream_entity.PackageProf
 	s.snapshot.Upstreams["sum.golang.org"] = upstream
 }
 
-func TestProxy_SumDBWarmCacheRequiresCurrentGoProxyProfile(t *testing.T) {
-	// warmHit 区分两条 sumdb 路径的暖形态：/supported 是合成应答，按约定压根不进
-	// 对象缓存；lookup 会落盘，撤销 profile 之前必须先证明它真的暖着——否则
-	// 「撤销后拿不到」可能只是因为它从来没被缓存过，这条用例就没有牙。
-	//
-	// lookup 那条还带上一条 immutable_patterns：撤销 profile 之后这条路径不再被
-	// go profile 认领，落回上游自己的不可变模式，缓存层若不显式复核当前 profile，
-	// 暖对象就会被当成内容寻址结果长期原样重放。
-	for _, tc := range []struct {
-		path              string
-		warmHit           bool
-		immutablePatterns upstream_entity.PatternList
-	}{
-		{path: "/sumdb/sum.golang.org/supported"},
-		{
-			path:    "/proxy.golang.org/sumdb/sum.golang.org/lookup/example.com/mod@v1.0.0",
-			warmHit: true, immutablePatterns: upstream_entity.PatternList{"/lookup/"},
-		},
-	} {
-		path := tc.path
-		t.Run(path, func(t *testing.T) {
-			srv, hits := countingOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
-				w.Header().Set("Content-Type", "text/plain")
-				_, _ = io.WriteString(w, "checksum-record")
-			})
-			current := &upstream_entity.Upstream{
-				ID: 9, Host: "sum.golang.org", Origin: srv.URL, Enabled: true,
-				Protocols:         upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
-				PackageProfile:    upstream_entity.PackageProfileGoProxy,
-				ImmutablePatterns: tc.immutablePatterns,
-			}
-			repo := mock_upstream_repo.NewMockUpstreamRepo(gomock.NewController(t))
-			repo.EXPECT().List(gomock.Any()).AnyTimes().DoAndReturn(func(context.Context) ([]*upstream_entity.Upstream, error) {
-				copy := *current
-				copy.Protocols = append(upstream_entity.ProtocolSet(nil), current.Protocols...)
-				return []*upstream_entity.Upstream{&copy}, nil
-			})
-			repo.EXPECT().Save(gomock.Any(), gomock.Any()).DoAndReturn(func(_ context.Context, updated *upstream_entity.Upstream) error {
-				copy := *updated
-				copy.Protocols = append(upstream_entity.ProtocolSet(nil), updated.Protocols...)
-				current = &copy
-				return nil
-			})
-			cachedRepo := proxy_svc.NewCachedUpstreamRepo(repo)
-			previousRepo := upstream_repo.Upstream()
-			upstream_repo.RegisterUpstream(cachedRepo)
-			t.Cleanup(func() { upstream_repo.RegisterUpstream(previousRepo) })
+// sumDBFixture 一套装好的 sumdb 别名拉取现场：真磁盘缓存、进程内上游表，以及
+// 一个能改的配置快照。撤销要同时改这两处——运维在界面上改一次上游，两边本来就
+// 是同一行数据的两个读法。
+type sumDBFixture struct {
+	repo     upstream_repo.UpstreamRepo
+	source   *mutableWebRewriteSource
+	hits     *atomic.Int64
+	cacheSvc cache_svc.CacheSvc
+	current  func() upstream_entity.Upstream
+}
 
-			source := &mutableWebRewriteSource{snapshot: configuredWebSumDB()}
-			originURL, err := url.Parse(srv.URL)
-			if err != nil {
-				t.Fatal(err)
-			}
-			_, port, err := net.SplitHostPort(originURL.Host)
-			if err != nil {
-				t.Fatal(err)
-			}
-			resolver := webResolverFunc(func(_ context.Context, target *url.URL, _ destination.DestinationRequirement) (*destination.ResolvedTarget, error) {
-				mapped := *target
-				mapped.Scheme = "http"
-				return &destination.ResolvedTarget{
-					URL: &mapped, Authority: target.Host, Host: target.Host,
-					ServerName: target.Hostname(), DialAddress: net.JoinHostPort("127.0.0.1", port),
-				}, nil
-			})
-			previousProxy := proxy_svc.Proxy()
-			proxy_svc.Register(proxy_svc.New(proxy_svc.Options{RewriteConfig: source, DestinationResolver: resolver}))
-			t.Cleanup(func() { proxy_svc.Register(previousProxy) })
-			cacheSvc := withDiskCacheOptions(t, cache_svc.Options{RewriteConfig: source})
-
-			first := cacheRequest(t, http.MethodGet, path, nil)
-			if first.Code != http.StatusOK {
-				t.Fatalf("first GET %s = %d, body %q", path, first.Code, first.Body.String())
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if err := cacheSvc.Quiesce(ctx); err != nil {
-				t.Fatal(err)
-			}
-			originHits := hits.Load()
-
-			warm := cacheRequest(t, http.MethodGet, path, nil)
-			if warm.Code != http.StatusOK {
-				t.Fatalf("warm GET %s before revoke = %d, body %q", path, warm.Code, warm.Body.String())
-			}
-			if got := warm.Header().Get("X-Katch-Cache"); tc.warmHit && got != "HIT" {
-				t.Fatalf("warm GET %s before revoke X-Katch-Cache = %q, want HIT", path, got)
-			}
-			if hits.Load() != originHits {
-				t.Fatalf("origin hits before revoke = %d, want %d", hits.Load(), originHits)
-			}
-
-			updated := *current
-			updated.PackageProfile = upstream_entity.PackageProfileNone
-			if err := cachedRepo.Save(context.Background(), &updated); err != nil {
-				t.Fatal(err)
-			}
-			source.setProfile(upstream_entity.PackageProfileNone)
-
-			second := cacheRequest(t, http.MethodGet, path, nil)
-			if second.Code != http.StatusServiceUnavailable || second.Body.Len() != 0 {
-				t.Fatalf("warm GET %s after profile revoke = %d, body %q; want empty 503", path, second.Code, second.Body.String())
-			}
-			if second.Header().Get("X-Katch-Cache") == "HIT" {
-				t.Fatalf("warm GET %s replayed cache after profile revoke", path)
-			}
-			if hits.Load() != originHits {
-				t.Fatalf("origin hits after revoke = %d, want %d", hits.Load(), originHits)
-			}
-		})
+func newSumDBFixture(t *testing.T, patterns upstream_entity.PatternList) *sumDBFixture {
+	t.Helper()
+	srv, hits := countingOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = io.WriteString(w, "checksum-record")
+	})
+	current := &upstream_entity.Upstream{
+		ID: 9, Host: "sum.golang.org", Origin: srv.URL, Enabled: true,
+		Protocols:         upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+		PackageProfile:    upstream_entity.PackageProfileGoProxy,
+		ImmutablePatterns: patterns,
 	}
+	repo := mock_upstream_repo.NewMockUpstreamRepo(gomock.NewController(t))
+	repo.EXPECT().List(gomock.Any()).AnyTimes().DoAndReturn(func(context.Context) ([]*upstream_entity.Upstream, error) {
+		copied := *current
+		copied.Protocols = append(upstream_entity.ProtocolSet(nil), current.Protocols...)
+		return []*upstream_entity.Upstream{&copied}, nil
+	})
+	repo.EXPECT().Save(gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(func(_ context.Context, updated *upstream_entity.Upstream) error {
+		copied := *updated
+		copied.Protocols = append(upstream_entity.ProtocolSet(nil), updated.Protocols...)
+		current = &copied
+		return nil
+	})
+	cachedRepo := proxy_svc.NewCachedUpstreamRepo(repo)
+	previousRepo := upstream_repo.Upstream()
+	upstream_repo.RegisterUpstream(cachedRepo)
+	t.Cleanup(func() { upstream_repo.RegisterUpstream(previousRepo) })
+
+	source := &mutableWebRewriteSource{snapshot: configuredWebSumDB()}
+	originURL, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, port, err := net.SplitHostPort(originURL.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver := webResolverFunc(func(_ context.Context, target *url.URL, _ destination.DestinationRequirement) (*destination.ResolvedTarget, error) {
+		mapped := *target
+		mapped.Scheme = "http"
+		return &destination.ResolvedTarget{
+			URL: &mapped, Authority: target.Host, Host: target.Host,
+			ServerName: target.Hostname(), DialAddress: net.JoinHostPort("127.0.0.1", port),
+		}, nil
+	})
+	previousProxy := proxy_svc.Proxy()
+	proxy_svc.Register(proxy_svc.New(proxy_svc.Options{RewriteConfig: source, DestinationResolver: resolver}))
+	t.Cleanup(func() { proxy_svc.Register(previousProxy) })
+
+	return &sumDBFixture{
+		repo: cachedRepo, source: source, hits: hits,
+		cacheSvc: withDiskCacheOptions(t, cache_svc.Options{RewriteConfig: source}),
+		current:  func() upstream_entity.Upstream { return *current },
+	}
+}
+
+// warm 先拉一次把对象写进缓存，再拉一次确认它真的暖着，返回此刻的回源次数。
+func (f *sumDBFixture) warm(t *testing.T, path string, wantHit bool) int64 {
+	t.Helper()
+	if first := cacheRequest(t, http.MethodGet, path, nil); first.Code != http.StatusOK {
+		t.Fatalf("first GET %s = %d, body %q", path, first.Code, first.Body.String())
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := f.cacheSvc.Quiesce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	hits := f.hits.Load()
+
+	warm := cacheRequest(t, http.MethodGet, path, nil)
+	if warm.Code != http.StatusOK {
+		t.Fatalf("warm GET %s = %d, body %q", path, warm.Code, warm.Body.String())
+	}
+	if got := warm.Header().Get("X-Katch-Cache"); (got == "HIT") != wantHit {
+		t.Fatalf("warm GET %s X-Katch-Cache = %q, want HIT = %v", path, got, wantHit)
+	}
+	if f.hits.Load() != hits {
+		t.Fatalf("origin hits on warm GET %s = %d, want %d", path, f.hits.Load(), hits)
+	}
+	return hits
+}
+
+// save 按运维在界面上改一行上游的形态撤销能力：库与配置快照一起变。
+func (f *sumDBFixture) save(t *testing.T, mutate func(*upstream_entity.Upstream)) {
+	t.Helper()
+	updated := f.current()
+	mutate(&updated)
+	if err := f.repo.Save(context.Background(), &updated); err != nil {
+		t.Fatal(err)
+	}
+	f.source.setProfile(updated.PackageProfile)
+}
+
+func (f *sumDBFixture) mustBeUnavailable(t *testing.T, path string, originHits int64) {
+	t.Helper()
+	got := cacheRequest(t, http.MethodGet, path, nil)
+	if got.Code != http.StatusServiceUnavailable || got.Body.Len() != 0 {
+		t.Fatalf("GET %s after revoke = %d, body %q; want empty 503", path, got.Code, got.Body.String())
+	}
+	if got.Header().Get("X-Katch-Cache") == "HIT" {
+		t.Fatalf("GET %s replayed cache after revoke", path)
+	}
+	if f.hits.Load() != originHits {
+		t.Fatalf("origin hits after revoke = %d, want %d", f.hits.Load(), originHits)
+	}
+}
+
+// TestProxy_SumDBAliasStopsAtRevokedUpstream
+//
+// 撤销 go profile 之后，这条路径不再被 profile 认领，会落回上游自己的
+// immutable_patterns（用例里就配着一条），缓存层若不显式复核当前上游，暖对象
+// 就会被当成内容寻址结果长期原样重放——桥那侧的配置检查压根轮不到。
+//
+// 三种撤销形态都要挡住：改 profile、停用上游、撤掉 static 协议。它们在界面上
+// 是三个不同的开关，在这条路径上却必须是同一个结果。
+func TestProxy_SumDBAliasStopsAtRevokedUpstream(t *testing.T) {
+	for _, revoke := range []struct {
+		name  string
+		apply func(*upstream_entity.Upstream)
+	}{
+		{name: "撤销 go profile", apply: func(u *upstream_entity.Upstream) {
+			u.PackageProfile = upstream_entity.PackageProfileNone
+		}},
+		{name: "停用上游", apply: func(u *upstream_entity.Upstream) { u.Enabled = false }},
+		{name: "撤掉 static 协议", apply: func(u *upstream_entity.Upstream) { u.Protocols = nil }},
+	} {
+		for _, tc := range []struct {
+			path string
+			// warmHit 合成的 /supported 不进对象缓存，暖的那一次也不该是 HIT；
+			// lookup 会落盘，撤销之前必须先证明它真的暖着，否则「撤销后拿不到」
+			// 可能只是因为它从来没被缓存过，这条用例就没有牙。
+			warmHit  bool
+			patterns upstream_entity.PatternList
+		}{
+			{path: "/sumdb/sum.golang.org/supported"},
+			{
+				path:    "/proxy.golang.org/sumdb/sum.golang.org/lookup/example.com/mod@v1.0.0",
+				warmHit: true, patterns: upstream_entity.PatternList{"/lookup/"},
+			},
+		} {
+			t.Run(revoke.name+tc.path, func(t *testing.T) {
+				fixture := newSumDBFixture(t, tc.patterns)
+				originHits := fixture.warm(t, tc.path, tc.warmHit)
+				fixture.save(t, revoke.apply)
+				fixture.mustBeUnavailable(t, tc.path, originHits)
+			})
+		}
+	}
+}
+
+// TestProxy_GenericStaticHostOutlivesTheSumDBAlias
+//
+// 撤销的是 checksum 桥这一件能力，不是「这台主机不再被镜像」：sum.golang.org
+// 仍是一条启用着的 static 上游，通用路径照常服务。这条边界要钉住——桥曾经把
+// 通用路径一起劫持掉，"撤销后连通用路径也 503" 看起来像更安全的行为，实际是
+// 把一条合法的 static 上游连带关掉。
+func TestProxy_GenericStaticHostOutlivesTheSumDBAlias(t *testing.T) {
+	const generic = "/sum.golang.org/lookup/example.com/mod@v1.0.0"
+	fixture := newSumDBFixture(t, upstream_entity.PatternList{"/lookup/"})
+	fixture.warm(t, generic, true)
+
+	fixture.save(t, func(u *upstream_entity.Upstream) {
+		u.PackageProfile = upstream_entity.PackageProfileNone
+	})
+
+	after := cacheRequest(t, http.MethodGet, generic, nil)
+	if after.Code != http.StatusOK || after.Body.String() != "checksum-record" {
+		t.Fatalf("generic GET after revoke = %d, body %q; want 200 checksum-record",
+			after.Code, after.Body.String())
+	}
+	fixture.mustBeUnavailable(t, "/sumdb/sum.golang.org/lookup/example.com/mod@v1.0.0", fixture.hits.Load())
 }
 
 func TestProxy_WarmHitRechecksCurrentTransport(t *testing.T) {

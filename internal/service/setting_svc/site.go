@@ -102,8 +102,12 @@ func canonicalSiteDomain(value string) (string, error) {
 // 已经带了协议的值原样留下：内网部署把 katch 挂在 http 上是合法的，硬补一个
 // https 会给出一条连不上的命令。尾部斜杠一律去掉，否则拼出来是 `//docker.io`。
 func siteBaseURL(domain string) string {
-	domain = strings.TrimSpace(domain)
-	if domain == "" {
+	// 先过一遍写入时的同一条判据：库里的旧行、手工改过的库、以及绕开设置服务
+	// 直接读原始值的改写快照，都只能从这里拿到地址。拼不出可用地址就给空串，
+	// 让上面的 readiness 与 companion 检查按「还没配」失败，而不是把一个坏
+	// 地址印进使用者的命令或改写出去的 metadata。
+	domain, err := canonicalSiteDomain(domain)
+	if err != nil || domain == "" {
 		return ""
 	}
 	if !strings.HasPrefix(domain, "http://") && !strings.HasPrefix(domain, "https://") {
