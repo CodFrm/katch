@@ -27,9 +27,25 @@ verify_capture() {
     return 1
   }
   [ -z "$blocked_dns_evidence" ] || : > "$blocked_dns_evidence"
+  # Go's RFC 6724 address sort connects a UDP socket to each candidate address on
+  # port 53 without sending, and KATCH_HOST has two /etc/hosts addresses (IPv4 and
+  # IPv4-mapped). That connect is indistinguishable from a DNS query in this trace,
+  # so it is accepted only against a resolver snapshot proving Katch is not a
+  # nameserver. Unset, missing or unreadable snapshots fail closed.
+  katch_route_probe=0
+  resolvers=${KATCH_ROUTE_PROBE_RESOLVERS:-}
+  if [ -n "$resolvers" ] && [ -r "$resolvers" ] && [ -f "$resolvers" ]; then
+    if ! awk -v ip="$katch_ip" '
+      $1 == "nameserver" && ($2 == ip || $2 == "::ffff:" ip) { found = 1 }
+      END { exit found ? 0 : 1 }
+    ' "$resolvers"; then
+      katch_route_probe=1
+    fi
+  fi
   if awk -v allowed="$katch_ip" -v allowed_port="${KATCH_PORT:-}" \
     -v allow_blocked_dns_probe="$KATCH_ALLOW_BLOCKED_DNS_PROBE" \
     -v allow_musl_route_probe="$KATCH_ALLOW_MUSL_ROUTE_PROBE" \
+    -v katch_route_probe="$katch_route_probe" \
     -v blocked_dns_evidence="$blocked_dns_evidence" '
     function reject(line) {
       print "non-katch connection attempt: " line > "/dev/stderr"
@@ -49,6 +65,10 @@ verify_capture() {
       if (destination ~ /^127\./ || destination == "::1" || destination ~ /^::ffff:127\./) return
       if (destination == allowed || destination == "::ffff:" allowed) {
         if (port == 53) {
+          # Only complete connects qualify: a split probe cannot be paired here
+          # without the Docker evidence path below, so it stays a rejection.
+          if (katch_route_probe == 1 && line ~ /(^|[[:space:]])connect\(/ &&
+            line ~ /[[:space:]]=[[:space:]]0[[:space:]]*$/) return
           if (allow_blocked_dns_probe == 1 && line ~ /(^|[[:space:]])connect\(/) {
             if (line ~ /[[:space:]]=[[:space:]]0[[:space:]]*$/) {
               preserve_blocked_dns_probe(line)
@@ -318,6 +338,15 @@ if [ "$KATCH_LOOPBACK_RESOLVER" -eq 1 ]; then
   cat /etc/hosts > "$KATCH_ARTIFACTS/hosts"
   install_loopback_resolver /etc/resolv.conf "$KATCH_ARTIFACTS"
 fi
+# Standard cases resolve through this container's own /etc/resolv.conf, so it is
+# the authority on whether Katch could be a DNS server. Privileged cases run nested
+# daemons that rewrite their own resolver to the gateway (Katch), so they never
+# get the route-probe allowance and keep their explicit per-case exceptions.
+resolv_before=
+if [ "$KATCH_LOOPBACK_RESOLVER" -eq 0 ]; then
+  resolv_before=$KATCH_ARTIFACTS/resolv.conf.before
+  cat /etc/resolv.conf > "$resolv_before"
+fi
 connect_log=$KATCH_ARTIFACTS/connect.log
 firewall_before_v4=$KATCH_ARTIFACTS/iptables.before
 firewall_before_v6=$KATCH_ARTIFACTS/ip6tables.before
@@ -372,6 +401,11 @@ ip6tables -nvxL OUTPUT > "$KATCH_ARTIFACTS/ip6tables.after"
 blocked_dns_evidence=
 if [ "$KATCH_ALLOW_BLOCKED_DNS_PROBE" -eq 1 ]; then
   blocked_dns_evidence=$KATCH_ARTIFACTS/blocked-dns-probes.log
+fi
+if [ -n "$resolv_before" ]; then
+  # A root case could point the resolver at Katch mid-run; audit both states.
+  KATCH_ROUTE_PROBE_RESOLVERS=$KATCH_ARTIFACTS/resolvers.audited
+  cat "$resolv_before" /etc/resolv.conf > "$KATCH_ROUTE_PROBE_RESOLVERS"
 fi
 if ! verify_capture "$connect_log" "$katch_ip" "$blocked_dns_evidence"; then
   status=70

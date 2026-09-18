@@ -1420,6 +1420,51 @@ if KATCH_PORT=$capture_katch_port "$ENTRYPOINT" --verify-capture "$workdir/neste
 fi
 grep -q '172.17.0.1' "$workdir/out" || fail "nested daemon DNS probe was not reported"
 
+# Go's RFC 6724 address sort connects a UDP socket to every candidate address on
+# port 53 to learn the source address; it sends nothing. The entrypoint's
+# IPv4-mapped hosts entry gives KATCH_HOST two addresses, so every Go client
+# emits one such probe per address before dialing Katch. In a standard case the
+# container resolver is authoritative: when Katch is not one of its nameservers
+# a connect to Katch:53 can only be that route probe, never a DNS query.
+cat > "$workdir/go-route-probe.log" <<EOF
+160 connect(7, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("$capture_katch_ip")}, 16) = 0
+160 connect(7, {sa_family=AF_INET6, sin6_port=htons(53), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "::ffff:$capture_katch_ip", &sin6_addr), sin6_scope_id=0}, 28) = 0
+160 connect(7, {sa_family=AF_INET, sin_port=htons($capture_katch_port), sin_addr=inet_addr("$capture_katch_ip")}, 16) = -1 EINPROGRESS (Operation now in progress)
+EOF
+printf 'nameserver 192.168.8.141\nnameserver 192.168.8.1\nsearch lan\n' > "$workdir/resolvers-without-katch"
+KATCH_ROUTE_PROBE_RESOLVERS=$workdir/resolvers-without-katch KATCH_PORT=$capture_katch_port \
+  "$ENTRYPOINT" --verify-capture "$workdir/go-route-probe.log" "$capture_katch_ip" ||
+  fail "Go route probes to Katch:53 were rejected although Katch is not a nameserver"
+
+for resolver_line in "nameserver $capture_katch_ip" "nameserver ::ffff:$capture_katch_ip"; do
+  printf 'nameserver 192.168.8.141\n%s\n' "$resolver_line" > "$workdir/resolvers-with-katch"
+  if KATCH_ROUTE_PROBE_RESOLVERS=$workdir/resolvers-with-katch KATCH_PORT=$capture_katch_port \
+    "$ENTRYPOINT" --verify-capture "$workdir/go-route-probe.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+    fail "Katch:53 connect was accepted while Katch is a nameserver ($resolver_line)"
+  fi
+  grep -F 'htons(53)' "$workdir/out" >/dev/null || fail "Katch:53 connect with Katch as nameserver was not reported"
+done
+
+if KATCH_ROUTE_PROBE_RESOLVERS=$workdir/no-such-resolvers KATCH_PORT=$capture_katch_port \
+  "$ENTRYPOINT" --verify-capture "$workdir/go-route-probe.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "Go route probe was accepted without a readable resolver snapshot"
+fi
+
+cat > "$workdir/go-route-probe-rejects.log" <<EOF
+161 connect(7, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("$capture_katch_ip")}, 16) = -1 EPERM (Operation not permitted)
+162 sendto(7, "query", 5, MSG_NOSIGNAL, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("$capture_katch_ip")}, 16) = 5
+163 connect(7, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, 16) = 0
+164 connect(7, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("$capture_katch_ip")}, 16 <unfinished ...>
+164 <... connect resumed>)            = 0
+EOF
+if KATCH_ROUTE_PROBE_RESOLVERS=$workdir/resolvers-without-katch KATCH_PORT=$capture_katch_port \
+  "$ENTRYPOINT" --verify-capture "$workdir/go-route-probe-rejects.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "route probe allowance accepted a failed, sent, external or split Katch:53 attempt"
+fi
+for expected in '= -1 EPERM' 'sendto(' '8.8.8.8' '<unfinished ...>'; do
+  grep -F "$expected" "$workdir/out" >/dev/null || fail "route probe allowance did not report: $expected"
+done
+
 cat > "$workdir/allowed-blocked-dns-probe.log" <<EOF
 139 connect(3, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("$capture_katch_ip")}, 16) = 0
 140 connect(3, {sa_family=AF_INET6, sin6_port=htons(53), inet_pton(AF_INET6, "::ffff:$capture_katch_ip", &sin6_addr), sin6_scope_id=0}, 28) = 0
@@ -1691,6 +1736,7 @@ case ${0##*/} in
     done
     [ -n "$capture" ] || exit 64
     : > "$capture"
+    [ -z "${STRACE_CAPTURE_FIXTURE:-}" ] || cat "$STRACE_CAPTURE_FIXTURE" > "$capture"
     "$@"
     ;;
   tee)
@@ -1749,6 +1795,25 @@ grep -q '^-u client --preserve-environment -- env HOME=/home/client USER=client 
 if grep -E '^(install|update-ca-certificates|update-ca-trust) ' "$workdir/entrypoint-events.log"; then
   fail "entrypoint changed system trust when no client CA was configured"
 fi
+
+# End to end through the real entrypoint: a standard case snapshots its resolver
+# and the Go route probes that its own IPv4-mapped hosts entry provokes pass the
+# audit. This host's resolver never lists the fixture Katch address.
+cat > "$workdir/entrypoint-go-probe.log" <<'EOF'
+170 connect(7, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("172.18.0.2")}, 16) = 0
+170 connect(7, {sa_family=AF_INET6, sin6_port=htons(53), inet_pton(AF_INET6, "::ffff:172.18.0.2", &sin6_addr), sin6_scope_id=0}, 28) = 0
+170 connect(7, {sa_family=AF_INET, sin_port=htons(8080), sin_addr=inet_addr("172.18.0.2")}, 16) = -1 EINPROGRESS (Operation now in progress)
+EOF
+rm -f "$workdir/host-mapping.state"
+if ! run_entrypoint "$workdir/go-probe-artifacts" env -u KATCH_CLIENT_USER -u KATCH_CLIENT_CA_CERT \
+  STRACE_CAPTURE_FIXTURE="$workdir/entrypoint-go-probe.log" >"$workdir/out" 2>&1; then
+  cat "$workdir/out" >&2
+  fail "standard case rejected the Go route probes its own hosts mapping provokes"
+fi
+[ -s "$workdir/go-probe-artifacts/resolv.conf.before" ] ||
+  fail "standard case did not snapshot its resolver before the client ran"
+[ -s "$workdir/go-probe-artifacts/resolvers.audited" ] ||
+  fail "standard case did not keep the resolver state it audited against"
 
 : > "$workdir/runuser.log"
 : > "$workdir/entrypoint-events.log"
