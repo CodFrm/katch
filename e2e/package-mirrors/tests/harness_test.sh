@@ -529,6 +529,57 @@ fi
 printf '%s\n' "$rubygems_case_commands" | grep -F 'BUNDLE_FROZEN=true' >/dev/null ||
   fail "RubyGems warm Bundler install is not frozen"
 
+# APT's InRelease carries max-age=120, and a CDN Age can consume most of it before the
+# index arrives, so a warm re-fetch is what the protocol asks for rather than a cache
+# miss. The warm phase therefore restores the cold phase's signature-verified index and
+# verifies it again, and only the .deb still crosses the network, where zero origin
+# requests is a promise Katch can keep. What the case must never do is widen that
+# sharing into the artifact cache, or skip the signature check on the restored index.
+apt_case=$CASES/apt.yaml
+apt_setup=$(jq -r '.setup' "$apt_case")
+apt_run=$(jq -r '.run' "$apt_case")
+apt_assert=$(jq -r '.assert' "$apt_case")
+apt_run_script=$workdir/apt-run.sh
+printf '%s\n' "$apt_run" > "$apt_run_script"
+printf '%s\n' "$apt_setup" | grep -Fx '  test -d "$KATCH_SHARED/apt-lists"' >/dev/null ||
+  fail "APT warm setup does not require the cold phase's shared index directory"
+printf '%s\n' "$apt_setup" | grep -Fx '  cp -a "$KATCH_SHARED/apt-lists/." /var/lib/apt/lists/' >/dev/null ||
+  fail "APT warm setup does not restore the shared index into the APT list directory"
+printf '%s\n' "$apt_setup" | grep -Fx 'rm -rf /var/lib/apt/lists/*' >/dev/null ||
+  fail "APT setup does not start each phase from an empty index directory"
+[ "$(printf '%s\n' "$apt_run" | grep -c 'apt-get')" -eq 2 ] ||
+  fail "APT run does not invoke apt-get exactly twice: one cold update and one install per phase"
+printf '%s\n' "$apt_run" | grep -Fx '    apt-get -o Acquire::Retries=0 update 2>&1 | tee /tmp/apt-update.log' >/dev/null ||
+  fail "APT run does not refresh indexes with retries disabled in the cold phase"
+printf '%s\n' "$apt_run" | grep -Fx 'apt-get -o Acquire::Retries=0 install -y --no-install-recommends hello' >/dev/null ||
+  fail "APT run does not install the package with retries disabled in both phases"
+apt_gpgv_line=$(grep -n -F 'gpgv --keyring /usr/share/keyrings/debian-archive-keyring.gpg' "$apt_run_script" | cut -d: -f1)
+apt_share_line=$(grep -n -F 'cp -a {} "$KATCH_SHARED/apt-lists/"' "$apt_run_script" | cut -d: -f1)
+apt_esac_line=$(grep -n -Fx 'esac' "$apt_run_script" | head -1 | cut -d: -f1)
+[ "$(printf '%s\n' "$apt_gpgv_line" | wc -l | tr -d ' ')" -eq 1 ] && [ -n "$apt_gpgv_line" ] ||
+  fail "APT run does not verify the index signature exactly once"
+[ -n "$apt_share_line" ] || fail "APT cold run does not publish the index for the warm phase"
+[ -n "$apt_esac_line" ] && [ "$apt_esac_line" -lt "$apt_gpgv_line" ] ||
+  fail "APT run verifies the index signature inside a phase branch instead of in both phases"
+[ "$apt_gpgv_line" -lt "$apt_share_line" ] ||
+  fail "APT cold run publishes the index before verifying its signature"
+printf '%s\n' "$apt_run" | grep -F "\\( -name '*_InRelease' -o -name '*_Packages*' \\)" >/dev/null ||
+  fail "APT cold run shares more than the signed index and its package lists"
+printf '%s\n' "$apt_assert" | grep -Fx '[ -z "$(find "$KATCH_SHARED" -name '"'"'*.deb'"'"' -print -quit)" ]' >/dev/null ||
+  fail "APT assertions do not prove the artifact cache stayed out of the shared directory"
+printf '%s\n' "$apt_assert" | grep -F 'cmp "$KATCH_SHARED/apt-lists/$(basename "${inrelease}")" "${inrelease}"' >/dev/null ||
+  fail "APT assertions do not prove the verified index is the one the phase used"
+printf '%s\n' "$apt_assert" | grep -Fx '    test ! -s /tmp/apt-update.log' >/dev/null ||
+  fail "APT warm assertions do not prove the phase refreshed no index"
+apt_case_commands=$(jq -r '[.setup, .run, .assert] | join("\n")' "$apt_case")
+if printf '%s\n' "$apt_case_commands" |
+  grep -i -E '(allow-unauthenticated|AllowUnauthenticated|trusted=yes|Dir::Cache|/var/cache/apt|--force-yes|https?://deb[.]debian[.]org)'; then
+  fail "APT mirror case disables signature checks, redirects the artifact cache, or uses a public Debian URL"
+fi
+if printf '%s\n' "$apt_case_commands" | grep -E 'KATCH_SHARED[^ ]*(archives|[.]deb)'; then
+  fail "APT mirror case shares downloaded packages instead of only the signed index"
+fi
+
 maven_case=$CASES/maven.yaml
 maven_setup=$(jq -r '.setup' "$maven_case")
 maven_run=$(jq -r '.run' "$maven_case")
