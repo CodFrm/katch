@@ -741,6 +741,36 @@ func transformedResponse(target *proxy_svc.Target, payload []byte, meta *proxy_s
 }
 
 func (c *cacheSvc) urlRewriter(snapshot *proxy_svc.RewriteSnapshot) packageprofile.RewriteURL {
+	// 一份元数据里的构件 URL 几乎都指向同一个伙伴主机，而解析这一步的判据只有
+	// scheme、主机和端口——一次链接解析一次，就把一趟 DNS 查询变成成千上万趟
+	// （PyPI 的 numpy 索引有 4232 个链接，够让一个索引页几十分钟才回得来）。
+	// 所以在这一份正文的范围内按 scheme/主机/端口记住结论。
+	//
+	// 刻意不跨请求：客户端真去拉那个 URL 时回源会重新解析、重新按地址策略校验，
+	// 那才是 DNS 重绑定防护生效的地方，把结论留到请求之外等于把它放掉。
+	requirement := destination.DestinationRequirement{AddressPolicy: destination.PublicAddressesOnly}
+	var mu sync.Mutex
+	resolved := map[string]error{}
+	resolveOnce := func(ctx context.Context, target *url.URL, host string) error {
+		// 带用户信息的 URL 一律现算：它在解析器里是无条件拒绝，不该由同主机的
+		// 别的 URL 的结论代表，也不该把自己的拒绝结论传染给它们。
+		if target.User != nil {
+			_, err := c.resolver.Resolve(ctx, target, requirement)
+			return err
+		}
+		key := target.Scheme + "|" + host + "|" + target.Port()
+		mu.Lock()
+		err, seen := resolved[key]
+		mu.Unlock()
+		if seen {
+			return err
+		}
+		_, err = c.resolver.Resolve(ctx, target, requirement)
+		mu.Lock()
+		resolved[key] = err
+		mu.Unlock()
+		return err
+	}
 	return func(ctx context.Context, target *url.URL, companion packageprofile.Companion) (*url.URL, error) {
 		host := strings.ToLower(strings.TrimSuffix(target.Hostname(), "."))
 		if companion.Host != "" && host != strings.ToLower(strings.TrimSuffix(companion.Host, ".")) {
@@ -763,9 +793,7 @@ func (c *cacheSvc) urlRewriter(snapshot *proxy_svc.RewriteSnapshot) packageprofi
 				zap.String("host", host), zap.String("reason", "profile_incompatible"))
 			return nil, packageprofile.ErrUnavailable
 		}
-		if _, err := c.resolver.Resolve(ctx, target, destination.DestinationRequirement{
-			AddressPolicy: destination.PublicAddressesOnly,
-		}); err != nil {
+		if err := resolveOnce(ctx, target, host); err != nil {
 			return nil, packageprofile.ErrInvalidMetadata
 		}
 		mapped, err := url.Parse(strings.TrimSuffix(snapshot.SiteBaseURL, "/") + "/" + host + target.EscapedPath())
