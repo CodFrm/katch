@@ -741,10 +741,14 @@ func transformedResponse(target *proxy_svc.Target, payload []byte, meta *proxy_s
 }
 
 func (c *cacheSvc) urlRewriter(snapshot *proxy_svc.RewriteSnapshot) packageprofile.RewriteURL {
-	// 一份元数据里的构件 URL 几乎都指向同一个伙伴主机，而解析这一步的判据只有
-	// scheme、主机和端口——一次链接解析一次，就把一趟 DNS 查询变成成千上万趟
-	// （PyPI 的 numpy 索引有 4232 个链接，够让一个索引页几十分钟才回得来）。
-	// 所以在这一份正文的范围内按 scheme/主机/端口记住结论。
+	// 一份元数据里的构件 URL 几乎都指向同一个伙伴主机，一次链接解析一次就把一趟 DNS
+	// 查询变成成千上万趟（PyPI 的 numpy 索引有 4232 个链接，够让一个索引页几十分钟才
+	// 回得来）。所以在这一份正文的范围内按 scheme/主机记住结论。
+	//
+	// 键里刻意不含端口：改写出来的地址本来就不带端口（下面拼的是 SiteBaseURL + "/" +
+	// 主机 + 路径），客户端回头来取时用的是这个上游注册的 origin 上的端口，元数据里
+	// 写的那个从头到尾不参与任何判断。把它放进键里只会让一份写了几万个不同端口的正文
+	// 把省下来的 DNS 查询原样要回去。
 	//
 	// 刻意不跨请求：客户端真去拉那个 URL 时回源会重新解析、重新按地址策略校验，
 	// 那才是 DNS 重绑定防护生效的地方，把结论留到请求之外等于把它放掉。
@@ -758,7 +762,7 @@ func (c *cacheSvc) urlRewriter(snapshot *proxy_svc.RewriteSnapshot) packageprofi
 			_, err := c.resolver.Resolve(ctx, target, requirement)
 			return err
 		}
-		key := target.Scheme + "|" + host + "|" + target.Port()
+		key := target.Scheme + "|" + host
 		mu.Lock()
 		err, seen := resolved[key]
 		mu.Unlock()
