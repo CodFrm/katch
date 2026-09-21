@@ -217,3 +217,45 @@ func TestGet_RegistryDigestETagAnswersConditional(t *testing.T) {
 		convey.So(o.hits.Load(), convey.ShouldEqual, 1)
 	})
 }
+
+// TestGet_RegistryHitReplaysDistributionAPIVersion 未命中时上游的
+// Docker-Distribution-Api-Version 随其余响应头原样转发，命中也必须带回同一个值；
+// 上游没给时命中同样不带，katch 不替缓存对象编造这个头。
+func TestGet_RegistryHitReplaysDistributionAPIVersion(t *testing.T) {
+	const path = "/library/redis/manifests/7"
+	const manifest = `{"schemaVersion":2,"flavour":"oci"}`
+	convey.Convey("上游给了 Docker-Distribution-Api-Version：GET 与 HEAD 命中都原样回放", t, func() {
+		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", ociManifestType)
+			w.Header().Set("Docker-Distribution-Api-Version", "registry/2.0")
+			_, _ = io.WriteString(w, manifest)
+		})
+		svc, _, _ := setupSvc(t, o, registryUpstream("registry.test"), Options{})
+
+		_, missMeta := pullWith(t, svc, registryTarget("registry.test", path, ociManifestType))
+		convey.So(missMeta.Header.Get("Docker-Distribution-Api-Version"), convey.ShouldEqual, "registry/2.0")
+
+		_, hitMeta := pullWith(t, svc, registryTarget("registry.test", path, ociManifestType))
+		convey.So(hitMeta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
+		convey.So(hitMeta.Header.Get("Docker-Distribution-Api-Version"), convey.ShouldEqual, "registry/2.0")
+
+		head := registryTarget("registry.test", path, ociManifestType)
+		head.Method = http.MethodHead
+		_, headMeta := pullWith(t, svc, head)
+		convey.So(headMeta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
+		convey.So(headMeta.Header.Get("Docker-Distribution-Api-Version"), convey.ShouldEqual, "registry/2.0")
+		convey.So(o.hits.Load(), convey.ShouldEqual, 1)
+	})
+
+	convey.Convey("上游没给：命中也不带", t, func() {
+		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", ociManifestType)
+			_, _ = io.WriteString(w, manifest)
+		})
+		svc, _, _ := setupSvc(t, o, registryUpstream("registry.test"), Options{})
+		pullWith(t, svc, registryTarget("registry.test", path, ociManifestType))
+		_, hitMeta := pullWith(t, svc, registryTarget("registry.test", path, ociManifestType))
+		convey.So(hitMeta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
+		convey.So(hitMeta.Header.Values("Docker-Distribution-Api-Version"), convey.ShouldBeEmpty)
+	})
+}

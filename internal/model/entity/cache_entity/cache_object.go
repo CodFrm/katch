@@ -39,6 +39,9 @@ type CacheObject struct {
 	AcceptRanges        string `gorm:"column:accept_ranges" json:"accept_ranges"`
 	ContentDisposition  string `gorm:"column:content_disposition" json:"content_disposition"`
 	DockerContentDigest string `gorm:"column:docker_content_digest" json:"docker_content_digest"`
+	// DockerDistributionAPIVersion 上游响应里的 Docker-Distribution-Api-Version，命中时原样
+	// 回放；上游没给时为空，命中也不带。
+	DockerDistributionAPIVersion string `gorm:"column:docker_distribution_api_version" json:"docker_distribution_api_version"`
 	// Maven-compatible checksum headers are opaque origin metadata. They are replayed as-is
 	// on hits, never derived from or used to validate the cached body.
 	XChecksumMD5         string `gorm:"column:x_checksum_md5" json:"x_checksum_md5"`

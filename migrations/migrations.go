@@ -30,6 +30,7 @@ func migrationList() []*gormigrate.Migration {
 		packageProfile(),
 		cacheResponseMetadata(),
 		cacheChecksumHeaders(),
+		cacheDistributionAPIVersion(),
 	}
 }
 

@@ -1193,6 +1193,7 @@ func responseRecordInput(upstreamID int64, key, digest string, size int64,
 var persistedResponseHeaders = []string{
 	"Content-Type", "Etag", "Last-Modified", "Cache-Control", "Date", "Age", "Expires",
 	"Vary", "Accept-Ranges", "Content-Disposition", "Docker-Content-Digest",
+	"Docker-Distribution-Api-Version",
 	"X-Checksum-MD5", "X-Checksum-SHA1", "X-Checksum-SHA256", "X-Checksum-SHA512",
 }
 
@@ -1309,7 +1310,9 @@ func replayStoredHeaders(object *cache_entity.CacheObject, now time.Time) http.H
 		"Expires": object.OriginExpires, "Vary": object.Vary,
 		"Accept-Ranges": object.AcceptRanges, "Content-Disposition": object.ContentDisposition,
 		"Docker-Content-Digest": object.DockerContentDigest,
-		"X-Checksum-MD5":        object.XChecksumMD5, "X-Checksum-SHA1": object.XChecksumSHA1,
+		// 只在上游给过时回放，不替缓存对象编造：没存就是上游没给。
+		"Docker-Distribution-Api-Version": object.DockerDistributionAPIVersion,
+		"X-Checksum-MD5":                  object.XChecksumMD5, "X-Checksum-SHA1": object.XChecksumSHA1,
 		"X-Checksum-SHA256": object.XChecksumSHA256, "X-Checksum-SHA512": object.XChecksumSHA512,
 	} {
 		if safe := safeHeaderValue(value); safe != "" {
@@ -1363,6 +1366,7 @@ func (c *cacheSvc) saveRecord(ctx context.Context, in *recordInput) error {
 	object.AcceptRanges = ""
 	object.ContentDisposition = ""
 	object.DockerContentDigest = ""
+	object.DockerDistributionAPIVersion = ""
 	object.XChecksumMD5 = ""
 	object.XChecksumSHA1 = ""
 	object.XChecksumSHA256 = ""
@@ -1381,6 +1385,7 @@ func (c *cacheSvc) saveRecord(ctx context.Context, in *recordInput) error {
 		object.AcceptRanges = safeHeaderValue(in.Header.Get("Accept-Ranges"))
 		object.ContentDisposition = safeHeaderValue(in.Header.Get("Content-Disposition"))
 		object.DockerContentDigest = safeHeaderValue(in.Header.Get("Docker-Content-Digest"))
+		object.DockerDistributionAPIVersion = safeHeaderValue(in.Header.Get("Docker-Distribution-Api-Version"))
 		object.XChecksumMD5 = safeHeaderValue(in.Header.Get("X-Checksum-MD5"))
 		object.XChecksumSHA1 = safeHeaderValue(in.Header.Get("X-Checksum-SHA1"))
 		object.XChecksumSHA256 = safeHeaderValue(in.Header.Get("X-Checksum-SHA256"))
