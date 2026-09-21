@@ -126,6 +126,8 @@ type fakeRepo struct {
 	// pump 里 Save 排在 finish 之前，所以按住它就把「字节全发完了、done 还没置」
 	// 那个窗口停住了——客户端正是在这个窗口里挂断，才会把一次成功的转发记成中断。
 	saveGate chan struct{}
+	// saveErr 非 nil 时 Save 返回它、不落库：模拟库写失败，记录停在上一份。
+	saveErr error
 	// totalSizeGate 非 nil 时，TotalSize 会先等它。
 	//
 	// TotalSize 只有 enforceQuota 一个调用方，而 enforceQuota 只跑在 pump 那个
@@ -164,6 +166,9 @@ func newFakeRepo(t *testing.T, stampAccess bool) *fakeRepo {
 			}
 			f.mu.Lock()
 			defer f.mu.Unlock()
+			if f.saveErr != nil {
+				return f.saveErr
+			}
 			if obj.ID == 0 {
 				obj.ID = f.nextID
 				f.nextID++
@@ -191,6 +196,18 @@ func newFakeRepo(t *testing.T, stampAccess bool) *fakeRepo {
 			row, ok := f.rows[id]
 			if !ok || row.Immutable || row.ExpiresAt <= 0 || row.ExpiresAt > before || row.Pinned ||
 				revalidatable(row) {
+				return false, nil
+			}
+			delete(f.rows, id)
+			return true, nil
+		})
+	m.EXPECT().DeleteEvictable(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().
+		DoAndReturn(func(_ any, id int64, digest string, now int64) (bool, error) {
+			f.waitDelete()
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			row, ok := f.rows[id]
+			if !ok || row.Digest != digest || !evictable(row, now) {
 				return false, nil
 			}
 			delete(f.rows, id)
@@ -255,9 +272,7 @@ func newFakeRepo(t *testing.T, stampAccess bool) *fakeRepo {
 			defer f.mu.Unlock()
 			list := make([]*cache_entity.CacheObject, 0, limit)
 			for _, row := range f.rows {
-				// 和 SQL 一样：未 pin 的不可变对象，加上已过期但可续期的可变对象。
-				expiredRevalidatable := row.ExpiresAt > 0 && row.ExpiresAt <= now && revalidatable(row)
-				if !row.Pinned && (row.Immutable || expiredRevalidatable) {
+				if evictable(row, now) {
 					list = append(list, clone(row))
 				}
 			}
@@ -617,6 +632,12 @@ func quotaOf(quota int64, percent int) func(rt *setting_svc.RuntimeSettings) {
 		rt.CacheQuotaBytes = quota
 		rt.CacheReclaimPercent = percent
 	}
+}
+
+// evictable 和仓储的淘汰判据一致：未 pin 的不可变对象，加上已过期但可续期的可变对象。
+func evictable(row *cache_entity.CacheObject, now int64) bool {
+	expiredRevalidatable := row.ExpiresAt > 0 && row.ExpiresAt <= now && revalidatable(row)
+	return !row.Pinned && (row.Immutable || expiredRevalidatable)
 }
 
 // revalidatable 记录有没有上游 validator 可供条件回源，和仓储 SQL 里的判据一致。

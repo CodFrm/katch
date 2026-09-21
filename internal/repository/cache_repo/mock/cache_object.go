@@ -85,6 +85,21 @@ func (mr *MockCacheObjectRepoMockRecorder) Delete(ctx, id any) *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Delete", reflect.TypeOf((*MockCacheObjectRepo)(nil).Delete), ctx, id)
 }
 
+// DeleteEvictable mocks base method.
+func (m *MockCacheObjectRepo) DeleteEvictable(ctx context.Context, id int64, digest string, now int64) (bool, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "DeleteEvictable", ctx, id, digest, now)
+	ret0, _ := ret[0].(bool)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// DeleteEvictable indicates an expected call of DeleteEvictable.
+func (mr *MockCacheObjectRepoMockRecorder) DeleteEvictable(ctx, id, digest, now any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeleteEvictable", reflect.TypeOf((*MockCacheObjectRepo)(nil).DeleteEvictable), ctx, id, digest, now)
+}
+
 // DeleteExpired mocks base method.
 func (m *MockCacheObjectRepo) DeleteExpired(ctx context.Context, id, before int64) (bool, error) {
 	m.ctrl.T.Helper()

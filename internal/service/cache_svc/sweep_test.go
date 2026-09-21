@@ -125,9 +125,6 @@ func TestSweep_DoesNotDeleteLegacyDigestPromotedAfterListing(t *testing.T) {
 // 重下（决策 9）。没有 validator 的照旧收走——留着它也只能整份重下。
 func TestSweep_KeepsExpiredObjectsThatCanBeRevalidated(t *testing.T) {
 	ro := newRevalidationOrigin(t, "InRelease", staticValidatorHeaders(), notModifiedAfterFirst(nil))
-	plain := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, "plain")
-	})
 	up := staticUpstream("deb.debian.org")
 	svc, repo, _ := setupSvc(t, ro.originStub, up, Options{})
 	const path = "/dists/stable/InRelease"
@@ -146,13 +143,9 @@ func TestSweep_KeepsExpiredObjectsThatCanBeRevalidated(t *testing.T) {
 		t.Fatalf("Sweep 之后的请求 = %q / %q，要的是一次 304 续期", body, meta.Header.Get(cacheStatusHeader))
 	}
 
-	// 同一套清理对没有 validator 的过期对象照旧生效。
-	plainUp := staticUpstream("plain.example.com")
-	plainUp.ID = 8
-	plainUp.Origin = plain.srv.URL
-	plainUp.Enabled = true
+	// 同一套清理对没有 validator 的过期对象照旧生效。Put 写进去的记录不带 validator。
 	if err := svc.Put(context.Background(), &PutRequest{
-		UpstreamID: plainUp.ID, Key: "/plain", Content: strings.NewReader("plain"),
+		UpstreamID: up.ID, Key: "/plain", Content: strings.NewReader("plain"),
 		ContentType: "text/plain", TTLSeconds: 60,
 	}); err != nil {
 		t.Fatal(err)
@@ -194,4 +187,64 @@ func TestReclaim_EvictsExpiredRevalidatableMutableObjects(t *testing.T) {
 	if repo.byKey("/pool/main/h/hello.deb") == nil {
 		t.Fatal("不可变对象比更久未访问的过期对象先被淘汰")
 	}
+}
+
+// TestReclaim_DoesNotEvictRowRewrittenAfterListing 覆盖淘汰与重新写入的竞态：过期可续期的
+// 可变对象被列为淘汰候选之后，一次回源可能已经把同一行换成了新内容、新的过期时刻。
+// 淘汰删除时必须复核，否则删掉的是刚写进去的那份，新内容的文件也没人再引用、白占着盘。
+func TestReclaim_DoesNotEvictRowRewrittenAfterListing(t *testing.T) {
+	ro := newRevalidationOrigin(t, "old-v1", staticValidatorHeaders(),
+		func(n int, _ *http.Request, w http.ResponseWriter) int {
+			if n > 1 {
+				w.Header().Set("Content-Type", "text/plain")
+				w.Header().Set("Etag", `"origin-v2"`)
+				w.Header().Set("Cache-Control", "public, max-age=60")
+				_, _ = io.WriteString(w, "new-content-v2")
+				return -1
+			}
+			return 0
+		})
+	up := staticUpstream("deb.debian.org")
+	runtime := newFakeRuntime(t, quotaOf(1<<30, 100))
+	svc, repo, store := setupSvc(t, ro.originStub, up, Options{Runtime: runtime})
+	const path = "/dists/stable/InRelease"
+	pullWith(t, svc, target(up.Host, path))
+	repo.expire(path)
+
+	runtime.mu.Lock()
+	runtime.rt.CacheQuotaBytes = 1
+	runtime.mu.Unlock()
+	repo.deleteStarted = make(chan struct{}, 1)
+	repo.deleteGate = make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, err := svc.Sweep(context.Background())
+		done <- err
+	}()
+	select {
+	case <-repo.deleteStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("配额回收没有走到删除候选")
+	}
+
+	body, _ := pullWith(t, svc, target(up.Host, path))
+	if body != "new-content-v2" {
+		t.Fatalf("重新回源的正文 = %q", body)
+	}
+	close(repo.deleteGate)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	row := repo.byKey(path)
+	if row == nil {
+		t.Fatal("列为候选之后被重新写入的记录仍被淘汰了")
+	}
+	if row.Digest != digestOfString("new-content-v2") {
+		t.Fatalf("记录 digest = %q，要的是新内容", row.Digest)
+	}
+	file, _, err := store.Open(row.Digest)
+	if err != nil {
+		t.Fatalf("新内容的文件不见了：%v", err)
+	}
+	_ = file.Close()
 }

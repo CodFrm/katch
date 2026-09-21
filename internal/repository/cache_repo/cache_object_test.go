@@ -198,6 +198,24 @@ func TestCacheObjectRepo_DeleteExpired(t *testing.T) {
 	})
 }
 
+func TestCacheObjectRepo_DeleteEvictable(t *testing.T) {
+	convey.Convey("淘汰删除前原子复核记录仍是同一份内容、仍在淘汰候选之列", t, func() {
+		ctx, _, mock := testutils.Database(t)
+		mock.ExpectBegin()
+		mock.ExpectExec("DELETE FROM `cache_objects` WHERE id=\\? AND digest=\\? AND pinned=\\? AND "+
+			"\\(immutable=\\? OR \\(expires_at>0 AND expires_at<=\\? AND "+
+			"\\(origin_etag<>'' OR origin_last_modified<>''\\)\\)\\)").
+			WithArgs(int64(5), "sha256:abc", false, true, int64(1000)).
+			WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectCommit()
+
+		removed, err := NewCacheObject().DeleteEvictable(ctx, 5, "sha256:abc", 1000)
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(removed, convey.ShouldBeFalse)
+		convey.So(mock.ExpectationsWereMet(), convey.ShouldBeNil)
+	})
+}
+
 func TestCacheObjectRepo_Delete(t *testing.T) {
 	convey.Convey("删除一条缓存记录", t, func() {
 		ctx, _, mock := testutils.Database(t)

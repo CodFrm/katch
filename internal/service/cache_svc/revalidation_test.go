@@ -3,6 +3,7 @@ package cache_svc
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"sync"
@@ -554,5 +555,81 @@ func TestGet_ExpiredManifestHeadRevalidatesWithOriginValidators(t *testing.T) {
 	}
 	if got := meta.Header.Get("Docker-Content-Digest"); got != digestOfString(manifest) {
 		t.Fatalf("Docker-Content-Digest = %q", got)
+	}
+}
+
+func TestGet_RevalidationWeakValidatorMismatchFallsBackToUnconditionalGet(t *testing.T) {
+	// 304 带来的弱 validator 和保存的对不上（RFC 9111 §4.3.4）：它选不中手上这份，
+	// 不能拿它续期，只能整份再取。
+	cases := []struct {
+		name    string
+		headers map[string]string
+		extra   map[string]string
+	}{
+		{
+			name: "弱 ETag 不同",
+			headers: map[string]string{
+				"Content-Type": "text/plain", "Etag": `W/"origin-v1"`, "Cache-Control": "public, max-age=60",
+			},
+			extra: map[string]string{"Etag": `W/"origin-v2"`},
+		},
+		{
+			name:    "304 不带 ETag，Last-Modified 不同",
+			headers: staticValidatorHeaders(),
+			extra:   map[string]string{"Last-Modified": "Thu, 22 Oct 2015 07:28:00 GMT"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ro := newRevalidationOrigin(t, "index", tc.headers, notModifiedAfterFirst(tc.extra))
+			up := staticUpstream("deb.example.com")
+			svc, repo, _ := setupSvc(t, ro.originStub, up, Options{})
+			const path = "/dists/stable/Release"
+
+			pullWith(t, svc, target(up.Host, path))
+			repo.expire(path)
+			_, meta := pullWith(t, svc, target(up.Host, path))
+
+			if got := ro.hits.Load(); got != 3 {
+				t.Fatalf("origin hits = %d，要的是 3（首次、条件回源、退回的无条件 GET）", got)
+			}
+			if got := meta.Header.Get(cacheStatusHeader); got != cacheStatusMiss {
+				t.Fatalf("整份重取的 X-Katch-Cache = %q，要的是 MISS", got)
+			}
+		})
+	}
+}
+
+func TestGet_ExpiredRangeNeverServesSupersededCopyWhenRecordWriteFails(t *testing.T) {
+	// 过期副本碰上 Range，上游 200 给了新内容，但新记录没写进库：库里仍是旧那份。
+	// 这时不能拿旧字节按本地表示切片冒充刚取回的内容，只能把原请求交回上游。
+	ro := newRevalidationOrigin(t, "index-v1", staticValidatorHeaders(),
+		func(n int, _ *http.Request, w http.ResponseWriter) int {
+			if n > 1 {
+				w.Header().Set("Content-Type", "text/plain")
+				w.Header().Set("Etag", `"origin-v2"`)
+				_, _ = io.WriteString(w, "index-v2")
+				return -1
+			}
+			return 0
+		})
+	up := staticUpstream("deb.example.com")
+	svc, repo, _ := setupSvc(t, ro.originStub, up, Options{})
+	const path = "/dists/stable/InRelease"
+	pullWith(t, svc, target(up.Host, path))
+	repo.expire(path)
+	repo.mu.Lock()
+	repo.saveErr = errors.New("db down")
+	repo.mu.Unlock()
+
+	tg := target(up.Host, path)
+	tg.Header.Set("Range", "bytes=6-7")
+	body, meta := pullWith(t, svc, tg)
+
+	if body == "v1" {
+		t.Fatalf("新记录没写进库，却拿旧副本切片应答：%d / %q", meta.StatusCode, body)
+	}
+	if body != "index-v2" {
+		t.Fatalf("应答 = %d / %q，要的是把原请求交回上游", meta.StatusCode, body)
 	}
 }

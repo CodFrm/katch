@@ -46,6 +46,11 @@ type CacheObjectRepo interface {
 	// EvictCandidates 按最久未访问给出淘汰候选：未被 pin 的不可变对象，以及在 now（秒）
 	// 已经过期、但带着上游 validator 的可变对象——Sweep 不收后者，留给条件回源续期。
 	EvictCandidates(ctx context.Context, now int64, limit int) ([]*cache_entity.CacheObject, error)
+	// DeleteEvictable 只在记录仍指向 digest、且仍满足淘汰候选条件时删除。
+	//
+	// 过期可续期的可变对象会在列为候选之后被一次回源换成新内容、新的过期时刻；
+	// 无条件删掉，删的就是刚写进去的那份，新内容的文件也再没有记录引用。
+	DeleteEvictable(ctx context.Context, id int64, digest string, now int64) (bool, error)
 	// ExpiredBefore 给出已经过期、且没有上游 validator 的可变对象，供 TTL 清理用。
 	//
 	// 这批对象不进 EvictCandidates，没有这趟清理就没有任何一条路径会把它们清掉：
@@ -207,14 +212,25 @@ func (c *cacheObjectRepo) ExpiredBefore(ctx context.Context, before int64, limit
 	return list, nil
 }
 
+// evictablePredicate 淘汰候选的判据，参数依次是 pinned=false、immutable=true、now。
+//
+// 候选查询与删除前的复核共用这一串：两边一旦分叉，复核就会放过或拦下不该的行。
+// pin 的是人明确要求留下的，把它们卷进 LRU 就成了「刚 pin 的东西过两天又没了」。
+// 还新鲜的可变对象由 TTL 管；过期了还带 validator 的那些 Sweep 不收，只能在这里
+// 按访问先后回收，否则它们会一直占着配额。
+const evictablePredicate = "pinned=? AND (immutable=? OR (expires_at>0 AND expires_at<=? AND " +
+	"(origin_etag<>'' OR origin_last_modified<>'')))"
+
+func (c *cacheObjectRepo) DeleteEvictable(ctx context.Context, id int64, digest string, now int64) (bool, error) {
+	result := db.Ctx(ctx).
+		Where("id=? AND digest=? AND "+evictablePredicate, id, digest, false, true, now).
+		Delete(&cache_entity.CacheObject{})
+	return result.RowsAffected > 0, result.Error
+}
+
 func (c *cacheObjectRepo) EvictCandidates(ctx context.Context, now int64, limit int) ([]*cache_entity.CacheObject, error) {
 	list := make([]*cache_entity.CacheObject, 0, limit)
-	// pin 的是人明确要求留下的，把它们卷进 LRU 就成了「刚 pin 的东西过两天又没了」。
-	// 还新鲜的可变对象由 TTL 管；过期了还带 validator 的那些 Sweep 不收，只能在这里
-	// 按访问先后回收，否则它们会一直占着配额。
-	if err := db.Ctx(ctx).
-		Where("pinned=? AND (immutable=? OR (expires_at>0 AND expires_at<=? AND "+
-			"(origin_etag<>'' OR origin_last_modified<>'')))", false, true, now).
+	if err := db.Ctx(ctx).Where(evictablePredicate, false, true, now).
 		Order("last_access_at asc").Limit(limit).Find(&list).Error; err != nil {
 		return nil, err
 	}

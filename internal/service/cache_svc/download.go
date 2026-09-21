@@ -140,6 +140,16 @@ func (f *flight) finish(digest string, failure error) {
 	f.mu.Unlock()
 }
 
+// committed 这一趟收尾后提交进缓存的内容摘要；还没收尾或没提交成功时为空。
+func (f *flight) committed() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.done {
+		return ""
+	}
+	return f.digest
+}
+
 // metaFor 给每个读者一份自己的元信息：响应头会被各自的处理器接着写，共享同一张
 // map 会在并发下互相打架。
 func (f *flight) metaFor(status string) *proxy_svc.Meta {

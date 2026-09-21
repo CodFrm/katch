@@ -1154,7 +1154,7 @@ func (c *cacheSvc) attachOrFetch(ctx context.Context, current *flight,
 	body, meta, err := current.attach(ctx)
 	if err == nil {
 		if !writableRequest(target) {
-			return c.serveStored(ctx, target, upstream, key, body)
+			return c.serveStored(ctx, target, upstream, key, current, body)
 		}
 		return body, meta, nil
 	}
@@ -1175,14 +1175,17 @@ func (c *cacheSvc) attachOrFetch(ctx context.Context, current *flight,
 // 正文读完（读到 EOF 即意味着对象已经落库），再用刚落盘的那份按本地表示求值，
 // 与一次命中同形，只是标 MISS——这是一次整份回源（spec「On an origin 200…」）。
 // 读不完或盘上找不到那份时，退回把客户端的原请求透传给上游。
+//
+// 库里那条必须指向这一趟刚提交的内容：提交或写记录失败时，库里留着的还是过期的
+// 旧副本，拿它求值就是把被上游替换掉的字节当成刚取回的发出去。
 func (c *cacheSvc) serveStored(ctx context.Context, target *proxy_svc.Target,
-	upstream *upstream_entity.Upstream, key string, body io.ReadCloser,
+	upstream *upstream_entity.Upstream, key string, current *flight, body io.ReadCloser,
 ) (io.ReadCloser, *proxy_svc.Meta, error) {
 	_, readErr := io.Copy(io.Discard, body)
 	closeErr := body.Close()
-	if readErr == nil && closeErr == nil {
+	if digest := current.committed(); readErr == nil && closeErr == nil && digest != "" {
 		object, err := cache_repo.CacheObject().FindByKey(ctx, upstream.ID, key)
-		if err == nil && object != nil {
+		if err == nil && object != nil && object.Digest == digest {
 			if out, meta, m := c.serveObject(ctx, target, upstream, key, object, false, cacheStatusMiss); m == nil {
 				return out, meta, nil
 			}
@@ -1234,8 +1237,8 @@ func withOriginValidators(target *proxy_svc.Target, held *cache_entity.CacheObje
 
 // renew 按上游的 304 更新 held，返回续期后的记录与它还能不能留下。
 //
-// 返回 nil 表示这次 304 不能用来续期，调用方要退回无条件 GET：304 带着一个和保存的
-// 不一样的强 ETag（证明不了是同一份），或者记录已经被别的写入换掉了内容。
+// 返回 nil 表示这次 304 不能用来续期，调用方要退回无条件 GET：304 带着的 validator
+// 选不中手上这份（见 notModifiedSelects），或者记录已经被别的写入换掉了内容。
 //
 // 更新哪些字段照 RFC 9111 §4.3.4：304 里出现的 Date、Age、Cache-Control、Expires 与
 // validator 覆盖保存的值，字节与表示上的其余头原样保留，新鲜期按新存一份的规则重算。
@@ -1243,10 +1246,10 @@ func withOriginValidators(target *proxy_svc.Target, held *cache_entity.CacheObje
 func (c *cacheSvc) renew(ctx context.Context, upstream *upstream_entity.Upstream, key string,
 	held *cache_entity.CacheObject, header http.Header, transformed bool,
 ) (*cache_entity.CacheObject, bool) {
-	etag := safeHeaderValue(header.Get("Etag"))
-	if etag != "" && !strings.HasPrefix(etag, "W/") && etag != held.OriginETag {
+	if !notModifiedSelects(header, held) {
 		return nil, false
 	}
+	etag := safeHeaderValue(header.Get("Etag"))
 	repo := cache_repo.CacheObject()
 	object, err := repo.FindByKey(ctx, upstream.ID, key)
 	if err != nil || object == nil || object.Digest != held.Digest {
@@ -1277,11 +1280,7 @@ func (c *cacheSvc) renew(ctx context.Context, upstream *upstream_entity.Upstream
 	directives := parseCacheControl(object.CacheControl)
 	_, noCache := directives["no-cache"]
 	object.RequiresRevalidation = noCache
-	ttl := int64(upstream.MutableTTLSeconds)
-	if !object.Immutable && ttl <= 0 {
-		ttl = c.limits(ctx).MutableTTLSeconds
-	}
-	object.ExpiresAt = effectiveExpiration(now, ttl, object.Immutable, object)
+	object.ExpiresAt = c.expiresAt(ctx, now, int64(upstream.MutableTTLSeconds), object.Immutable, object)
 	object.LastAccessAt = now.Unix()
 	object.Updatetime = now.Unix()
 	_, noStore := directives["no-store"]
@@ -1294,6 +1293,22 @@ func (c *cacheSvc) renew(ctx context.Context, upstream *upstream_entity.Upstream
 		logger.Ctx(ctx).Warn("写续期后的缓存记录失败", zap.String("key", key), zap.Error(err))
 	}
 	return object, true
+}
+
+// notModifiedSelects 上游的 304 能不能选中 held 来更新，照 RFC 9111 §4.3.4。
+//
+// 强 ETag 要和保存的逐字相同；弱 ETag 按弱比较对上保存的那串；304 不带 ETag 时，
+// 带来的 Last-Modified 不能和保存的不同。对不上说明上游答的不是手上这份——比如只按
+// If-Modified-Since 求值、内容却换了——拿它续期就是给旧字节盖上新鲜期。
+func notModifiedSelects(header http.Header, held *cache_entity.CacheObject) bool {
+	if etag := safeHeaderValue(header.Get("Etag")); etag != "" {
+		if weak, ok := strings.CutPrefix(etag, "W/"); ok {
+			return held.OriginETag != "" && weak == strings.TrimPrefix(held.OriginETag, "W/")
+		}
+		return etag == held.OriginETag
+	}
+	lastModified := safeHeaderValue(header.Get("Last-Modified"))
+	return lastModified == "" || held.OriginLastModified == "" || lastModified == held.OriginLastModified
 }
 
 // serveRenewed 用刚被上游 304 确认过的副本应答，标 REVALIDATED、归因 TTL。
@@ -1520,6 +1535,19 @@ func effectiveExpiration(now time.Time, ttl int64, immutable bool,
 	return saturatingAdd(now.Unix(), remaining)
 }
 
+// expiresAt 按上游 TTL（没配时退回站点默认）与记录上的源站新鲜度算过期时刻。
+//
+// 存一份新的与 304 续期共用这一处：两边各写一遍 TTL 兜底，迟早一边改了另一边没改，
+// 同一个对象续期后与重下后的新鲜期就对不上。
+func (c *cacheSvc) expiresAt(ctx context.Context, now time.Time, ttl int64, immutable bool,
+	object *cache_entity.CacheObject,
+) int64 {
+	if !immutable && ttl <= 0 {
+		ttl = c.limits(ctx).MutableTTLSeconds
+	}
+	return effectiveExpiration(now, ttl, immutable, object)
+}
+
 func saturatingAdd(left, right int64) int64 {
 	if right > 0 && left > math.MaxInt64-right {
 		return math.MaxInt64
@@ -1625,11 +1653,7 @@ func (c *cacheSvc) saveRecord(ctx context.Context, in *recordInput) error {
 		_, noCache := directives["no-cache"]
 		object.RequiresRevalidation = noCache
 	}
-	ttl := in.TTLSeconds
-	if !in.Immutable && ttl <= 0 {
-		ttl = c.limits(ctx).MutableTTLSeconds
-	}
-	object.ExpiresAt = effectiveExpiration(nowTime, ttl, in.Immutable, object)
+	object.ExpiresAt = c.expiresAt(ctx, nowTime, in.TTLSeconds, in.Immutable, object)
 	object.LastAccessAt = now
 	object.Updatetime = now
 	if err := repo.Save(ctx, object); err != nil {
@@ -1643,8 +1667,8 @@ func (c *cacheSvc) saveRecord(ctx context.Context, in *recordInput) error {
 
 // enforceQuota 超配额就按最近最少使用淘汰，直到回到回收水位。
 //
-// 淘汰只落在不可变且未被 pin 的对象上（由 EvictCandidates 保证）：可变对象由 TTL
-// 自行过期，pin 的对象是人明确要求留下的。
+// 淘汰只落在未被 pin 的不可变对象、以及过期但带着上游 validator 的可变对象上（由
+// EvictCandidates 保证）：还新鲜的可变对象由 TTL 管，pin 的对象是人明确要求留下的。
 //
 // 跑过一轮就往事件流上记一条（概览：自动告警与人为变更放在同一条时间线上）。
 // 记的是**这一轮**，不是每个被淘汰的对象：一次回收可能带走几百个对象，逐个记
@@ -1703,11 +1727,19 @@ func (c *cacheSvc) reclaim(ctx context.Context, repo cache_repo.CacheObjectRepo,
 				zap.Int64("total", total), zap.Int64("waterline", waterline))
 			return removed, freed
 		}
+		batchRemoved := int64(0)
 		for _, object := range candidates {
-			if err := repo.Delete(ctx, object.ID); err != nil {
+			deleted, err := repo.DeleteEvictable(ctx, object.ID, object.Digest, c.now().Unix())
+			if err != nil {
 				logger.Ctx(ctx).Error("淘汰缓存记录失败", zap.Int64("id", object.ID), zap.Error(err))
 				return removed, freed
 			}
+			if !deleted {
+				// 候选查询之后这一行可能已被续期、重写成新内容或被 pin：它不再是
+				// 这份候选，记录与文件都原样留下。
+				continue
+			}
+			batchRemoved++
 			// 记一笔「这条是被淘汰走的」：下一次拉到它时，表里同样什么都
 			// 查不到，而它和一次首次拉取说的是相反的事。
 			c.forgot.remember(object.UpstreamID, object.Key, metrics.MissEvicted)
@@ -1718,6 +1750,11 @@ func (c *cacheSvc) reclaim(ctx context.Context, repo cache_repo.CacheObjectRepo,
 			if total <= waterline {
 				return removed, freed
 			}
+		}
+		if batchRemoved == 0 {
+			// 一整页都没删动：候选在查询后并发变了。不立刻重查同一页形成忙循环，
+			// 下一次写入或清理会再按当时的状态回收。
+			return removed, freed
 		}
 	}
 	return removed, freed
