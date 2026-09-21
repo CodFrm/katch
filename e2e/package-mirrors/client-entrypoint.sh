@@ -438,9 +438,9 @@ if [ "$KATCH_ALLOW_BLOCKED_DNS_PROBE" -eq 1 ]; then
 fi
 if [ -n "$resolv_before" ]; then
   # A root case could point the resolver at Katch mid-run, so audit the pre-run snapshot
-# as well as the final file. The snapshot lives in the case-writable artifacts directory,
-# the same trust boundary as connect.log itself: this catches a case that switches
-# resolvers, not one that also rewrites the evidence.
+  # as well as the final file. The snapshot lives in the case-writable artifacts directory,
+  # the same trust boundary as connect.log itself: this catches a case that switches
+  # resolvers, not one that also rewrites the evidence.
   KATCH_ROUTE_PROBE_RESOLVERS=$KATCH_ARTIFACTS/resolvers.audited
   cat "$resolv_before" /etc/resolv.conf > "$KATCH_ROUTE_PROBE_RESOLVERS"
 fi

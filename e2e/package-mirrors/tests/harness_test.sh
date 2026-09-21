@@ -549,11 +549,17 @@ printf '%s\n' "$apt_setup" | grep -Fx 'rm -rf /var/lib/apt/lists/*' >/dev/null |
   fail "APT setup does not start each phase from an empty index directory"
 [ "$(printf '%s\n' "$apt_run" | grep -c 'apt-get')" -eq 2 ] ||
   fail "APT run does not invoke apt-get exactly twice: one cold update and one install per phase"
-printf '%s\n' "$apt_run" | grep -Fx '    apt-get -o Acquire::Retries=0 update 2>&1 | tee /tmp/apt-update.log' >/dev/null ||
-  fail "APT run does not refresh indexes with retries disabled in the cold phase"
+# apt's output goes to a file rather than through tee: without pipefail a pipeline's
+# status is tee's, so a failed install or update would not fail the run step.
 printf '%s\n' "$apt_run" |
-  grep -Fx 'apt-get -o Acquire::Retries=0 install -y --no-install-recommends hello 2>&1 | tee /tmp/apt-install.log' >/dev/null ||
+  grep -Fx '    apt-get -o Acquire::Retries=0 update > /tmp/apt-update.log 2>&1 || { cat /tmp/apt-update.log; exit 1; }' >/dev/null ||
+  fail "APT run does not refresh indexes with retries disabled in the cold phase, failing when apt fails"
+printf '%s\n' "$apt_run" |
+  grep -Fx 'apt-get -o Acquire::Retries=0 install -y --no-install-recommends hello > /tmp/apt-install.log 2>&1 || { cat /tmp/apt-install.log; exit 1; }' >/dev/null ||
   fail "APT run does not install the package with retries disabled in both phases, keeping apt's own transfer log"
+if printf '%s\n' "$apt_run" | grep -F '| tee '; then
+  fail "APT run pipes apt through tee, which hides apt's exit status"
+fi
 apt_gpgv_line=$(grep -n -F 'gpgv --keyring /usr/share/keyrings/debian-archive-keyring.gpg' "$apt_run_script" | cut -d: -f1)
 apt_share_line=$(grep -n -F 'cp -a {} "$KATCH_SHARED/apt-lists/"' "$apt_run_script" | cut -d: -f1)
 apt_esac_line=$(grep -n -Fx 'esac' "$apt_run_script" | head -1 | cut -d: -f1)
@@ -575,19 +581,28 @@ printf '%s\n' "$apt_assert" | grep -Fx '[ -z "$(find "$KATCH_SHARED" -name '"'"'
 # evidence is apt's own Get line, backed by a setup precondition that hello is absent.
 printf '%s\n' "$apt_assert" | grep -Fx "grep -Eq '^Get:[0-9]+ .*hello' /tmp/apt-install.log" >/dev/null ||
   fail "APT assertions do not prove the phase downloaded the package through Katch"
-printf '%s\n' "$apt_assert" | grep -Fx "! grep -q 'is already the newest version' /tmp/apt-install.log" >/dev/null ||
+printf '%s\n' "$apt_assert" | grep -Fx "if grep -q 'is already the newest version' /tmp/apt-install.log; then" >/dev/null ||
   fail "APT assertions accept an install that had nothing to do"
 printf '%s\n' "$apt_setup" |
-  grep -Fx "! dpkg-query -W -f='\${Status}\\n' hello 2>/dev/null | grep -qx 'install ok installed'" >/dev/null ||
+  grep -Fx "if dpkg-query -W -f='\${Status}\\n' hello 2>/dev/null | grep -qx 'install ok installed'; then" >/dev/null ||
   fail "APT setup does not require each phase to start without the package installed"
-# Byte equality alone would not show the warm phase skipped the refresh: the origin can
-# hand back the same InRelease. A refetch rewrites the file, and the restore kept the cold
-# phase's timestamp, so the timestamps are what carry the claim.
+# set -e does not apply to a pipeline that begins with !, so a negated check that is not the
+# script's last command can never fail. The APT scripts write those checks as if/exit.
+for apt_script in "$apt_setup" "$apt_run" "$apt_assert"; do
+  if printf '%s\n' "$apt_script" | grep -E '^[[:space:]]*! '; then
+    fail "APT case negates a pipeline with !, which set -e ignores"
+  fi
+done
+# The index the warm phase verified and installed from must be the one the cold phase
+# published after verifying it. Whether the warm phase refreshes indexes at all is a
+# property of the run script, pinned by the apt-get count above; no runtime file state
+# can show it, because apt stamps each list with the origin's Last-Modified, so a refetch
+# of an unchanged InRelease leaves both its bytes and its timestamp as the restore did.
 printf '%s\n' "$apt_assert" | grep -Fx '    cmp "${shared}" "${inrelease}"' >/dev/null ||
   fail "APT warm assertions do not compare the used index against the published one"
-printf '%s\n' "$apt_assert" |
-  grep -Fx '    [ "$(stat -c %Y "${shared}")" = "$(stat -c %Y "${inrelease}")" ]' >/dev/null ||
-  fail "APT warm assertions do not prove the phase refreshed no index"
+if printf '%s\n' "$apt_assert" | grep -F 'stat -c %Y'; then
+  fail "APT warm assertions claim a timestamp comparison can detect a refresh; apt stamps lists with Last-Modified"
+fi
 if printf '%s\n' "$apt_assert" | grep -F 'test ! -s /tmp/apt-update.log'; then
   fail "APT warm assertions lean on a log the warm phase truncates itself, which cannot fail"
 fi
