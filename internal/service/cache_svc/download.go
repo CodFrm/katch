@@ -10,6 +10,7 @@ import (
 
 	"github.com/CodFrm/katch/internal/cache"
 	"github.com/CodFrm/katch/internal/metrics"
+	"github.com/CodFrm/katch/internal/model/entity/cache_entity"
 	"github.com/CodFrm/katch/internal/service/proxy_svc"
 )
 
@@ -18,6 +19,9 @@ import (
 // 它不是故障，而是「合并不成立」的正常出口：上游给的是 404、是 206、或者盘写不了，
 // 这些响应都不该进缓存，也就没有一份可以被多个客户端共读的副本。
 var errNotCoalescable = errors.New("cache: 这次回源不参与合并")
+
+// errRenewed 这一趟回源是一次 304 续期，没有要共读的下载：等待者改从盘上读 renewed。
+var errRenewed = errors.New("cache: 这次回源续期了手上的副本")
 
 // flight 一次正在进行的回源下载，供同一对象的并发请求共读（决策 9）。
 //
@@ -33,6 +37,8 @@ type flight struct {
 	startErr  error
 	cacheable bool
 	tmpPath   string
+	// renewed 这一趟是 304 续期时，被续期的那条记录。
+	renewed *cache_entity.CacheObject
 
 	// mu 护住下面这组进度状态，cond 用来叫醒追到文件末尾的读者。
 	mu      sync.Mutex
@@ -63,6 +69,12 @@ func (f *flight) startUncacheable() {
 	close(f.ready)
 }
 
+// startRenewed 上游答 304、手上那份已经续期，等待者改从盘上读它。
+func (f *flight) startRenewed(object *cache_entity.CacheObject) {
+	f.renewed = object
+	close(f.ready)
+}
+
 // start 元信息就绪，开始对外提供共读。
 func (f *flight) start(meta *proxy_svc.Meta, tmpPath string) {
 	f.meta = meta
@@ -87,6 +99,9 @@ func (f *flight) attach(ctx context.Context) (io.ReadCloser, *proxy_svc.Meta, er
 	}
 	if f.startErr != nil {
 		return nil, nil, f.startErr
+	}
+	if f.renewed != nil {
+		return nil, nil, errRenewed
 	}
 	if !f.cacheable {
 		return nil, nil, errNotCoalescable

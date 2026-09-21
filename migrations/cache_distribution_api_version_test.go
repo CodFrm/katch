@@ -43,8 +43,17 @@ func TestCacheDistributionAPIVersionMigration(t *testing.T) {
 	})
 
 	convey.Convey("这条迁移排在 checksum 头之后", t, func() {
-		list := migrationList()
-		convey.So(list[len(list)-1].ID, convey.ShouldEqual, cacheDistributionAPIVersion().ID)
-		convey.So(list[len(list)-2].ID, convey.ShouldEqual, cacheChecksumHeaders().ID)
+		convey.So(migrationIndex(cacheDistributionAPIVersion().ID), convey.ShouldBeGreaterThan,
+			migrationIndex(cacheChecksumHeaders().ID))
 	})
+}
+
+// migrationIndex 迁移在 migrationList 里的位置，找不到时为 -1。
+func migrationIndex(id string) int {
+	for i, migration := range migrationList() {
+		if migration.ID == id {
+			return i
+		}
+	}
+	return -1
 }

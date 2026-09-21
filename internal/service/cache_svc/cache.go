@@ -54,6 +54,9 @@ const (
 	cacheStatusHeader = "X-Katch-Cache"
 	cacheStatusHit    = "HIT"
 	cacheStatusMiss   = "MISS"
+	// cacheStatusRevalidated 过期副本带着上游 validator 回源、上游答 304：联系过上游，
+	// 所以不是 HIT；正文出自盘上那份，所以也不是一次整份 MISS（决策 10）。
+	cacheStatusRevalidated = "REVALIDATED"
 )
 
 const (
@@ -290,7 +293,7 @@ func (c *cacheSvc) Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCl
 	}
 	variants := declaredVariants(target, representation)
 	if promotableManifestHead(target) {
-		body, meta, err = c.fetchAndCache(ctx, canonicalMetadataTarget(target), upstream, key, immutable, variants)
+		body, meta, err = c.fetchAndCache(ctx, canonicalMetadataTarget(target), upstream, key, immutable, variants, nil)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -303,7 +306,7 @@ func (c *cacheSvc) Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCl
 		}
 		return body, m.stamp(meta), nil
 	}
-	body, meta, err = c.fetchAndCache(ctx, target, upstream, key, immutable, variants)
+	body, meta, err = c.fetchAndCache(ctx, target, upstream, key, immutable, variants, m.held)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -625,7 +628,17 @@ func (c *cacheSvc) getTransformed(ctx context.Context, target *proxy_svc.Target,
 	}
 
 	fillCtx := context.WithoutCancel(ctx)
-	body, meta, err := fetchOriginMiss(fillCtx, canonicalMetadataTarget(target))
+	fetchTarget := canonicalMetadataTarget(target)
+	body, meta, err := fetchOriginMiss(fillCtx, withOriginValidators(fetchTarget, attribution.held))
+	if err == nil && attribution.held != nil && meta.StatusCode == http.StatusNotModified {
+		_ = body.Close()
+		if renewed, keep := c.renew(fillCtx, upstream, key, attribution.held, meta.Header, true); renewed != nil {
+			if body, meta, ok := c.serveRenewed(ctx, target, upstream, key, renewed, keep, true); ok {
+				return body, meta, nil
+			}
+		}
+		body, meta, err = fetchOriginMiss(fillCtx, fetchTarget)
+	}
 	if err != nil {
 		return nil, nil, err
 	}
@@ -684,7 +697,7 @@ func (c *cacheSvc) getTransformed(ctx context.Context, target *proxy_svc.Target,
 	}
 	outMeta := &proxy_svc.Meta{StatusCode: http.StatusOK, Header: header, ContentLength: int64(len(result.Body))}
 	if cacheable && cacheableResponse(outMeta, representation.Variants) && c.usable() {
-		if err := c.storeBuffered(fillCtx, upstream, key, result.Body, outMeta, immutable); err != nil {
+		if err := c.storeBuffered(fillCtx, upstream, key, result.Body, outMeta, meta.Header, immutable); err != nil {
 			logger.Ctx(ctx).Warn("写转换后缓存失败", zap.String("key", key), zap.Error(err))
 		}
 	}
@@ -816,8 +829,10 @@ func (c *cacheSvc) urlRewriter(snapshot *proxy_svc.RewriteSnapshot) packageprofi
 	}
 }
 
+// storeBuffered 落一份转换后的表示。originHeader 是上游那次响应的头：表示上的 ETag
+// 是 katch 算的，上游自己的 validator 只能从这里取，过期后条件回源要用它们。
 func (c *cacheSvc) storeBuffered(ctx context.Context, upstream *upstream_entity.Upstream,
-	key string, payload []byte, meta *proxy_svc.Meta, immutable bool,
+	key string, payload []byte, meta *proxy_svc.Meta, originHeader http.Header, immutable bool,
 ) error {
 	writer, err := c.store.Create()
 	if err != nil {
@@ -831,8 +846,11 @@ func (c *cacheSvc) storeBuffered(ctx context.Context, upstream *upstream_entity.
 	if err != nil {
 		return err
 	}
-	return c.saveRecord(ctx, responseRecordInput(upstream.ID, key, digest, size, meta,
-		immutable, int64(upstream.MutableTTLSeconds), c.now()))
+	in := responseRecordInput(upstream.ID, key, digest, size, meta,
+		immutable, int64(upstream.MutableTTLSeconds), c.now())
+	in.OriginETag = safeHeaderValue(originHeader.Get("Etag"))
+	in.OriginLastModified = safeHeaderValue(originHeader.Get("Last-Modified"))
+	return c.saveRecord(ctx, in)
 }
 
 // cacheKey 缓存键：上游内路径加查询串，末尾按需缀上这次请求的变体。
@@ -895,8 +913,26 @@ func (c *cacheSvc) serveFromDisk(ctx context.Context, target *proxy_svc.Target,
 	if object.RequiresRevalidation || object.Expired(c.now().Unix()) {
 		// 记录还在，只是过期了——可变对象由 TTL 自行过期（缓存一节）。
 		// 带上手上这份的摘要：回源的响应头会说清上游那份是不是同一个。
-		return nil, nil, &miss{reason: metrics.MissTTL, heldDigest: object.Digest}
+		m := &miss{reason: metrics.MissTTL, heldDigest: object.Digest}
+		if object.OriginETag != "" || object.OriginLastModified != "" {
+			// 有上游 validator 才有条件回源可言：回源那一跳带着它们去问上游，
+			// 304 就续期这一份，不必整份重下（决策 9）。
+			m.held = object
+		}
+		return nil, nil, m
 	}
+	return c.serveObject(ctx, target, upstream, key, object, transformed, cacheStatusHit)
+}
+
+// serveObject 用盘上的一份副本应答：打开、按记录校验、回放头、本地求值条件。
+//
+// status 是这次应答要标的缓存状态：普通命中是 HIT，304 续期之后是 REVALIDATED。
+// 两者走同一段读盘与求值，续期那一份才和一次命中发出去的完全同形。
+func (c *cacheSvc) serveObject(ctx context.Context, target *proxy_svc.Target,
+	upstream *upstream_entity.Upstream, key string, object *cache_entity.CacheObject,
+	transformed bool, status string,
+) (io.ReadCloser, *proxy_svc.Meta, *miss) {
+	repo := cache_repo.CacheObject()
 	file, size, err := c.store.Open(object.Digest)
 	if err != nil {
 		// 记录还在、文件没了：这是磁盘或写入路径出了问题，不能静默自愈了事。
@@ -929,7 +965,7 @@ func (c *cacheSvc) serveFromDisk(ctx context.Context, target *proxy_svc.Target,
 		header.Set("Content-Type", object.ContentType)
 	}
 	header.Set("Content-Length", strconv.FormatInt(object.Size, 10))
-	header.Set(cacheStatusHeader, cacheStatusHit)
+	header.Set(cacheStatusHeader, status)
 	// 上游的 validator 原样回放：未命中时客户端拿到的就是这两串，命中时若缺席，
 	// 同一个 URL 的响应头就随「这次有没有命中」而变，靠它做条件请求的客户端会
 	// 退回整份重传。空值不回放——那是「上游没给」，不是「上游给了空」。（决策 3/5）
@@ -1033,16 +1069,19 @@ func (c *cacheSvc) removeIfUnreferenced(ctx context.Context, digest string) {
 }
 
 // fetchAndCache 未命中：回源，同一对象的并发请求合并成一次（决策 9）。
+//
+// held 是手上那份过期但带着上游 validator 的副本，没有时为 nil。有它时这一趟回源是
+// 条件请求：上游答 304 就续期 held、从盘上应答，等在这一趟上的请求也改读那份副本。
 func (c *cacheSvc) fetchAndCache(ctx context.Context, target *proxy_svc.Target,
 	upstream *upstream_entity.Upstream, key string, immutable bool,
-	variants []string,
+	variants []string, held *cache_entity.CacheObject,
 ) (io.ReadCloser, *proxy_svc.Meta, error) {
 	flightKey := objectKey(upstream.ID, key)
 
 	c.mu.Lock()
 	if running, ok := c.inflight[flightKey]; ok {
 		c.mu.Unlock()
-		return c.attachOrFetch(ctx, running, target)
+		return c.attachOrFetch(ctx, running, target, upstream, key)
 	}
 	current := newFlight(c.store)
 	c.inflight[flightKey] = current
@@ -1052,7 +1091,25 @@ func (c *cacheSvc) fetchAndCache(ctx context.Context, target *proxy_svc.Target,
 	// 仍要写完缓存——下一个请求就能命中，否则一次断线就白白浪费整趟回源。
 	fetchCtx := context.WithoutCancel(ctx)
 	fetchTarget := canonicalTarget(target)
-	body, meta, err := fetchOriginMiss(fetchCtx, fetchTarget)
+	body, meta, err := fetchOriginMiss(fetchCtx, withOriginValidators(fetchTarget, held))
+	if err == nil && held != nil && meta.StatusCode == http.StatusNotModified {
+		_ = body.Close()
+		if renewed, keep := c.renew(fetchCtx, upstream, key, held, meta.Header, false); renewed != nil {
+			c.forget(flightKey)
+			if keep {
+				current.startRenewed(renewed)
+			} else {
+				// 续期之后不能再存：只有这一次拿验证过的字节应答，等待者各自回源。
+				current.startUncacheable()
+			}
+			if body, meta, ok := c.serveRenewed(ctx, target, upstream, key, renewed, keep, false); ok {
+				return body, meta, nil
+			}
+			return fetchOriginMiss(ctx, target)
+		}
+		// 304 证明不了手上这份就是上游那份：整份再取一次。
+		body, meta, err = fetchOriginMiss(fetchCtx, fetchTarget)
+	}
 	if err != nil {
 		c.forget(flightKey)
 		current.startFailed(err)
@@ -1077,20 +1134,130 @@ func (c *cacheSvc) fetchAndCache(ctx context.Context, target *proxy_svc.Target,
 	// 被调度到的时候看到一个空计数，于是「等干完」等了个寂寞。
 	c.pending.Add(1)
 	go c.pump(fetchCtx, flightKey, current, body, writer, upstream, key, meta, immutable)
-	return c.attachOrFetch(ctx, current, target)
+	return c.attachOrFetch(ctx, current, target, upstream, key)
 }
 
 // attachOrFetch 搭上一次正在进行的下载；搭不上就自己回源。
 func (c *cacheSvc) attachOrFetch(ctx context.Context, current *flight,
-	target *proxy_svc.Target) (io.ReadCloser, *proxy_svc.Meta, error) {
+	target *proxy_svc.Target, upstream *upstream_entity.Upstream, key string,
+) (io.ReadCloser, *proxy_svc.Meta, error) {
 	body, meta, err := current.attach(ctx)
 	if err == nil {
 		return body, meta, nil
+	}
+	if errors.Is(err, errRenewed) {
+		// 这一趟是一次 304 续期：副本刚被上游确认过，照样从盘上读。
+		if body, meta, ok := c.serveRenewed(ctx, target, upstream, key, current.renewed, true, false); ok {
+			return body, meta, nil
+		}
+		return fetchOriginMiss(ctx, target)
 	}
 	if errors.Is(err, errNotCoalescable) {
 		return fetchOriginMiss(ctx, target)
 	}
 	return nil, nil, err
+}
+
+// withOriginValidators 给一次 canonical 回源带上 held 保存的上游 validator。
+//
+// 只用上游自己的那两串：转换过的元数据回放的是 katch 算的 ETag，拿它去问上游永远
+// 得不到 304。客户端自己的条件头在 canonical 目标里已经去掉了，不会被转发上去。
+func withOriginValidators(target *proxy_svc.Target, held *cache_entity.CacheObject) *proxy_svc.Target {
+	if held == nil || (held.OriginETag == "" && held.OriginLastModified == "") {
+		return target
+	}
+	cloned := *target
+	cloned.Header = target.Header.Clone()
+	if held.OriginETag != "" {
+		cloned.Header.Set("If-None-Match", held.OriginETag)
+	}
+	if held.OriginLastModified != "" {
+		cloned.Header.Set("If-Modified-Since", held.OriginLastModified)
+	}
+	return &cloned
+}
+
+// renew 按上游的 304 更新 held，返回续期后的记录与它还能不能留下。
+//
+// 返回 nil 表示这次 304 不能用来续期，调用方要退回无条件 GET：304 带着一个和保存的
+// 不一样的强 ETag（证明不了是同一份），或者记录已经被别的写入换掉了内容。
+//
+// 更新哪些字段照 RFC 9111 §4.3.4：304 里出现的 Date、Age、Cache-Control、Expires 与
+// validator 覆盖保存的值，字节与表示上的其余头原样保留，新鲜期按新存一份的规则重算。
+// transformed 时表示 ETag 是 katch 算的，上游 validator 只更新到 origin_* 两列。
+func (c *cacheSvc) renew(ctx context.Context, upstream *upstream_entity.Upstream, key string,
+	held *cache_entity.CacheObject, header http.Header, transformed bool,
+) (*cache_entity.CacheObject, bool) {
+	etag := safeHeaderValue(header.Get("Etag"))
+	if etag != "" && !strings.HasPrefix(etag, "W/") && etag != held.OriginETag {
+		return nil, false
+	}
+	repo := cache_repo.CacheObject()
+	object, err := repo.FindByKey(ctx, upstream.ID, key)
+	if err != nil || object == nil || object.Digest != held.Digest {
+		return nil, false
+	}
+	now := c.now()
+	for name, field := range map[string]*string{
+		"Cache-Control": &object.CacheControl, "Date": &object.OriginDate, "Expires": &object.OriginExpires,
+	} {
+		if value := safeHeaderValue(header.Get(name)); value != "" {
+			*field = value
+		}
+	}
+	if etag != "" {
+		object.OriginETag = etag
+		if !transformed {
+			object.ETag = etag
+		}
+	}
+	if lastModified := safeHeaderValue(header.Get("Last-Modified")); lastModified != "" {
+		object.OriginLastModified = lastModified
+		if !transformed {
+			object.LastModified = lastModified
+		}
+	}
+	object.StoredAt = now.Unix()
+	object.OriginAge = correctedInitialAge(header, now)
+	directives := parseCacheControl(object.CacheControl)
+	_, noCache := directives["no-cache"]
+	object.RequiresRevalidation = noCache
+	ttl := int64(upstream.MutableTTLSeconds)
+	if !object.Immutable && ttl <= 0 {
+		ttl = c.limits(ctx).MutableTTLSeconds
+	}
+	object.ExpiresAt = effectiveExpiration(now, ttl, object.Immutable, object)
+	object.LastAccessAt = now.Unix()
+	object.Updatetime = now.Unix()
+	_, noStore := directives["no-store"]
+	_, private := directives["private"]
+	if noStore || private {
+		return object, false
+	}
+	if err := repo.Save(ctx, object); err != nil {
+		// 这一次仍可用验证过的字节应答；记录没写上，下一次会再做一次条件回源。
+		logger.Ctx(ctx).Warn("写续期后的缓存记录失败", zap.String("key", key), zap.Error(err))
+	}
+	return object, true
+}
+
+// serveRenewed 用刚被上游 304 确认过的副本应答，标 REVALIDATED、归因 TTL。
+//
+// keep 为 false 时续期后的指令不允许再存（no-store / private）：先打开副本应答这一次，
+// 再删掉记录——已经打开的文件在删除之后仍读得完。ok 为 false 表示副本读不出来，
+// 调用方要改为回源。
+func (c *cacheSvc) serveRenewed(ctx context.Context, target *proxy_svc.Target,
+	upstream *upstream_entity.Upstream, key string, object *cache_entity.CacheObject,
+	keep, transformed bool,
+) (io.ReadCloser, *proxy_svc.Meta, bool) {
+	body, meta, m := c.serveObject(ctx, target, upstream, key, object, transformed, cacheStatusRevalidated)
+	if !keep {
+		c.dropRecord(ctx, object)
+	}
+	if m != nil {
+		return nil, nil, false
+	}
+	return body, (&miss{reason: metrics.MissTTL}).stamp(meta), true
 }
 
 func (c *cacheSvc) forget(flightKey string) {
@@ -1172,10 +1339,14 @@ type recordInput struct {
 	// 一起覆盖掉，不会留着给下一次命中回放。
 	ETag         string
 	LastModified string
-	Immutable    bool
-	TTLSeconds   int64
-	Header       http.Header
-	StoredAt     time.Time
+	// OriginETag 与 OriginLastModified 上游自己的 validator，只用于过期后的条件回源。
+	// 原样透传的对象与上面两项相同；转换过的元数据由 storeBuffered 另行填上。
+	OriginETag         string
+	OriginLastModified string
+	Immutable          bool
+	TTLSeconds         int64
+	Header             http.Header
+	StoredAt           time.Time
 }
 
 func responseRecordInput(upstreamID int64, key, digest string, size int64,
@@ -1185,7 +1356,8 @@ func responseRecordInput(upstreamID int64, key, digest string, size int64,
 	return &recordInput{
 		UpstreamID: upstreamID, Key: key, Digest: digest, Size: size,
 		ContentType: header.Get("Content-Type"), ETag: header.Get("Etag"),
-		LastModified: header.Get("Last-Modified"), Immutable: immutable,
+		LastModified: header.Get("Last-Modified"), OriginETag: header.Get("Etag"),
+		OriginLastModified: header.Get("Last-Modified"), Immutable: immutable,
 		TTLSeconds: ttl, Header: header, StoredAt: storedAt,
 	}
 }
@@ -1357,6 +1529,8 @@ func (c *cacheSvc) saveRecord(ctx context.Context, in *recordInput) error {
 	// ETag/Last-Modified 时，留着它们会让命中回放一个对不上的校验符。
 	object.ETag = in.ETag
 	object.LastModified = in.LastModified
+	object.OriginETag = in.OriginETag
+	object.OriginLastModified = in.OriginLastModified
 	object.Immutable = in.Immutable
 	object.CacheControl = ""
 	object.OriginDate = ""

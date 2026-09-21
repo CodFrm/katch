@@ -30,6 +30,14 @@ type CacheObject struct {
 	ETag string `gorm:"column:etag" json:"etag"`
 	// LastModified 上游成功响应里的 Last-Modified，原样保存、命中时原样回放。
 	LastModified string `gorm:"column:last_modified" json:"last_modified"`
+	// OriginETag 与 OriginLastModified 上游自己的 validator，只用来在过期后发条件回源，
+	// 从不回放给客户端。
+	//
+	// 和上面两列分开存：转换过的元数据回放的是 katch 对转换结果算的 ETag，不带
+	// Last-Modified，上游那两串在那两列里已经不在了；拿 katch 的 ETag 去问上游，上游
+	// 永远答不出 304。原样透传的对象这两组值相同。
+	OriginETag         string `gorm:"column:origin_etag" json:"origin_etag"`
+	OriginLastModified string `gorm:"column:origin_last_modified" json:"origin_last_modified"`
 	// Safe response metadata is persisted explicitly; arbitrary origin headers never reach disk.
 	CacheControl        string `gorm:"column:cache_control" json:"cache_control"`
 	OriginDate          string `gorm:"column:origin_date" json:"origin_date"`

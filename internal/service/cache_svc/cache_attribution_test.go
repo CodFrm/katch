@@ -116,12 +116,13 @@ func TestAttachOrFetch_UncacheableWaiterFallbackOverridesOriginAttribution(t *te
 		w.Header().Set("X-Protocol-Revision", "7")
 		_, _ = io.WriteString(w, "fallback body")
 	})
-	svc, _, store := setupSvc(t, o, staticUpstream("files.example.com"), Options{})
+	up := staticUpstream("files.example.com")
+	svc, _, store := setupSvc(t, o, up, Options{})
 	current := newFlight(store)
 	current.startUncacheable()
 
 	body, meta, err := svc.(*cacheSvc).attachOrFetch(
-		context.Background(), current, target("files.example.com", "/fallback"),
+		context.Background(), current, target("files.example.com", "/fallback"), up, "/fallback",
 	)
 	if err != nil {
 		t.Fatal(err)

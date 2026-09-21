@@ -31,6 +31,7 @@ func migrationList() []*gormigrate.Migration {
 		cacheResponseMetadata(),
 		cacheChecksumHeaders(),
 		cacheDistributionAPIVersion(),
+		cacheOriginValidators(),
 	}
 }
 

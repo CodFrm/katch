@@ -75,6 +75,9 @@ const (
 	// cacheStatusHeader 缓存层在响应上留下的命中标记。
 	cacheStatusHeader = "X-Katch-Cache"
 	cacheStatusHit    = "HIT"
+	// cacheStatusRevalidated 过期副本经上游 304 续期：问过上游，所以记未命中；正文出自
+	// 盘上那份，所以没有一个字节算作来自上游。
+	cacheStatusRevalidated = "REVALIDATED"
 	// MissHeader 缓存层在未命中的响应上留下的归因。
 	//
 	// 和命中标记分成两个头而不是把原因拼进 X-Katch-Cache 的值里：那个值是已经
@@ -557,7 +560,8 @@ func (r *Recorder) Middleware(hooks Hooks) gin.HandlerFunc {
 		}
 		if size := int64(c.Writer.Size()); size > 0 {
 			ev.BytesServed = size
-			if ev.Result == ResultMiss || ev.Result == ResultPassthrough {
+			revalidated := c.Writer.Header().Get(cacheStatusHeader) == cacheStatusRevalidated
+			if (ev.Result == ResultMiss && !revalidated) || ev.Result == ResultPassthrough {
 				ev.BytesOrigin = size
 			}
 		}

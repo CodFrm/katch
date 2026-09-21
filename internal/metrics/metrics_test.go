@@ -710,3 +710,23 @@ func TestRecorder_RejectedGitRequestsAreStillGit(t *testing.T) {
 			`katch_requests_total{kind="git",result="denied",upstream="git.example.com"} 1`)
 	})
 }
+
+func TestRecorder_RevalidatedCountsAsTTLMissWithoutOriginBytes(t *testing.T) {
+	convey.Convey("304 续期记一次 TTL 未命中，但没有一个正文字节来自上游", t, func() {
+		reg := prometheus.NewRegistry()
+		rec := New(Options{Registerer: reg, Now: func() time.Time { return time.Unix(1700000045, 0) }})
+		hooks := Hooks{Lookup: knownUpstreams("deb.debian.org")}
+
+		get(newTestEngine(rec, hooks, &upstreamResponse{status: http.StatusOK, cache: "REVALIDATED",
+			miss: string(MissTTL), body: "abcdef"}), "/deb.debian.org/dists/stable/InRelease")
+
+		got := rec.Drain()
+		convey.So(len(got), convey.ShouldEqual, 1)
+		convey.So(got[0].Requests, convey.ShouldEqual, 1)
+		convey.So(got[0].Hits, convey.ShouldEqual, 0)
+		convey.So(got[0].MissTTL, convey.ShouldEqual, 1)
+		convey.So(got[0].BytesServed, convey.ShouldEqual, 6)
+		convey.So(got[0].BytesOrigin, convey.ShouldEqual, 0)
+		convey.So(scrape(reg), convey.ShouldContainSubstring, `result="miss"`)
+	})
+}
