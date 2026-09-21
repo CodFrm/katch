@@ -551,8 +551,9 @@ printf '%s\n' "$apt_setup" | grep -Fx 'rm -rf /var/lib/apt/lists/*' >/dev/null |
   fail "APT run does not invoke apt-get exactly twice: one cold update and one install per phase"
 printf '%s\n' "$apt_run" | grep -Fx '    apt-get -o Acquire::Retries=0 update 2>&1 | tee /tmp/apt-update.log' >/dev/null ||
   fail "APT run does not refresh indexes with retries disabled in the cold phase"
-printf '%s\n' "$apt_run" | grep -Fx 'apt-get -o Acquire::Retries=0 install -y --no-install-recommends hello' >/dev/null ||
-  fail "APT run does not install the package with retries disabled in both phases"
+printf '%s\n' "$apt_run" |
+  grep -Fx 'apt-get -o Acquire::Retries=0 install -y --no-install-recommends hello 2>&1 | tee /tmp/apt-install.log' >/dev/null ||
+  fail "APT run does not install the package with retries disabled in both phases, keeping apt's own transfer log"
 apt_gpgv_line=$(grep -n -F 'gpgv --keyring /usr/share/keyrings/debian-archive-keyring.gpg' "$apt_run_script" | cut -d: -f1)
 apt_share_line=$(grep -n -F 'cp -a {} "$KATCH_SHARED/apt-lists/"' "$apt_run_script" | cut -d: -f1)
 apt_esac_line=$(grep -n -Fx 'esac' "$apt_run_script" | head -1 | cut -d: -f1)
@@ -567,10 +568,29 @@ printf '%s\n' "$apt_run" | grep -F "\\( -name '*_InRelease' -o -name '*_Packages
   fail "APT cold run shares more than the signed index and its package lists"
 printf '%s\n' "$apt_assert" | grep -Fx '[ -z "$(find "$KATCH_SHARED" -name '"'"'*.deb'"'"' -print -quit)" ]' >/dev/null ||
   fail "APT assertions do not prove the artifact cache stayed out of the shared directory"
-printf '%s\n' "$apt_assert" | grep -F 'cmp "$KATCH_SHARED/apt-lists/$(basename "${inrelease}")" "${inrelease}"' >/dev/null ||
-  fail "APT assertions do not prove the verified index is the one the phase used"
-printf '%s\n' "$apt_assert" | grep -Fx '    test ! -s /tmp/apt-update.log' >/dev/null ||
+# The warm phase installs the only package that crosses the network, so both phases have
+# to show that the install really transferred it. dpkg's state cannot say that (it does not
+# distinguish a fresh install from a package the image already carried) and the archive
+# cache cannot either (docker-clean deletes the .deb straight after dpkg runs), so the
+# evidence is apt's own Get line, backed by a setup precondition that hello is absent.
+printf '%s\n' "$apt_assert" | grep -Fx "grep -Eq '^Get:[0-9]+ .*hello' /tmp/apt-install.log" >/dev/null ||
+  fail "APT assertions do not prove the phase downloaded the package through Katch"
+printf '%s\n' "$apt_assert" | grep -Fx "! grep -q 'is already the newest version' /tmp/apt-install.log" >/dev/null ||
+  fail "APT assertions accept an install that had nothing to do"
+printf '%s\n' "$apt_setup" |
+  grep -Fx "! dpkg-query -W -f='\${Status}\\n' hello 2>/dev/null | grep -qx 'install ok installed'" >/dev/null ||
+  fail "APT setup does not require each phase to start without the package installed"
+# Byte equality alone would not show the warm phase skipped the refresh: the origin can
+# hand back the same InRelease. A refetch rewrites the file, and the restore kept the cold
+# phase's timestamp, so the timestamps are what carry the claim.
+printf '%s\n' "$apt_assert" | grep -Fx '    cmp "${shared}" "${inrelease}"' >/dev/null ||
+  fail "APT warm assertions do not compare the used index against the published one"
+printf '%s\n' "$apt_assert" |
+  grep -Fx '    [ "$(stat -c %Y "${shared}")" = "$(stat -c %Y "${inrelease}")" ]' >/dev/null ||
   fail "APT warm assertions do not prove the phase refreshed no index"
+if printf '%s\n' "$apt_assert" | grep -F 'test ! -s /tmp/apt-update.log'; then
+  fail "APT warm assertions lean on a log the warm phase truncates itself, which cannot fail"
+fi
 apt_case_commands=$(jq -r '[.setup, .run, .assert] | join("\n")' "$apt_case")
 if printf '%s\n' "$apt_case_commands" |
   grep -i -E '(allow-unauthenticated|AllowUnauthenticated|trusted=yes|Dir::Cache|/var/cache/apt|--force-yes|https?://deb[.]debian[.]org)'; then
