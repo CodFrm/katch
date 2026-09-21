@@ -3,7 +3,12 @@ env: DEV
 # ErrRecordNotFound 都按 ERROR 级别、带 ANSI 转义写出去。而「缓存里没有这个对象」
 # 「setting 表里还没有这个键」本来就是正常路径上最常见的两次查询，于是下面那个
 # 专收 error 的文件会变成 100% 的 record not found——值班时最该看的那一个文件里
-# 一行真错误都没有。要看 SQL 就开 db 段里的 debug（那一项走的是 orm.Debug()）。
+# 一行真错误都没有。
+#
+# 它顺带还管两件本地开发会想要的事：gin 的 debug 模式与逐请求日志、以及一路
+# Debug 级别的人读格式控制台输出；关掉后控制台是 logger.level 下的 JSON。本地调试
+# 时可以自己打开，代价是上面说的 error 文件噪音。只想看 SQL 就开 db 段里的 debug
+# （那一项走的是 orm.Debug()，不碰日志器）。
 debug: false
 
 # source 不能省。cago 的 Config.init() 会无条件读这个键，缺失时启动直接失败

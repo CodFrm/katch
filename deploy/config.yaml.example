@@ -1,8 +1,9 @@
 # katch 容器部署的配置模板。
 #
-# 和 configs/config.yaml.example 是**两份**：那份是本地开发的出厂值（env: DEV、
-# debug: true、日志落 ./runtime/logs），这份是跑在容器里的那一套。加新配置项时
-# 两边都要加——只加一边的后果是「本地好好的，部署上去起不来」。
+# 和 configs/config.yaml.example 是**两份**：那份是本地开发与 smoke 的出厂值
+# （env: DEV、日志落 ./runtime/logs），这份是跑在容器里的那一套。两份的 debug 都关着，
+# 理由写在那份里。加新配置项时两边都要加——只加一边的后果是「本地好好的，部署上去
+# 起不来」。
 #
 # 用法：
 #   cp deploy/config.yaml.example deploy/config.yaml
