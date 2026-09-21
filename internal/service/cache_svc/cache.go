@@ -797,6 +797,12 @@ func (c *cacheSvc) urlRewriter(snapshot *proxy_svc.RewriteSnapshot) packageprofi
 				zap.String("host", host), zap.String("reason", "profile_incompatible"))
 			return nil, packageprofile.ErrUnavailable
 		}
+		// 端口不进记忆化的键，可它合不合法是解析器会判的一项：不单独判的话，一条
+		// https://h:0/ 排在同主机的干净链接后面就会命中「已放行」，排在前面则被拒，
+		// 同一份元数据的结论取决于链接的先后。
+		if _, err := destination.TargetPort(target); err != nil {
+			return nil, packageprofile.ErrInvalidMetadata
+		}
 		if err := resolveOnce(ctx, target, host); err != nil {
 			return nil, packageprofile.ErrInvalidMetadata
 		}

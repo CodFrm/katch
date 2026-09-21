@@ -103,7 +103,7 @@ func (r *resolver) Resolve(
 	if host == "" {
 		return nil, deny(ctx, target, "missing hostname", nil)
 	}
-	port, err := targetPort(target)
+	port, err := TargetPort(target)
 	if err != nil {
 		return nil, deny(ctx, target, "invalid port", err)
 	}
@@ -164,7 +164,11 @@ func (r *resolver) resolveAddresses(ctx context.Context, host string) ([]netip.A
 	return r.lookup(ctx, host)
 }
 
-func targetPort(target *url.URL) (string, error) {
+// TargetPort 目标实际要连的端口：没写就取 scheme 的默认值，写了就必须是 1–65535。
+//
+// 导出是为了让只需要「这个 URL 的端口合不合法」的调用方（元数据改写）复用这一条规则，
+// 而不是各抄一份——两份规则一旦分叉，同一个 URL 在改写时放行、回源时被拒。
+func TargetPort(target *url.URL) (string, error) {
 	port := target.Port()
 	if port == "" {
 		if target.Scheme == "https" {

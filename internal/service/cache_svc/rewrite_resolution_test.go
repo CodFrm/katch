@@ -280,3 +280,72 @@ func TestGet_MetadataRewriteDoesNotPoisonAHostWithARejectedURL(t *testing.T) {
 		t.Fatalf("status = %d, body = %q", meta.StatusCode, payload)
 	}
 }
+
+// TestGet_MetadataRewriteRejectsInvalidPortsWhateverTheirPosition 非法端口不管排在第几条都被拒。
+//
+// 端口不进记忆化的键（见 TestGet_MetadataRewriteIgnoresTheMetadataPort），可端口是否
+// 合法是解析器会判的一项：https://h:0/ 与 https://h:99999/ 在 destination 那里都是
+// 「invalid port」。只靠记忆时，这样一条链接排在同主机的干净链接后面就会命中「已放行」
+// 被照常改写，排在前面则会被拒——同一份元数据的结论取决于链接的先后。所以端口先按
+// destination 自己的规则单独判一次，再进记忆。
+func TestGet_MetadataRewriteRejectsInvalidPortsWhateverTheirPosition(t *testing.T) {
+	const host = "cdn.example.com"
+	profile := testProfile{
+		description: packageprofile.Description{Profile: upstream_entity.PackageProfileNPM, Name: "test"},
+		representation: packageprofile.Representation{
+			Class: packageprofile.ClassMutable, Transform: true, MediaTypes: []string{"application/json"},
+		},
+		transform: func(ctx context.Context, in packageprofile.TransformRequest) (*packageprofile.TransformResult, error) {
+			companion := packageprofile.Companion{
+				Host: host, Profile: upstream_entity.PackageProfileNPM,
+				Transport: upstream_entity.ProtocolStatic,
+			}
+			clean, err := url.Parse("https://" + host + "/pkg/-/clean.tgz")
+			if err != nil {
+				return nil, err
+			}
+			if _, err := in.RewriteURL(ctx, clean, companion); err != nil {
+				return nil, fmt.Errorf("干净的构件 URL 被拒了：%w", err)
+			}
+			for _, raw := range []string{
+				"https://" + host + ":0/pkg/-/zero.tgz",
+				"https://" + host + ":99999/pkg/-/overflow.tgz",
+			} {
+				bad, err := url.Parse(raw)
+				if err != nil {
+					return nil, err
+				}
+				if _, err := in.RewriteURL(ctx, bad, companion); err == nil {
+					return nil, fmt.Errorf("%s 排在干净链接后面，被照常改写了", raw)
+				}
+			}
+			return &packageprofile.TransformResult{Body: []byte(`{}`)}, nil
+		},
+	}
+	up := staticUpstream("metadata.example.com")
+	up.PackageProfile = upstream_entity.PackageProfileNPM
+	options := transformingOptions(t, profile, 1)
+	options.DestinationResolver = &countingResolver{}
+	options.RewriteConfig.(fixedRewriteSource).snapshot.Upstreams[host] = proxy_svc.RewriteUpstream{
+		Profile:    upstream_entity.PackageProfileNPM,
+		Transports: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+	}
+	o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{}`)
+	})
+	svc, _, _ := setupSvc(t, o, up, options)
+
+	body, meta, err := svc.Get(context.Background(), target(up.Host, "/pkg"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, readErr := io.ReadAll(body)
+	closeErr := body.Close()
+	if readErr != nil || closeErr != nil {
+		t.Fatalf("read/close = %v/%v", readErr, closeErr)
+	}
+	if meta.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %q", meta.StatusCode, payload)
+	}
+}
