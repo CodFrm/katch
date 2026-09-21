@@ -143,6 +143,8 @@ exporter 创建两次、双双注册进 prometheus 的默认 registry，于是 `
 计数发生在一个 gin 中间件里，它排在 SPA 与拉取共用的 NoRoute 之前，按响应本身
 判定结果：502 是回源失败、403 是规则拒绝、带 `X-Katch-Cache: HIT` 的是命中、
 其余算回源取回（包括上游自己的 404——那是上游对这个对象的判断，不是 katch 拒绝了谁）。
+`X-Katch-Cache: REVALIDATED`（过期副本经上游 `304` 续期）也算回源取回、归因 TTL 过期，
+但正文出自本地副本，发出去的字节记在 `source="cache"` 下、不计入回源字节。
 好处是埋点只有一处，不必在缓存层和代理层各插一次。
 
 **git 的拉取自成一类。** `kind` 按路径形态判（`info/refs?service=…` 与

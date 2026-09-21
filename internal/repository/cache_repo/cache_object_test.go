@@ -61,19 +61,24 @@ func TestCacheObjectRepo_Touch(t *testing.T) {
 	})
 }
 
-// TestCacheObjectRepo_EvictCandidates 淘汰只能落在**不可变且未被 pin** 的对象上。
+// TestCacheObjectRepo_EvictCandidates 淘汰落在未被 pin 的不可变对象，以及已经过期、
+// 但带着上游 validator 的可变对象上。
 //
-// 可变对象由 TTL 自己过期，pin 的对象是人明确要求留下的；把它们卷进 LRU，
-// 表现就是「刚 pin 的基础镜像层过两天又没了」。
+// pin 的对象是人明确要求留下的；把它们卷进 LRU，表现就是「刚 pin 的基础镜像层过两天
+// 又没了」。还新鲜的可变对象由 TTL 管，不进 LRU；过期了还带 validator 的那些 Sweep
+// 不收（留着给条件回源续期），只能由配额压力收走，否则它们会一直占着配额。
 func TestCacheObjectRepo_EvictCandidates(t *testing.T) {
-	convey.Convey("淘汰候选按最久未访问排序，且排除 pin 与可变对象", t, func() {
+	convey.Convey("淘汰候选按最久未访问排序：不可变对象与过期但可续期的可变对象，排除 pin", t, func() {
 		ctx, _, mock := testutils.Database(t)
-		mock.ExpectQuery("SELECT \\* FROM `cache_objects` WHERE immutable=\\? AND pinned=\\? ORDER BY last_access_at asc LIMIT \\?").
-			WithArgs(true, false, 2).
+		mock.ExpectQuery("SELECT \\* FROM `cache_objects` WHERE pinned=\\? AND "+
+			"\\(immutable=\\? OR \\(expires_at>0 AND expires_at<=\\? AND "+
+			"\\(origin_etag<>'' OR origin_last_modified<>''\\)\\)\\) "+
+			"ORDER BY last_access_at asc LIMIT \\?").
+			WithArgs(false, true, int64(1000), 2).
 			WillReturnRows(sqlmock.NewRows([]string{"id", "size", "last_access_at"}).
 				AddRow(5, 100, 1).AddRow(6, 200, 2))
 
-		got, err := NewCacheObject().EvictCandidates(ctx, 2)
+		got, err := NewCacheObject().EvictCandidates(ctx, 1000, 2)
 		convey.So(err, convey.ShouldBeNil)
 		convey.So(len(got), convey.ShouldEqual, 2)
 		convey.So(got[0].ID, convey.ShouldEqual, 5)
@@ -180,7 +185,8 @@ func TestCacheObjectRepo_DeleteExpired(t *testing.T) {
 	convey.Convey("删除前原子复核记录仍是过期可变对象", t, func() {
 		ctx, _, mock := testutils.Database(t)
 		mock.ExpectBegin()
-		mock.ExpectExec("DELETE FROM `cache_objects` WHERE id=\\? AND immutable=\\? AND expires_at>0 AND expires_at<=\\? AND pinned=\\?").
+		mock.ExpectExec("DELETE FROM `cache_objects` WHERE id=\\? AND immutable=\\? AND expires_at>0 AND expires_at<=\\? AND pinned=\\? "+
+			"AND origin_etag='' AND origin_last_modified=''").
 			WithArgs(int64(3), false, int64(1000), false).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 		mock.ExpectCommit()
@@ -239,11 +245,13 @@ func TestCacheObjectRepo_SizeByUpstream(t *testing.T) {
 }
 
 func TestCacheObjectRepo_ExpiredBefore(t *testing.T) {
-	convey.Convey("过期清理只挑真的过期了的可变对象", t, func() {
+	convey.Convey("过期清理只挑真的过期了、且没有上游 validator 的可变对象", t, func() {
 		ctx, _, mock := testutils.Database(t)
 		// expires_at>0 与 immutable=false 都不能少：正常不可变对象的 expires_at 是 0，
 		// 但升级遗留或人工修复可能留下 immutable=true 且旧 TTL 仍为正的组合。
-		mock.ExpectQuery("SELECT \\* FROM `cache_objects` WHERE expires_at>0 AND expires_at<=\\? AND immutable=\\? AND pinned=\\? ORDER BY expires_at asc LIMIT \\?").
+		// 带 validator 的过期对象留给条件回源续期，由 LRU 在配额压力下回收。
+		mock.ExpectQuery("SELECT \\* FROM `cache_objects` WHERE expires_at>0 AND expires_at<=\\? AND immutable=\\? AND pinned=\\? "+
+			"AND origin_etag='' AND origin_last_modified='' ORDER BY expires_at asc LIMIT \\?").
 			WithArgs(int64(1000), false, false, 2).
 			WillReturnRows(sqlmock.NewRows([]string{"id", "size", "expires_at"}).
 				AddRow(9, 300, 500).AddRow(10, 400, 900))

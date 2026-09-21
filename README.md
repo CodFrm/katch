@@ -171,12 +171,13 @@ companion 全部就绪时提供可复制配置。Docker、Podman 与 Git 的共�
 
 ### 命中验证
 
-`X-Katch-Cache: HIT|MISS` 说明这一次有没有回源。要看到完整的 MISS → HIT，必须用
+`X-Katch-Cache: HIT|MISS|REVALIDATED` 说明这一次有没有回源：`HIT` 没问上游，`MISS`
+整份取自上游，`REVALIDATED` 问过上游、上游答 `304`，正文出自本地副本（见下文过期续期）。要看到完整的 MISS → HIT，必须用
 **GET 读完整响应体**再比对：普通 HEAD 和可本地求值的条件请求在命中时同样报 `HIT`，
 但 HEAD 没有响应体、条件请求可能只拿到 `304`，单看一次命中说明不了本地那份副本
 完整；`MISS → HIT` 加上两次内容逐字节相同才是完整证据。
 
-请求的对象没有副本（或可变对象已过 TTL）时第一次才是 `MISS`；已在 TTL 内或不可变
+请求的对象没有副本（或可变对象已过 TTL，此时上游若答 `304` 则是 `REVALIDATED`）时第一次才是 `MISS`；已在 TTL 内或不可变
 对象一上手就是 `HIT`，换一个没缓存过的路径再验。
 
 ```bash
@@ -211,6 +212,14 @@ TTL 内的副本由本地应答，命中响应原样回放上游保存下来的 
 `412` 或 `416`，不能当成一份完整副本存下来。普通 static HEAD 和 registry blob HEAD
 同样透传；仅无条件、无范围的 registry manifest HEAD 会以同一 `Accept` 变体的 identity
 GET 填充缓存，再返回无正文的 GET 等价元数据。
+
+**过期续期。** 可变对象过期（或上游标了 `Cache-Control: no-cache`）后，如果记录里存有
+上游自己给过的 `ETag`/`Last-Modified`，回源那一次带上 `If-None-Match`/`If-Modified-Since`：
+上游答 `304` 就按它更新新鲜期、复用盘上的字节，响应标 `X-Katch-Cache: REVALIDATED`；
+上游答 `200` 就整份替换（`MISS`）；上游出错则照常透传，过期副本不会被当成新鲜的发出去。
+转换过的元数据（npm packument、PyPI Simple 等）回放的是 katch 自己算的 ETag，续期时发给
+上游的仍是上游那一串。过期但带着上游 validator 的对象不被定时清理删除，留着等下一次
+续期，由配额回收按 LRU 收走；没有 validator 的过期对象照旧由定时清理删除。
 
 ### git clone
 

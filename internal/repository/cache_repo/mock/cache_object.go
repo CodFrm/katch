@@ -101,18 +101,18 @@ func (mr *MockCacheObjectRepoMockRecorder) DeleteExpired(ctx, id, before any) *g
 }
 
 // EvictCandidates mocks base method.
-func (m *MockCacheObjectRepo) EvictCandidates(ctx context.Context, limit int) ([]*cache_entity.CacheObject, error) {
+func (m *MockCacheObjectRepo) EvictCandidates(ctx context.Context, now int64, limit int) ([]*cache_entity.CacheObject, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "EvictCandidates", ctx, limit)
+	ret := m.ctrl.Call(m, "EvictCandidates", ctx, now, limit)
 	ret0, _ := ret[0].([]*cache_entity.CacheObject)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // EvictCandidates indicates an expected call of EvictCandidates.
-func (mr *MockCacheObjectRepoMockRecorder) EvictCandidates(ctx, limit any) *gomock.Call {
+func (mr *MockCacheObjectRepoMockRecorder) EvictCandidates(ctx, now, limit any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "EvictCandidates", reflect.TypeOf((*MockCacheObjectRepo)(nil).EvictCandidates), ctx, limit)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "EvictCandidates", reflect.TypeOf((*MockCacheObjectRepo)(nil).EvictCandidates), ctx, now, limit)
 }
 
 // ExpiredBefore mocks base method.

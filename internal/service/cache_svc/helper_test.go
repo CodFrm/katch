@@ -189,7 +189,8 @@ func newFakeRepo(t *testing.T, stampAccess bool) *fakeRepo {
 			f.mu.Lock()
 			defer f.mu.Unlock()
 			row, ok := f.rows[id]
-			if !ok || row.Immutable || row.ExpiresAt <= 0 || row.ExpiresAt > before || row.Pinned {
+			if !ok || row.Immutable || row.ExpiresAt <= 0 || row.ExpiresAt > before || row.Pinned ||
+				revalidatable(row) {
 				return false, nil
 			}
 			delete(f.rows, id)
@@ -248,13 +249,15 @@ func newFakeRepo(t *testing.T, stampAccess bool) *fakeRepo {
 		}
 		return total, nil
 	})
-	m.EXPECT().EvictCandidates(gomock.Any(), gomock.Any()).AnyTimes().
-		DoAndReturn(func(_ any, limit int) ([]*cache_entity.CacheObject, error) {
+	m.EXPECT().EvictCandidates(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().
+		DoAndReturn(func(_ any, now int64, limit int) ([]*cache_entity.CacheObject, error) {
 			f.mu.Lock()
 			defer f.mu.Unlock()
 			list := make([]*cache_entity.CacheObject, 0, limit)
 			for _, row := range f.rows {
-				if row.Immutable && !row.Pinned {
+				// 和 SQL 一样：未 pin 的不可变对象，加上已过期但可续期的可变对象。
+				expiredRevalidatable := row.ExpiresAt > 0 && row.ExpiresAt <= now && revalidatable(row)
+				if !row.Pinned && (row.Immutable || expiredRevalidatable) {
 					list = append(list, clone(row))
 				}
 			}
@@ -270,8 +273,9 @@ func newFakeRepo(t *testing.T, stampAccess bool) *fakeRepo {
 			defer f.mu.Unlock()
 			list := make([]*cache_entity.CacheObject, 0, limit)
 			for _, row := range f.rows {
-				// 和 SQL 一样：只收已过期、可变且未 pin 的记录。
-				if row.ExpiresAt > 0 && row.ExpiresAt <= before && !row.Immutable && !row.Pinned {
+				// 和 SQL 一样：只收已过期、可变、未 pin 且没有上游 validator 的记录。
+				if row.ExpiresAt > 0 && row.ExpiresAt <= before && !row.Immutable && !row.Pinned &&
+					!revalidatable(row) {
 					list = append(list, clone(row))
 				}
 			}
@@ -613,4 +617,9 @@ func quotaOf(quota int64, percent int) func(rt *setting_svc.RuntimeSettings) {
 		rt.CacheQuotaBytes = quota
 		rt.CacheReclaimPercent = percent
 	}
+}
+
+// revalidatable 记录有没有上游 validator 可供条件回源，和仓储 SQL 里的判据一致。
+func revalidatable(row *cache_entity.CacheObject) bool {
+	return row.OriginETag != "" || row.OriginLastModified != ""
 }

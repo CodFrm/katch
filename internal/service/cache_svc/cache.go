@@ -153,12 +153,14 @@ type CacheSvc interface {
 	Search(ctx context.Context, req *SearchRequest) (*SearchResponse, error)
 	Purge(ctx context.Context, req *PurgeRequest) (*PurgeResponse, error)
 	Pin(ctx context.Context, req *PinRequest) error
-	// Sweep 收走已经过期的可变对象，返回收走了几条，然后按当下的配额回收一次。
+	// Sweep 收走已经过期、且没有上游 validator 的可变对象，返回收走了几条，然后按
+	// 当下的配额回收一次。
 	//
 	// 「可变对象由 TTL 自行过期」（缓存一节）在读路径上只做到了「过期的不再命中」；
 	// 一个再也没人来取的过期对象，记录和盘上的字节会一直留着，还一直算进配额，
-	// 而它又进不了 LRU 的候选（那条只挑不可变的）。没有这一趟，配额就会被一批
-	// 死对象慢慢顶穿，表现成「缓存超配额但没有可淘汰的对象」那条日志。
+	// 而没有 validator 的那些进不了 LRU 的候选。没有这一趟，配额就会被一批死对象
+	// 慢慢顶穿，表现成「缓存超配额但没有可淘汰的对象」那条日志。带 validator 的过期
+	// 对象留着给条件回源续期（决策 9），由配额回收按 LRU 收走。
 	//
 	// 顺带在这里再跑一次配额回收：原先只有「写进一个新对象」才会触发，于是站长
 	// 在设置页把配额改小之后，要等到下一次回源才开始削——决策 3/4 说的是改完立刻生效。
@@ -1637,13 +1639,13 @@ func (c *cacheSvc) enforceQuota(ctx context.Context) {
 func (c *cacheSvc) reclaim(ctx context.Context, repo cache_repo.CacheObjectRepo,
 	total, waterline int64) (removed, freed int64) {
 	for total > waterline {
-		candidates, err := repo.EvictCandidates(ctx, evictBatch)
+		candidates, err := repo.EvictCandidates(ctx, c.now().Unix(), evictBatch)
 		if err != nil {
 			logger.Ctx(ctx).Error("查询淘汰候选失败", zap.Error(err))
 			return removed, freed
 		}
 		if len(candidates) == 0 {
-			// 剩下的全是 pin 的或可变的：这不是可以静默忽略的状态，配额已经守不住了。
+			// 剩下的全是 pin 的或还没到清理的可变对象：这不是可以静默忽略的状态，配额已经守不住了。
 			logger.Ctx(ctx).Error("缓存超配额但没有可淘汰的对象",
 				zap.Int64("total", total), zap.Int64("waterline", waterline))
 			return removed, freed
