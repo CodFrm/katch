@@ -300,7 +300,7 @@ func (c *cacheSvc) Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCl
 	// 只有冷请求——手上根本没有副本——才走下面的透传与 manifest HEAD 提升。
 	stale := m.heldDigest != ""
 	if promotableManifestHead(target) && !stale {
-		body, meta, err = c.fetchAndCache(ctx, canonicalMetadataTarget(target), upstream, key, immutable, variants, nil)
+		body, meta, err = c.fetchAndCache(ctx, canonicalMetadataTarget(target), upstream, key, immutable, variants)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -313,7 +313,7 @@ func (c *cacheSvc) Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCl
 		}
 		return body, m.stamp(meta), nil
 	}
-	body, meta, err = c.fetchAndCache(ctx, target, upstream, key, immutable, variants, m.held)
+	body, meta, err = c.fetchAndCache(ctx, target, upstream, key, immutable, variants)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1077,16 +1077,31 @@ func (c *cacheSvc) removeIfUnreferenced(ctx context.Context, digest string) {
 
 // fetchAndCache 未命中：回源，同一对象的并发请求合并成一次（决策 9）。
 //
-// held 是手上那份过期但带着上游 validator 的副本，没有时为 nil。有它时这一趟回源是
-// 条件请求：上游答 304 就续期 held、从盘上应答，等在这一趟上的请求也改读那份副本。
+// 成为 leader 之前先再查一次盘：手上若是一份过期但带着上游 validator 的副本（held），
+// 这一趟回源就是条件请求，上游答 304 就续期它、从盘上应答，等在这一趟上的请求也改读
+// 那份副本。
 //
 // 回源的永远是 target 的 canonical identity GET；target 本身若是 HEAD、Range 或条件
 // 请求（刷新过期副本时会这样），应答在对象落盘之后按本地表示求值，见 serveStored。
 func (c *cacheSvc) fetchAndCache(ctx context.Context, target *proxy_svc.Target,
 	upstream *upstream_entity.Upstream, key string, immutable bool,
-	variants []string, held *cache_entity.CacheObject,
+	variants []string,
 ) (io.ReadCloser, *proxy_svc.Meta, error) {
 	flightKey := objectKey(upstream.ID, key)
+
+	c.mu.Lock()
+	if running, ok := c.inflight[flightKey]; ok {
+		c.mu.Unlock()
+		return c.attachOrFetch(ctx, running, target, upstream, key)
+	}
+	c.mu.Unlock()
+	// 调用方查盘未命中之后、走到这里之前，上一趟可能已经下完：它先落库再从合并表里摘掉，
+	// 所以表里没有 flight 时盘上那份若已经在，就直接由它应答，不再白打一次上游。
+	body, meta, m := c.serveFromDisk(ctx, target, upstream, key, immutable, !immutable, false)
+	if m == nil {
+		return body, meta, nil
+	}
+	held := m.held
 
 	c.mu.Lock()
 	if running, ok := c.inflight[flightKey]; ok {
@@ -1369,8 +1384,11 @@ func (c *cacheSvc) pump(ctx context.Context, flightKey string, current *flight,
 		// 回源中断或盘写不下去：这次不留缓存，下一次重新来过。
 		logger.Ctx(ctx).Error("缓存写入中断", zap.String("key", key), zap.Error(failure))
 	}
-	current.finish(digest, failure)
+	// 先摘掉再收尾：读者读到 EOF 时，这一趟必须已经不可再搭。反过来的话，两步之间一个刚
+	// 判定「手上那份过期了」的请求会搭上这趟下完的 flight，拿旧副本答成 HIT。摘掉之后
+	// 到达的请求直接查盘：记录在上面已经落库了。
 	c.forget(flightKey)
+	current.finish(digest, failure)
 	if failure == nil && digest != "" {
 		c.enforceQuota(ctx)
 	}

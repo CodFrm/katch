@@ -18,10 +18,12 @@ import (
 
 	"github.com/smartystreets/goconvey/convey"
 
+	"github.com/CodFrm/katch/internal/cache"
 	"github.com/CodFrm/katch/internal/metrics"
 	"github.com/CodFrm/katch/internal/model/entity/cache_entity"
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
 	"github.com/CodFrm/katch/internal/proxy/packageprofile"
+	"github.com/CodFrm/katch/internal/service/proxy_svc"
 )
 
 // TestGet_SecondPullIsServedFromDisk 目标的第一条：两次相同拉取只回源一次，
@@ -1369,4 +1371,142 @@ func waitForKey(repo *fakeRepo, key string, timeout time.Duration) *cache_entity
 		time.Sleep(10 * time.Millisecond)
 	}
 	return nil
+}
+
+// TestGet_ReaderNeverSeesEOFWhileFinishedFlightIsAttachable 读者拿到 EOF 之前，这一趟下载必须
+// 已经从合并表里摘掉。
+//
+// 以前 pump 先 finish 再 forget：两步之间，一个刚判定「手上那份过期了、要续期」的请求会搭上
+// 这趟已经下完的旧 flight，attach 看到 done 就拿旧副本答成 HIT——过期副本没经上游确认就发了
+// 出去。满载的 CI 上它表现为「上游 503 时应答 200」「新记录没写进去却拿旧副本切片」。
+// 用例持住合并表的锁：旧次序下读者照样读到 EOF、flight 却还挂在表上；新次序下 forget 在前，
+// 锁放开之前读者拿不到 EOF。
+func TestGet_ReaderNeverSeesEOFWhileFinishedFlightIsAttachable(t *testing.T) {
+	release := make(chan struct{})
+	o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "5")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-release
+		_, _ = io.WriteString(w, "index")
+	})
+	svc, _, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+	cs := svc.(*cacheSvc)
+
+	body, _, err := svc.Get(context.Background(), target("deb.debian.org", "/dists/stable/InRelease"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs.mu.Lock()
+	close(release)
+	read := make(chan error, 1)
+	go func() {
+		_, err := io.ReadAll(body)
+		read <- err
+	}()
+	select {
+	case err := <-read:
+		attachable := len(cs.inflight)
+		cs.mu.Unlock()
+		if err == nil && attachable > 0 {
+			t.Fatalf("读者已经读到 EOF，合并表里却还挂着 %d 趟下完的 flight", attachable)
+		}
+	case <-time.After(500 * time.Millisecond):
+		cs.mu.Unlock()
+		if err := <-read; err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = body.Close()
+}
+
+// TestFetchAndCache_RechecksDiskBeforeLeadingANewFetch 查盘未命中之后、登记 flight 之前，上一趟
+// 可能已经下完、落库并从合并表里摘掉了。那时再开一趟回源就是白打上游：满载的 CI 上
+// TestGet_ConcurrentPullsCoalesceIntoOneOriginFetch 因此偶发两次回源。成为 leader 之前再查一次盘。
+func TestFetchAndCache_RechecksDiskBeforeLeadingANewFetch(t *testing.T) {
+	o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "shared layer")
+	})
+	up := staticUpstream("deb.debian.org")
+	svc, _, _ := setupSvc(t, o, up, Options{})
+	const path = "/pool/base.deb"
+	pullWith(t, svc, target(up.Host, path))
+
+	// 模拟晚到的那个请求：它查盘时还没有记录，走到这里时上一趟已经收尾。
+	body, meta, err := svc.(*cacheSvc).fetchAndCache(context.Background(), target(up.Host, path), up, path,
+		true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := io.ReadAll(body)
+	_ = body.Close()
+	if string(payload) != "shared layer" {
+		t.Fatalf("正文 = %q", payload)
+	}
+	if got := meta.Header.Get(cacheStatusHeader); got != cacheStatusHit {
+		t.Fatalf("X-Katch-Cache = %q，要的是直接由盘上那份应答", got)
+	}
+	if got := o.hits.Load(); got != 1 {
+		t.Fatalf("origin hits = %d，上一趟已经落库，不该再回源", got)
+	}
+}
+
+// TestFlight_LateJoinerBetweenCommitAndFinishStillShares 晚到的读者落在「临时文件已经提交改名、
+// 这一趟还没收尾」之间，也要共读这一份，而不是退回自己回源。
+//
+// pump 的次序是字节写完 → Commit（把临时文件改名成内容摘要）→ 落库 → finish。以前 attach
+// 在没 done 时只认临时文件名，这个窗口里打开失败就返回 errNotCoalescable，调用方于是透传
+// 再打一次上游。满载的 CI 上 TestGet_ConcurrentPullsCoalesceIntoOneOriginFetch 的「两次回源」
+// 就是它：一个被调度得晚的等待者正好醒在这个窗口里。
+func TestFlight_LateJoinerBetweenCommitAndFinishStillShares(t *testing.T) {
+	store, err := cache.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer, err := store.Create()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = writer.Close() }()
+	f := newFlight(store)
+	f.start(&proxy_svc.Meta{StatusCode: http.StatusOK, Header: http.Header{}, ContentLength: 5}, writer.Name())
+	if _, err := writer.Write([]byte("layer")); err != nil {
+		t.Fatal(err)
+	}
+	f.publish(5)
+	digest, _, err := writer.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type attached struct {
+		body string
+		err  error
+	}
+	got := make(chan attached, 1)
+	go func() {
+		body, _, err := f.attach(context.Background())
+		if err != nil {
+			got <- attached{err: err}
+			return
+		}
+		payload, readErr := io.ReadAll(body)
+		_ = body.Close()
+		got <- attached{body: string(payload), err: readErr}
+	}()
+	select {
+	case early := <-got:
+		// 还没收尾就先回来了：只可能是退回自己回源的那个出口。
+		t.Fatalf("提交之后、收尾之前的读者没能共读：%+v", early)
+	case <-time.After(100 * time.Millisecond):
+	}
+	f.finish(digest, nil)
+	select {
+	case res := <-got:
+		if res.err != nil || res.body != "layer" {
+			t.Fatalf("晚到的读者 = %+v，要共读这一份", res)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("收尾之后晚到的读者仍没拿到内容")
+	}
 }

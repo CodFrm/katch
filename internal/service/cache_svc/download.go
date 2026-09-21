@@ -109,22 +109,30 @@ func (f *flight) attach(ctx context.Context) (io.ReadCloser, *proxy_svc.Meta, er
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	// 下载已经收尾：临时文件已经按内容摘要改名，直接从内容寻址的位置读。
-	if f.done {
-		if f.digest == "" {
-			return nil, nil, errNotCoalescable
+	for {
+		// 下载已经收尾：临时文件已经按内容摘要改名，直接从内容寻址的位置读。
+		if f.done {
+			if f.digest == "" {
+				return nil, nil, errNotCoalescable
+			}
+			file, _, err := f.store.Open(f.digest)
+			if err != nil {
+				return nil, nil, errNotCoalescable
+			}
+			return file, f.metaFor(cacheStatusHit), nil
 		}
-		file, _, err := f.store.Open(f.digest)
-		if err != nil {
-			return nil, nil, errNotCoalescable
+		file, err := os.Open(f.tmpPath) // #nosec G304 -- 路径由 store 自己造的临时文件给出
+		if err == nil {
+			return newTailReader(ctx, f, file), f.metaFor(cacheStatusMiss), nil
 		}
-		return file, f.metaFor(cacheStatusHit), nil
+		// 临时文件打不开而这一趟还没收尾：字节已经写完、Commit 刚把它改名成内容摘要，
+		// 落库之后就会 finish。等它收尾再从内容寻址的位置读；退回去自己回源只会为同一份
+		// 内容再打一次上游。pump 无论成败都会 finish，这里等得到头。
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		f.cond.Wait()
 	}
-	file, err := os.Open(f.tmpPath) // #nosec G304 -- 路径由 store 自己造的临时文件给出
-	if err != nil {
-		return nil, nil, errNotCoalescable
-	}
-	return newTailReader(ctx, f, file), f.metaFor(cacheStatusMiss), nil
 }
 
 // finish 收尾：done 之后读者才会读到 EOF。
