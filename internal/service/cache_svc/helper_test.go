@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -440,6 +441,14 @@ func newOrigin(t *testing.T, handler http.HandlerFunc) *originStub {
 // setupSvc 装一套完整的缓存层：假源站 + 一条上游 + 内存缓存表 + 真磁盘目录。
 func setupSvc(t *testing.T, o *originStub, up *upstream_entity.Upstream, opt Options) (CacheSvc, *fakeRepo, *cache.Store) {
 	t.Helper()
+	// 换掉进程全局之前，先把上一套夹具的后台下载等回来。
+	//
+	// goconvey 的每个内层叶子都会把外层闭包整个重跑一遍，所以一个表驱动用例会跑很多
+	// 次 setupSvc。下面那条 Cleanup 只在整个用例结束时才等，中间这些换手没人等：上一
+	// 个叶子的 pump 还停在 enforceQuota 里读它那份仓储时就被换掉，race detector 会在
+	// 下一个叶子的装配处报竞争。守这条的是 harness_test.go 里的
+	// TestHarness_WaitsForPreviousBackgroundWorkBeforeReassembling。
+	quiescePendingFixtures(t)
 	repo := newFakeRepo(t, true)
 	upRepo := mock_upstream_repo.NewMockUpstreamRepo(gomock.NewController(t))
 	up.Origin = o.srv.URL
@@ -471,6 +480,7 @@ func setupSvc(t *testing.T, o *originStub, up *upstream_entity.Upstream, opt Opt
 	// 这条 Cleanup 注册在两条还原之后，于是 LIFO 下它**先**跑：先把人等回来，
 	// 再把全局换回去，顺序反了等于没等。
 	t.Cleanup(func() {
+		forgetFixture(svc)
 		ctx, cancel := context.WithTimeout(context.Background(), quiesceTimeout)
 		defer cancel()
 		if err := svc.Quiesce(ctx); err != nil {
@@ -479,7 +489,47 @@ func setupSvc(t *testing.T, o *originStub, up *upstream_entity.Upstream, opt Opt
 			t.Errorf("后台缓存写入没能在 %s 内收尾：%v", quiesceTimeout, err)
 		}
 	})
+	rememberFixture(svc)
 	return svc, repo, store
+}
+
+// pendingFixtures 本进程里已经装出来、还没被等过的 svc。
+//
+// 这个包的用例不跑 t.Parallel，装配是串行的，所以一张表加一把锁就够；锁只是因为
+// Cleanup 与 setupSvc 可能来自不同协程（见 harness_test.go 里的两条元测试）。
+var (
+	pendingFixturesMu sync.Mutex
+	pendingFixtures   []CacheSvc
+)
+
+func rememberFixture(svc CacheSvc) {
+	pendingFixturesMu.Lock()
+	defer pendingFixturesMu.Unlock()
+	pendingFixtures = append(pendingFixtures, svc)
+}
+
+func forgetFixture(svc CacheSvc) {
+	pendingFixturesMu.Lock()
+	defer pendingFixturesMu.Unlock()
+	pendingFixtures = slices.DeleteFunc(pendingFixtures, func(pending CacheSvc) bool {
+		return pending == svc
+	})
+}
+
+// quiescePendingFixtures 把之前装出来、还没收尾的后台下载全部等回来。
+func quiescePendingFixtures(t *testing.T) {
+	t.Helper()
+	pendingFixturesMu.Lock()
+	pending := pendingFixtures
+	pendingFixtures = nil
+	pendingFixturesMu.Unlock()
+	for _, svc := range pending {
+		ctx, cancel := context.WithTimeout(context.Background(), quiesceTimeout)
+		if err := svc.Quiesce(ctx); err != nil {
+			t.Errorf("上一套夹具的后台缓存写入没能在 %s 内收尾：%v", quiesceTimeout, err)
+		}
+		cancel()
+	}
 }
 
 // quiesceTimeout 用例结束时留给后台缓存写入的收尾窗口。

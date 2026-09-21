@@ -113,3 +113,59 @@ func TestHarness_WaitsForBackgroundWorkBeforeTestEnds(t *testing.T) {
 		t.Fatal("闸放开之后用例仍然没结束")
 	}
 }
+
+// TestHarness_WaitsForPreviousBackgroundWorkBeforeReassembling 同一个用例里再装一套
+// 夹具之前，上一套的后台下载必须已经收尾。
+//
+// 「一个用例只装一次夹具」是错觉：goconvey 的每个内层叶子都会把外层闭包整个重跑
+// 一遍，所以一个带七个叶子的表驱动用例会跑七次 setupSvc，每次都换掉进程全局的
+// cache_repo 与 upstream_repo。上一个叶子的 pump 还停在 enforceQuota 里读它那份
+// mock 时换手，下一个叶子的装配处就会被 race detector 抓到——而 t.Cleanup 里的
+// Quiesce 只在整个用例结束时跑一次，中间这些换手没人等。
+//
+// 按住的仍然是 TotalSize，理由同上一条：那是「后台这件活还没干完」唯一一个不靠
+// 睡眠就按得住的缝。
+func TestHarness_WaitsForPreviousBackgroundWorkBeforeReassembling(t *testing.T) {
+	gate := make(chan struct{})
+	o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "full content")
+	})
+	svc, repo, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+	repo.mu.Lock()
+	repo.totalSizeGate = gate
+	repo.mu.Unlock()
+
+	r, _, err := svc.Get(context.Background(), target("deb.debian.org", "/pool/leaf.deb"))
+	if err != nil {
+		t.Fatalf("回源失败：%v", err)
+	}
+	if _, err := io.ReadAll(r); err != nil {
+		t.Fatalf("读响应体失败：%v", err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("关闭响应体失败：%v", err)
+	}
+
+	// 客户端这一侧收完了，pump 还欠一趟 enforceQuota，此刻正停在闸上。
+	assembled := make(chan struct{})
+	go func() {
+		defer close(assembled)
+		setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+	}()
+
+	select {
+	case <-assembled:
+		close(gate)
+		t.Fatal("上一趟后台回收还停在闸上，夹具就把进程全局换给了新的一套——" +
+			"那个协程接下来读写的是下一个叶子的仓储")
+	case <-time.After(200 * time.Millisecond):
+		// 正是要的：第二套夹具卡在「等上一套收尾」上。
+	}
+
+	close(gate)
+	select {
+	case <-assembled:
+	case <-time.After(quiesceTimeout):
+		t.Fatal("闸放开之后第二套夹具仍然没装完")
+	}
+}
