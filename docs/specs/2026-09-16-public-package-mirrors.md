@@ -2,7 +2,7 @@
 
 > Status: Approved
 > Owner: katch maintainers
-> Last updated: 2026-09-16
+> Last updated: 2026-09-21 (amended: conditional revalidation of expired objects, Docker-Distribution-Api-Version replay)
 
 **Objective:** 让常见包管理器在客户端无法访问公网时，仅通过 katch 完成公开包的元数据解析、制品下载和原生完整性校验，并让重复下载按协议语义命中缓存。
 
@@ -15,12 +15,15 @@
 3. **缓存命中缺少下载语义。** 当前 static 命中不恢复 ETag、Last-Modified、Vary 或 Accept-Ranges，HEAD、Range 和条件请求只能穿透；请求 gzip 元数据时响应不会进入缓存，真实 npm 请求因而持续 MISS。
 4. **协议可变性不能只靠站长填写路径模式。** tag、索引、快照、带版本制品和带摘要对象在各协议中的可变性不同；错误的长期缓存会隐藏新版本或永久保存可变对象。
 5. **重定向和嵌套 URL 缺少同一条目标约束。** 元数据 URL、HTTP 重定向和 registry token realm 都可能把服务端带到初始上游之外；只验证首个请求主机不足以维持上游白名单边界。
+6. **过期的可变对象每次都整份重下。** 已核实：过期或 `no-cache` 的对象走无条件 GET，上游未变时也重新传输整份正文；转换后的元数据只存 katch 自己的 ETag，丢掉了上游 validator，无从发起条件请求；过期可变对象不进 LRU 候选，每 10 分钟的 Sweep 会连记录带字节删除，即使带上 validator 也几乎没有可续期的副本。
+7. **命中与未命中的 registry 响应头不一致。** 已核实：未命中时上游的 `Docker-Distribution-Api-Version` 随其余非 hop-by-hop 头原样转发，命中时它不在保存的安全头集合里，同一个 manifest 的冷暖响应因此不同。尚未观察到真实客户端因此失败。
 
 ## Actors and user stories
 
 1. As a katch administrator, I want to select a package metadata adapter for a static upstream and see its required companion upstreams, so that clients receive a complete, closed mirror path instead of partially working configuration.
 2. As a developer, I want to point npm-family, Python, Go, JVM, Cargo, NuGet, Ruby, APT, DNF/YUM, APK, Composer and Homebrew clients at katch, so that dependency resolution and artifact verification succeed without direct public network access.
 3. As an operator, I want metadata and immutable artifacts to use different cache semantics while preserving validators, so that warm requests reduce origin traffic without serving stale mutable state or invalid bytes.
+4. As an operator, I want an expired mutable object whose origin copy has not changed to be renewed by a conditional request, so that frequently refreshed indexes cost a 304 instead of a full download, and I can tell such a renewal apart from a hit or a full refetch.
 
 ## Design decisions
 
@@ -34,6 +37,8 @@
 | 6   | Store one canonical identity-coded object per cache variant, persist safe validators, and make cache variants protocol-aware.                                                                                                                                                                                       | Real clients rely on validators, ranges and content negotiation. Rejected: cache encoded and identity bodies under one key or cache only Content-Type and bytes - both produce incorrect warm responses.                        |
 | 7   | Keep signed indexes and artifact bodies byte-identical; solve Homebrew bottles through its supported OCI artifact-domain mapping and Go checksum through a sumdb bridge instead of body rewriting.                                                                                                                  | Homebrew JWS, APT Release data and APK indexes cannot be modified without invalidating trust. Rejected: rewrite every metadata document or claim Homebrew source builds use artifact-domain - Homebrew 6 does neither safely.   |
 | 8   | Deliver all listed ecosystems in dependency order, but do not mark an ecosystem supported until its real client passes with public egress blocked.                                                                                                                                                                  | Shared cache and safety behavior must precede adapters. Rejected: infer compatibility from successful curl requests - earlier research showed this misses nested URLs.                                                          |
+| 9   | Revalidate expired or `no-cache` mutable objects with the stored origin validators and renew them on 304; keep expired objects that carry an origin validator as LRU candidates instead of sweeping them. (user-decided 2026-09-21) | Unchanged mutable metadata is the common case for indexes and packuments, and disk use is already governed by the quota. Rejected: keep the unconditional refresh (wastes origin traffic); a fixed grace window before sweeping (adds a hard-coded constant and still misses day-later requests); leave Sweep unchanged (renewal would only work in a window under 10 minutes). |
+| 10  | Mark a renewal `X-Katch-Cache: REVALIDATED`; metrics count it as a TTL miss with zero origin bytes. (user-decided 2026-09-21) | The origin was contacted, so it is not a hit, but no body crossed the wire, so saved traffic must include it. Rejected: report HIT (breaks the "HIT means no origin access" contract); a separate metric category with a new rollup column and UI legend (schema and frontend cost without a current need). |
 
 ## Upstream configuration
 
@@ -69,7 +74,7 @@ Cache identity includes path, query, adapter-declared request variants and, for 
 
 Every cache-fill request sets `Accept-Encoding: identity`, regardless of the client's accepted content codings. The stored object therefore never varies on `Accept-Encoding`; katch deliberately removes that dimension from Vary on its canonical identity response. A client that explicitly forbids identity bypasses object caching for byte-transparent content and receives `406 Not Acceptable` for transformable metadata. If an origin ignores the identity request and returns a content-encoded transformable document, katch returns 502 rather than parsing ambiguous bytes; encoded byte-transparent content may pass through but is not cached. `Vary: *` and Vary dimensions other than the removed `Accept-Encoding` or those declared by the active profile make a response uncacheable.
 
-Cache records retain the safe response metadata required by supported read clients: Content-Type, representation ETag, Last-Modified, effective Cache-Control, origin Date/Age/Expires, Vary, Accept-Ranges, Content-Disposition and Docker-Content-Digest. Hop-by-hop, Content-Encoding, authentication, cookie, account quota and upstream transport-policy headers are never stored or replayed.
+Cache records retain the safe response metadata required by supported read clients: Content-Type, representation ETag, Last-Modified, effective Cache-Control, origin Date/Age/Expires, Vary, Accept-Ranges, Content-Disposition, Docker-Content-Digest and Docker-Distribution-Api-Version. Docker-Distribution-Api-Version is replayed on a hit only when the origin supplied it; katch never synthesizes it for cached objects. For transformed metadata the origin ETag and Last-Modified are retained separately as origin validators: they are used only for revalidation requests and are never replayed to clients. Hop-by-hop, Content-Encoding, authentication, cookie, account quota and upstream transport-policy headers are never stored or replayed.
 
 Local freshness is no longer than either the profile/upstream TTL or a more restrictive origin directive. `no-store` and `private` responses are not stored; `no-cache` objects are stored only as bodies and refreshed before every reuse, while `must-revalidate` objects may be reused while fresh but must never be served stale without successful validation. Warm responses expose an Age derived from the origin Age and local residence time, so cache hits do not restart the origin freshness lifetime.
 
@@ -79,7 +84,11 @@ Range applies only after preconditions and only to GET. It supports closed, open
 
 A cold HEAD, Range or conditional request for byte-transparent content passes through and never stores a partial response or 304 as a full object. The same request for transformable metadata first performs the canonical unconditional identity GET described above, then applies HEAD, range and conditions to the transformed representation. If that representation is uncacheable, katch may still answer the current request from the bounded transformed buffer but does not retain it.
 
-Expired mutable objects are refreshed with an unconditional canonical GET in this change; katch does not send its representation ETag to the origin. After refresh, client conditions are evaluated against the new representation validator. An origin failure does not silently promote expired metadata to fresh.
+An expired mutable object, or one stored with `no-cache`, is refreshed through the canonical identity GET. When the record holds an origin ETag, that request carries `If-None-Match` with it; when it holds an origin Last-Modified, the request carries `If-Modified-Since` with it; a record with neither sends the unconditional GET. katch never sends its own transformed-representation ETag to the origin, and the client's own conditional headers are not forwarded: after the refresh, client method, preconditions and ranges are evaluated locally against the resulting representation exactly as for a hit.
+
+On an origin 304, katch keeps the stored bytes and representation validators and updates the stored Date, Age, Cache-Control, Expires and origin validators from the 304 as RFC 9111 §4.3.4 describes, then recomputes local freshness under the same rules as a new store. If the 304 carries a strong ETag different from the stored origin ETag, the stored copy is not proven current: katch discards the renewal and performs the unconditional GET. If the updated directives make the object unstorable (`no-store` or `private`), the current request is still answered from the validated bytes but the record is removed. A renewed response is marked `X-Katch-Cache: REVALIDATED`; metrics record it as a TTL miss whose origin byte count is zero. On an origin 200, the object is replaced as a normal miss. Any other status or origin failure behaves as the unconditional refresh does today and never promotes expired metadata to fresh.
+
+An expired mutable object that holds at least one origin validator is not removed by the periodic expiry sweep; it remains on disk as an LRU eviction candidate, reclaimed under quota pressure like immutable objects, so a later request can renew it. An expired mutable object without any origin validator is swept as before. Pinned objects keep their existing exemption from both. This supersedes the non-goal "可变对象过期后的条件回源 `304` 自动续期" in [static cache policy and revalidation](2026-09-16-static-cache-policy-and-revalidation.md).
 
 Adapters provide protocol-owned classification before administrator `immutable_patterns`; explicitly mutable protocol paths cannot be overridden into immutable ones. Unknown non-standard paths continue to use administrator patterns and the upstream mutable TTL.
 
@@ -170,6 +179,9 @@ An ecosystem is presented as supported only after its real-client case has passe
 | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
 | Adapter unit tests with protocol fixtures | Exact known-field rewriting, escaping, hashes, size limits, media types and fail-closed companion hosts                   | Existing proxy and cache service unit-test patterns             |
 | Cache service tests                       | Accept variants, persisted headers, HEAD, conditions, ranges, protocol mutability and transformed ETag behavior           | `internal/service/cache_svc` tests                              |
+| Revalidation tests                        | Origin validators sent, 304 renewal and header update, ETag-mismatch fallback, no-validator unconditional GET, `no-cache` renewal, unstorable 304, origin failure, `REVALIDATED` marker and Docker-Distribution-Api-Version replay | `internal/service/cache_svc` tests with a fake origin           |
+| Metrics tests                             | `REVALIDATED` counted as a TTL miss with zero origin bytes                                                                | `internal/metrics` tests                                        |
+| Repository/migration tests                | Origin-validator and Docker header columns, sweep skipping validator-bearing expired rows, LRU candidates including them  | `internal/repository/cache_repo` tests with sqlmock; migration tests |
 | Origin/redirect tests                     | Registered-target enforcement, downgrade/userinfo rejection and dial-address validation                                   | Existing `internal/proxy/origin` tests                          |
 | Admin API/repository tests                | Adapter persistence, validation, migration compatibility and API round trips                                              | Existing upstream service/repository tests with sqlmock         |
 | Frontend tests                            | Adapter controls, translated guidance, invalid combinations and partial-configuration states                              | Existing Vitest component tests                                 |
@@ -178,6 +190,8 @@ An ecosystem is presented as supported only after its real-client case has passe
 The runtime matrix requires every named client to pass: npm, pnpm, Yarn Classic, current Yarn Berry, Bun, pip, uv, current Poetry, Go, Maven, Gradle, sbt, Cargo, dotnet/NuGet, gem, Bundler, APT, DNF, YUM compatibility mode, Alpine apk, Composer 2 dist installation and Homebrew standard bottle installation. Missing host-platform clients run in a Linux container or CI runner using the same built katch binary; unavailability is a blocked verification result, not a skip. Docker, Podman and Git also run as regression cases for the shared cache and destination-safety changes.
 
 Runtime clients execute in a network namespace or container whose firewall permits only the katch listener and loopback, while katch runs outside that namespace with origin access. DNS and rejected connection attempts are recorded; any attempted non-katch connection fails the case even if the client later succeeds. Proxy environment variables may supplement this boundary for diagnostics but never serve as the isolation mechanism.
+
+Conditional revalidation additionally receives one manual real-client check against live origins (user-decided 2026-09-21): with a short mutable TTL, a real client re-requests expired metadata and the run records an origin 304, an `X-Katch-Cache: REVALIDATED` response and a successful client operation. It is recorded in the verification report rather than added as a harness case, because live origins decide whether a copy is unchanged.
 
 Some public repositories change independently during a run. Automated protocol tests therefore own exact fields and cache decisions; runtime tests own client interoperability, blocked-egress behavior, cold/warm origin counts and native integrity checks without pinning mutable metadata bytes.
 
