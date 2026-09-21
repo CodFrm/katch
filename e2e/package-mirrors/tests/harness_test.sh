@@ -1521,6 +1521,17 @@ if KATCH_ROUTE_PROBE_RESOLVERS=$workdir/no-such-resolvers KATCH_PORT=$capture_ka
   fail "Go route probe was accepted without a readable resolver snapshot"
 fi
 
+# The allowance keys on the syscall strace names after the pid, not on the text
+# "connect(" appearing anywhere: a printed buffer can carry that text too.
+cat > "$workdir/route-probe-disguised.log" <<EOF
+161 sendto(7, " connect(x", 0, MSG_NOSIGNAL, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("$capture_katch_ip")}, 16) = 0
+EOF
+if KATCH_ROUTE_PROBE_RESOLVERS=$workdir/resolvers-without-katch KATCH_PORT=$capture_katch_port \
+  "$ENTRYPOINT" --verify-capture "$workdir/route-probe-disguised.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
+  fail "a sendto whose payload contains connect( entered the route probe allowance"
+fi
+grep -F 'sendto' "$workdir/out" >/dev/null || fail "the disguised sendto was not reported"
+
 # Concurrent Go threads make strace split a probe; its result arrives on the same
 # pid after unrelated threads' resumed lines. This interleaving is copied from a
 # real warm goproxy capture. Unrelated resumed lines carry only a result for a

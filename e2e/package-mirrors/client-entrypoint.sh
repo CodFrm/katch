@@ -35,10 +35,14 @@ verify_capture() {
   katch_route_probe=0
   resolvers=${KATCH_ROUTE_PROBE_RESOLVERS:-}
   if [ -n "$resolvers" ] && [ -r "$resolvers" ] && [ -f "$resolvers" ]; then
-    if ! awk -v ip="$katch_ip" '
+    # The verdict is a token rather than an exit status: "awk did not find Katch" and
+    # "awk failed" share exit codes in neither direction worth trusting, and only an
+    # explicit katch_absent may open the allowance.
+    verdict=$(awk -v ip="$katch_ip" '
       $1 == "nameserver" && ($2 == ip || $2 == "::ffff:" ip) { found = 1 }
-      END { exit found ? 0 : 1 }
-    ' "$resolvers"; then
+      END { print found ? "katch_present" : "katch_absent" }
+    ' "$resolvers" 2>/dev/null) || verdict=
+    if [ "$verdict" = katch_absent ]; then
       katch_route_probe=1
     fi
   fi
@@ -50,6 +54,12 @@ verify_capture() {
     function reject(line) {
       print "non-katch connection attempt: " line > "/dev/stderr"
       bad = 1
+    }
+    # is_connect anchors the syscall name to the pid prefix that strace -f prints.
+    # An unanchored match would also accept " connect(" appearing inside a printed
+    # buffer, so a sendto carrying that text could enter a probe allowance.
+    function is_connect(line) {
+      return line ~ /^[[:space:]]*[0-9]+[[:space:]]+connect\(/
     }
     function trace_pid(line, pid) {
       pid = line
@@ -65,7 +75,7 @@ verify_capture() {
       if (destination ~ /^127\./ || destination == "::1" || destination ~ /^::ffff:127\./) return
       if (destination == allowed || destination == "::ffff:" allowed) {
         if (port == 53) {
-          if (katch_route_probe == 1 && line ~ /(^|[[:space:]])connect\(/) {
+          if (katch_route_probe == 1 && is_connect(line)) {
             if (line ~ /[[:space:]]=[[:space:]]0[[:space:]]*$/) return
             # Concurrent threads make strace split the probe; its result arrives
             # later on the same pid and is checked by the resumed rule below.
@@ -77,7 +87,7 @@ verify_capture() {
               }
             }
           }
-          if (allow_blocked_dns_probe == 1 && line ~ /(^|[[:space:]])connect\(/) {
+          if (allow_blocked_dns_probe == 1 && is_connect(line)) {
             if (line ~ /[[:space:]]=[[:space:]]0[[:space:]]*$/) {
               preserve_blocked_dns_probe(line)
               return
@@ -95,7 +105,7 @@ verify_capture() {
           return
         }
         if (port == 65535) {
-          if (allow_musl_route_probe == 1 && line ~ /(^|[[:space:]])connect\(/ && line ~ /[[:space:]]=[[:space:]]0[[:space:]]*$/) return
+          if (allow_musl_route_probe == 1 && is_connect(line) && line ~ /[[:space:]]=[[:space:]]0[[:space:]]*$/) return
           reject(line)
           return
         }
@@ -427,7 +437,10 @@ if [ "$KATCH_ALLOW_BLOCKED_DNS_PROBE" -eq 1 ]; then
   blocked_dns_evidence=$KATCH_ARTIFACTS/blocked-dns-probes.log
 fi
 if [ -n "$resolv_before" ]; then
-  # A root case could point the resolver at Katch mid-run; audit both states.
+  # A root case could point the resolver at Katch mid-run, so audit the pre-run snapshot
+# as well as the final file. The snapshot lives in the case-writable artifacts directory,
+# the same trust boundary as connect.log itself: this catches a case that switches
+# resolvers, not one that also rewrites the evidence.
   KATCH_ROUTE_PROBE_RESOLVERS=$KATCH_ARTIFACTS/resolvers.audited
   cat "$resolv_before" /etc/resolv.conf > "$KATCH_ROUTE_PROBE_RESOLVERS"
 fi
