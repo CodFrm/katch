@@ -34,12 +34,16 @@ db:
   #   driver: "mysql"
   #   dsn: "user:pass@tcp(127.0.0.1:3306)/katch?charset=utf8mb4&parseTime=True&loc=Local"
   driver: "sqlite"
-  # 两个 pragma 都不能省：
-  #   journal_mode(WAL)  —— 默认的 DELETE 模式下读会阻塞写，缓存元数据是读多写少，
-  #                         不开 WAL 一上并发就互相卡。
-  #   busy_timeout(5000) —— sqlite 遇到锁默认**立刻**返回 SQLITE_BUSY 而不是等待，
-  #                         不设这个值，并发写会直接报 "database is locked"。
-  dsn: "file:./data/katch.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+  # 三个 pragma 都不能省：
+  #   journal_mode(WAL)     —— 默认的 DELETE 模式下读会阻塞写，缓存元数据是读多写少，
+  #                            不开 WAL 一上并发就互相卡。
+  #   busy_timeout(5000)    —— sqlite 遇到锁默认**立刻**返回 SQLITE_BUSY 而不是等待，
+  #                            不设这个值，并发写会直接报 "database is locked"。
+  #   synchronous(NORMAL)   —— 默认的 FULL 在 WAL 下每次提交都 fsync，而缓存正往同一块盘
+  #                            写大文件，一次提交能卡几百毫秒到几秒，等锁的写还会超过上面
+  #                            的 5 秒直接失败。NORMAL 只在断电或系统崩溃时可能丢最后几个
+  #                            事务（进程崩溃不丢），对缓存元数据的代价是下次重新回源。
+  dsn: "file:./data/katch.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)"
   prefix: "katch_"
   debug: false
   # sqlite 是单文件，写入本来就串行，连接数开大只会增加锁竞争。切到 mysql 时这几项

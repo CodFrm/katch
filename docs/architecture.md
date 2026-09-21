@@ -112,9 +112,12 @@ MySQL 特有语法。DDL 优先写原生 SQL 而不是依赖 gorm 的 AutoMigrat
 一张 repository 永远查不到的表。代价是表名跟着实体的结构体名走，**重命名实体必须
 配一条补丁迁移**。
 
-sqlite 的 DSN 里两个 pragma 不能省（见 `configs/config.yaml` 的注释）：
+sqlite 的 DSN 里三个 pragma 不能省（见 `configs/config.yaml` 的注释）：
 `journal_mode(WAL)` 让读不阻塞写，`busy_timeout` 让遇锁时等待而不是立刻返回
-`SQLITE_BUSY`——缺了它并发写会直接报 "database is locked"。
+`SQLITE_BUSY`——缺了它并发写会直接报 "database is locked"；`synchronous(NORMAL)`
+让 WAL 下的提交不再每次 fsync——缓存往同一块盘写大文件时，默认的 FULL 能让一次提交
+卡几百毫秒到几秒，等锁的写还会超过 `busy_timeout` 直接失败。NORMAL 只在断电或系统
+崩溃时可能丢最后几个事务，对缓存元数据的代价是下一次重新回源。
 
 ## 上游适配
 

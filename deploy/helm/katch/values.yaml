@@ -52,7 +52,8 @@ config:
     # sqlite 驱动是纯 Go 的 modernc.org/sqlite，落地就是数据卷里的一个文件。
     # 切 mysql 改这一段即可，但**换不来多副本**，见 docs/deploy.md。
     driver: sqlite
-    dsn: "file:./data/katch.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+    # 三个 pragma 的理由见 configs/config.yaml.example 里 db 段的注释。
+    dsn: "file:./data/katch.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)"
     prefix: katch_
     debug: false
     maxOpenConns: 8
