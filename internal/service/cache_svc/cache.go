@@ -1239,13 +1239,20 @@ func durationSeconds(duration time.Duration) int64 {
 	return int64(duration / time.Second)
 }
 
+// effectiveExpiration 本地新鲜期的截止时刻；返回 0 表示不因时间过期。
+//
+// 两道上限分开算：源站那道是它声明的寿命减去对象到手时已有的年龄（Age 或 Date 推算，
+// 取大者），katch 这道是可变 TTL——封的是对象在这里的驻留时间。以前是先取两者较小的
+// 寿命、再统一扣源站年龄，于是 CDN 报的 Age 一旦超过 TTL，对象刚存进来就已经过期：
+// index.crates.io/config.json 没有寿命指令却带着 Age: 1420，sum.golang.org 的部分
+// tile 是 max-age=10800、Age 几千秒，结果每一次都回源。
+//
+// spec 对本地新鲜度的约束都还满足：不超过 TTL，不超过源站剩下的新鲜期，命中也不会
+// 重启源站寿命（对外的 Age 仍是源站年龄加本地驻留时间，见读路径）。
 func effectiveExpiration(now time.Time, ttl int64, immutable bool,
 	object *cache_entity.CacheObject,
 ) int64 {
 	lifetime := int64(math.MaxInt64)
-	if !immutable && ttl > 0 {
-		lifetime = ttl
-	}
 	directives := parseCacheControl(object.CacheControl)
 	for _, name := range []string{"s-maxage", "max-age"} {
 		if value, ok := directives[name]; ok {
@@ -1266,10 +1273,16 @@ func effectiveExpiration(now time.Time, ttl int64, immutable bool,
 			lifetime = seconds
 		}
 	}
-	if lifetime == math.MaxInt64 {
+	remaining := int64(math.MaxInt64)
+	if lifetime != math.MaxInt64 {
+		remaining = lifetime - min(lifetime, object.OriginAge)
+	}
+	if !immutable && ttl > 0 && ttl < remaining {
+		remaining = ttl
+	}
+	if remaining == math.MaxInt64 {
 		return 0
 	}
-	remaining := lifetime - min(lifetime, object.OriginAge)
 	return saturatingAdd(now.Unix(), remaining)
 }
 
