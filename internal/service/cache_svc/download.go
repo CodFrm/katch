@@ -152,12 +152,27 @@ type tailReader struct {
 	f    *flight
 	file *os.File
 	off  int64
-	stop chan struct{}
-	once sync.Once
+	// declared 这一份表示声明的字节数，未知（分块传输）时为负。
+	//
+	// 只用在一处：客户端挂断时判断它是不是已经拿齐了。pump 的次序是字节发完 →
+	// Commit → 写记录 → 置 done，提交和落库要落盘写库，而客户端拿到声明的最后一个
+	// 字节之后随时可以关连接。那一刻读者正停在「等新字节或等 done」上，于是最后一次
+	// 读拿到 ctx 取消，一次完整成功的转发被 web 那边记成「转发响应体中断」——真机上
+	// 约半数成功的 MISS 都带着这条 warn，值班时要靠它区分「客户端真的断了」和「一切正常」。
+	//
+	// 反过来，没挂断的读者照旧等到 done：「读到 EOF 就意味着记录已经落库」是另一条
+	// 被依赖的契约（紧接着的下一次拉取要能命中），提前放它走会把那条毁掉。
+	declared int64
+	stop     chan struct{}
+	once     sync.Once
 }
 
 func newTailReader(ctx context.Context, f *flight, file *os.File) *tailReader {
-	r := &tailReader{ctx: ctx, f: f, file: file, stop: make(chan struct{})}
+	declared := int64(-1)
+	if f.meta != nil {
+		declared = f.meta.ContentLength
+	}
+	r := &tailReader{ctx: ctx, f: f, file: file, declared: declared, stop: make(chan struct{})}
 	// 客户端断开时把等在 cond 上的这个读者叫醒：cond.Wait 自己不认识 context，
 	// 少了这个看门协程，一个已经走掉的客户端会一直占着处理器直到下载结束。
 	go func() {
@@ -178,6 +193,10 @@ func (r *tailReader) Read(p []byte) (int, error) {
 	for r.off >= f.written && !f.done {
 		if err := r.ctx.Err(); err != nil {
 			f.mu.Unlock()
+			if r.declared >= 0 && r.off >= r.declared {
+				// 声明的字节一个不差地交付完了才挂断：这不是中断，见 declared。
+				return 0, io.EOF
+			}
 			return 0, err
 		}
 		f.cond.Wait()

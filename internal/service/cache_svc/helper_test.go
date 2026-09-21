@@ -121,6 +121,11 @@ type fakeRepo struct {
 	promoteErr    error
 	deleteStarted chan struct{}
 	deleteGate    chan struct{}
+	// saveGate 非 nil 时，Save 会先等它。
+	//
+	// pump 里 Save 排在 finish 之前，所以按住它就把「字节全发完了、done 还没置」
+	// 那个窗口停住了——客户端正是在这个窗口里挂断，才会把一次成功的转发记成中断。
+	saveGate chan struct{}
 	// totalSizeGate 非 nil 时，TotalSize 会先等它。
 	//
 	// TotalSize 只有 enforceQuota 一个调用方，而 enforceQuota 只跑在 pump 那个
@@ -151,6 +156,12 @@ func newFakeRepo(t *testing.T, stampAccess bool) *fakeRepo {
 		})
 	m.EXPECT().Save(gomock.Any(), gomock.Any()).AnyTimes().
 		DoAndReturn(func(_ any, obj *cache_entity.CacheObject) error {
+			f.mu.Lock()
+			gate := f.saveGate
+			f.mu.Unlock()
+			if gate != nil {
+				<-gate
+			}
 			f.mu.Lock()
 			defer f.mu.Unlock()
 			if obj.ID == 0 {
