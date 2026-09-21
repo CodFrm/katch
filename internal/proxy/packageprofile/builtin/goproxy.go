@@ -2,8 +2,9 @@ package builtin
 
 import (
 	"context"
-	"strconv"
 	"strings"
+
+	"golang.org/x/mod/sumdb/tlog"
 
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
 	"github.com/CodFrm/katch/internal/proxy/packageprofile"
@@ -87,24 +88,22 @@ func classifyGoChecksumPath(path string) packageprofile.Representation {
 	if strings.HasPrefix(path, "/lookup/") && len(path) > len("/lookup/") {
 		return packageprofile.Representation{Class: packageprofile.ClassImmutable}
 	}
-	parts := strings.Split(strings.TrimPrefix(path, "/tile/"), "/")
 	if !strings.HasPrefix(path, "/tile/") {
 		return packageprofile.Representation{}
 	}
-	if len(parts) == 3 && decimal(parts[0]) && decimal(parts[1]) && decimal(parts[2]) {
+	// 路径格式交给 Go 自己的 tlog 解析：tile 索引 ≥1000 时按三位一组编码、除最后一组外
+	// 都带 x 前缀（/tile/8/0/x251/154），另有 data 层。真实的 sum.golang.org 树很大，
+	// 客户端取的 level-0 tile 几乎全是分组形式；只认三段路径时它们全被当成普通对象，
+	// CDN 带来的 Age 一旦超过可变 TTL，刚存进来就已经过期。ParseTilePath 还会回环校验，
+	// 只接受规范路径——只有规范路径才由树上的位置唯一确定内容。
+	tile, err := tlog.ParseTilePath(strings.TrimPrefix(path, "/"))
+	if err != nil {
+		return packageprofile.Representation{}
+	}
+	// 满 tile 的内容由它在树里的位置唯一决定，树只增不改，所以永远不变；部分 tile 会随
+	// 树长大被更宽的一版替换。
+	if tile.W == 1<<uint(tile.H) {
 		return packageprofile.Representation{Class: packageprofile.ClassImmutable}
 	}
-	if len(parts) == 4 && strings.HasSuffix(parts[2], ".p") &&
-		decimal(parts[0]) && decimal(parts[1]) && decimal(strings.TrimSuffix(parts[2], ".p")) && decimal(parts[3]) {
-		return packageprofile.Representation{Class: packageprofile.ClassMutable}
-	}
-	return packageprofile.Representation{}
-}
-
-func decimal(value string) bool {
-	if value == "" {
-		return false
-	}
-	_, err := strconv.ParseUint(value, 10, 64)
-	return err == nil
+	return packageprofile.Representation{Class: packageprofile.ClassMutable}
 }

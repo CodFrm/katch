@@ -36,6 +36,15 @@ func TestGoProxyProfileRegistersAndClassifiesRepresentations(t *testing.T) {
 		{name: "sumdb latest", host: "sum.golang.org", path: "/latest", class: packageprofile.ClassMutable},
 		{name: "bare lookup", host: "sum.golang.org", path: "/lookup", class: packageprofile.ClassUnknown},
 		{name: "partial tile without width", host: "sum.golang.org", path: "/tile/8/1/000.p/", class: packageprofile.ClassUnknown},
+		// tlog 把 ≥1000 的 tile 索引按三位一组编码，除最后一组外都带 x 前缀。真实的
+		// sum.golang.org 树很大，Go 客户端取的 level-0 tile 几乎全是这种形式。
+		{name: "complete tile with grouped index", host: "sum.golang.org", path: "/tile/8/0/x251/154", class: packageprofile.ClassImmutable},
+		{name: "partial tile with grouped index", host: "sum.golang.org", path: "/tile/8/0/x251/174.p/91", class: packageprofile.ClassMutable},
+		{name: "complete data tile", host: "sum.golang.org", path: "/tile/8/data/x001/x234/567", class: packageprofile.ClassImmutable},
+		{name: "partial data tile", host: "sum.golang.org", path: "/tile/8/data/x001/x234/567.p/3", class: packageprofile.ClassMutable},
+		// 只有规范路径才由树上的位置唯一确定内容；Go 客户端也只发规范路径。
+		{name: "grouped index without x prefix", host: "sum.golang.org", path: "/tile/8/0/251/154", class: packageprofile.ClassUnknown},
+		{name: "index not zero padded", host: "sum.golang.org", path: "/tile/8/1/1", class: packageprofile.ClassUnknown},
 		{name: "unknown module path", host: "proxy.golang.org", path: "/example.com/mod/@v/v1.2.3.txt", class: packageprofile.ClassUnknown},
 	}
 	for _, tc := range tests {
