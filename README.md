@@ -208,7 +208,7 @@ TTL 内的副本由本地应答，命中响应原样回放上游保存下来的 
 - `Range` 支持单段、多段和后缀范围；完整新鲜副本可以本地返回 `206`，非法或不可满足
   范围返回 `416`。`If-Range` 匹配才返回范围，不匹配则返回完整 `200`。
 
-没有完整新鲜副本时，条件与 Range 请求透传且不写缓存——它们可能拿到 `206`、`304`、
+手上没有副本（冷请求）时，条件与 Range 请求透传且不写缓存——它们可能拿到 `206`、`304`、
 `412` 或 `416`，不能当成一份完整副本存下来。普通 static HEAD 和 registry blob HEAD
 同样透传；仅无条件、无范围的 registry manifest HEAD 会以同一 `Accept` 变体的 identity
 GET 填充缓存，再返回无正文的 GET 等价元数据。
@@ -217,6 +217,8 @@ GET 填充缓存，再返回无正文的 GET 等价元数据。
 上游自己给过的 `ETag`/`Last-Modified`，回源那一次带上 `If-None-Match`/`If-Modified-Since`：
 上游答 `304` 就按它更新新鲜期、复用盘上的字节，响应标 `X-Katch-Cache: REVALIDATED`；
 上游答 `200` 就整份替换（`MISS`）；上游出错则照常透传，过期副本不会被当成新鲜的发出去。
+这一跳总是 canonical identity GET：客户端发的是 `HEAD`、`Range` 或自己的条件请求时，这些
+不转发给上游，刷新之后按本地副本求值，与命中时一样。
 转换过的元数据（npm packument、PyPI Simple 等）回放的是 katch 自己算的 ETag，续期时发给
 上游的仍是上游那一串。过期但带着上游 validator 的对象不被定时清理删除，留着等下一次
 续期，由配额回收按 LRU 收走；没有 validator 的过期对象照旧由定时清理删除。

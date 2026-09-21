@@ -294,14 +294,19 @@ func (c *cacheSvc) Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCl
 		return body, meta, nil
 	}
 	variants := declaredVariants(target, representation)
-	if promotableManifestHead(target) {
+	// 手上有一份过期（或 no-cache、或旧配置写成永久）的副本：不论客户端发的是普通
+	// GET 还是 HEAD、Range、条件请求，都先用 canonical identity GET 刷新它（带着保存的
+	// 上游 validator），再按本地表示求值客户端的方法、条件与范围，与命中时一样。
+	// 只有冷请求——手上根本没有副本——才走下面的透传与 manifest HEAD 提升。
+	stale := m.heldDigest != ""
+	if promotableManifestHead(target) && !stale {
 		body, meta, err = c.fetchAndCache(ctx, canonicalMetadataTarget(target), upstream, key, immutable, variants, nil)
 		if err != nil {
 			return nil, nil, err
 		}
 		return drainPromotedHead(body, stampPassthroughMiss(meta, m))
 	}
-	if !writableRequest(target) {
+	if !writableRequest(target) && !stale {
 		body, meta, err = fetchOriginMiss(ctx, target)
 		if err != nil {
 			return nil, nil, err
@@ -1074,6 +1079,9 @@ func (c *cacheSvc) removeIfUnreferenced(ctx context.Context, digest string) {
 //
 // held 是手上那份过期但带着上游 validator 的副本，没有时为 nil。有它时这一趟回源是
 // 条件请求：上游答 304 就续期 held、从盘上应答，等在这一趟上的请求也改读那份副本。
+//
+// 回源的永远是 target 的 canonical identity GET；target 本身若是 HEAD、Range 或条件
+// 请求（刷新过期副本时会这样），应答在对象落盘之后按本地表示求值，见 serveStored。
 func (c *cacheSvc) fetchAndCache(ctx context.Context, target *proxy_svc.Target,
 	upstream *upstream_entity.Upstream, key string, immutable bool,
 	variants []string, held *cache_entity.CacheObject,
@@ -1092,7 +1100,7 @@ func (c *cacheSvc) fetchAndCache(ctx context.Context, target *proxy_svc.Target,
 	// 回源用脱离客户端取消的 context：客户端断开时下载要继续跑完，已下载的部分
 	// 仍要写完缓存——下一个请求就能命中，否则一次断线就白白浪费整趟回源。
 	fetchCtx := context.WithoutCancel(ctx)
-	fetchTarget := canonicalTarget(target)
+	fetchTarget := canonicalMetadataTarget(target)
 	body, meta, err := fetchOriginMiss(fetchCtx, withOriginValidators(fetchTarget, held))
 	if err == nil && held != nil && meta.StatusCode == http.StatusNotModified {
 		_ = body.Close()
@@ -1120,7 +1128,7 @@ func (c *cacheSvc) fetchAndCache(ctx context.Context, target *proxy_svc.Target,
 	if !cacheableResponse(meta, variants) {
 		c.forget(flightKey)
 		current.startUncacheable()
-		return body, meta, nil
+		return uncachedForClient(ctx, target, body, meta)
 	}
 	writer, err := c.store.Create()
 	if err != nil {
@@ -1129,7 +1137,7 @@ func (c *cacheSvc) fetchAndCache(ctx context.Context, target *proxy_svc.Target,
 			zap.String("key", key), zap.Error(err))
 		c.forget(flightKey)
 		current.startUncacheable()
-		return body, meta, nil
+		return uncachedForClient(ctx, target, body, meta)
 	}
 	current.start(meta, writer.Name())
 	// 计数要在起协程**之前**加：加在 pump 里面的话，Quiesce 可能刚好在协程还没
@@ -1145,6 +1153,9 @@ func (c *cacheSvc) attachOrFetch(ctx context.Context, current *flight,
 ) (io.ReadCloser, *proxy_svc.Meta, error) {
 	body, meta, err := current.attach(ctx)
 	if err == nil {
+		if !writableRequest(target) {
+			return c.serveStored(ctx, target, upstream, key, body)
+		}
 		return body, meta, nil
 	}
 	if errors.Is(err, errRenewed) {
@@ -1158,6 +1169,48 @@ func (c *cacheSvc) attachOrFetch(ctx context.Context, current *flight,
 		return fetchOriginMiss(ctx, target)
 	}
 	return nil, nil, err
+}
+
+// serveStored 刷新过期副本时客户端发的是 HEAD、Range 或条件请求：canonical GET 的
+// 正文读完（读到 EOF 即意味着对象已经落库），再用刚落盘的那份按本地表示求值，
+// 与一次命中同形，只是标 MISS——这是一次整份回源（spec「On an origin 200…」）。
+// 读不完或盘上找不到那份时，退回把客户端的原请求透传给上游。
+func (c *cacheSvc) serveStored(ctx context.Context, target *proxy_svc.Target,
+	upstream *upstream_entity.Upstream, key string, body io.ReadCloser,
+) (io.ReadCloser, *proxy_svc.Meta, error) {
+	_, readErr := io.Copy(io.Discard, body)
+	closeErr := body.Close()
+	if readErr == nil && closeErr == nil {
+		object, err := cache_repo.CacheObject().FindByKey(ctx, upstream.ID, key)
+		if err == nil && object != nil {
+			if out, meta, m := c.serveObject(ctx, target, upstream, key, object, false, cacheStatusMiss); m == nil {
+				return out, meta, nil
+			}
+		}
+	}
+	return fetchOriginMiss(ctx, target)
+}
+
+// uncachedForClient 一次不能入缓存的 canonical 回源怎么交给客户端。
+//
+// 客户端本来就是普通 GET 时原样交出。HEAD、Range 或条件请求没法在一份不落盘的流上
+// 本地求值：出错与重定向的状态照样交出（HEAD 不带正文），成功的那份则丢掉，把客户端
+// 的原请求透传给上游，与冷请求一样。
+func uncachedForClient(ctx context.Context, target *proxy_svc.Target,
+	body io.ReadCloser, meta *proxy_svc.Meta,
+) (io.ReadCloser, *proxy_svc.Meta, error) {
+	if writableRequest(target) {
+		return body, meta, nil
+	}
+	if meta.StatusCode >= http.StatusMultipleChoices {
+		if target.Method == http.MethodHead {
+			_ = body.Close()
+			return http.NoBody, meta, nil
+		}
+		return body, meta, nil
+	}
+	_ = body.Close()
+	return fetchOriginMiss(ctx, target)
 }
 
 // withOriginValidators 给一次 canonical 回源带上 held 保存的上游 validator。
