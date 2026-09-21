@@ -96,7 +96,6 @@ verify_capture() {
               pid = trace_pid(line)
               if (pid != "" && !(pid in pending_dns_probe)) {
                 pending_dns_probe[pid] = line
-                pending_dns_probe_count++
                 return
               }
             }
@@ -139,10 +138,10 @@ verify_capture() {
           reject(line)
         }
         delete pending_dns_probe[pid]
-        pending_dns_probe_count--
-      } else if (pending_dns_probe_count > 0) {
-        reject(line)
       }
+      # A resumed line of another PID carries only a result; its destination was
+      # audited on its own unfinished half. Rejecting it here only hits ordinary
+      # connects interleaved with a probe. An unpaired probe is rejected in END.
       next
     }
     /sa_family=AF_INET,/ {

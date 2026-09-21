@@ -1633,8 +1633,26 @@ if KATCH_ALLOW_BLOCKED_DNS_PROBE=1 KATCH_PORT=$capture_katch_port \
   "$ENTRYPOINT" --verify-capture "$workdir/wrong-pid-split-blocked-dns-probe.log" "$capture_katch_ip" >"$workdir/out" 2>&1; then
   fail "explicit blocked DNS probe allowance paired a resumed connect from the wrong PID"
 fi
-grep -F '152 <... connect resumed>) = 0' "$workdir/out" >/dev/null ||
-  fail "wrong-PID blocked DNS completion was not reported"
+# 151's probe never pairs with its own half and is reported as unpaired at the end; 152's
+# resumed line carries only a result and cannot complete another PID's probe.
+grep -F '151 connect(3,' "$workdir/out" >/dev/null ||
+  fail "wrong-PID blocked DNS probe was not reported as unpaired"
+
+# The interleaving from the real Docker warm phase (2026-09-21, 9969a1c): strace split a
+# Katch connect, and its resumed half arrived while another PID's blocked DNS probe was still
+# unpaired. The resumed line has no destination; its unfinished half was already audited
+# (the Katch port here), so a pending probe elsewhere must not reject it.
+cat > "$workdir/interleaved-katch-connect-during-blocked-dns-probe.log" <<EOF
+98 connect(27, {sa_family=AF_INET, sin_port=htons($capture_katch_port), sin_addr=inet_addr("$capture_katch_ip")}, 16 <unfinished ...>
+60 connect(31, {sa_family=AF_INET, sin_port=htons($capture_katch_port), sin_addr=inet_addr("$capture_katch_ip")}, 16 <unfinished ...>
+80 connect(30, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("$capture_katch_ip")}, 16 <unfinished ...>
+98 <... connect resumed>) = -1 EINPROGRESS (Operation in progress)
+80 <... connect resumed>) = 0
+60 <... connect resumed>) = -1 EINPROGRESS (Operation in progress)
+EOF
+KATCH_ALLOW_BLOCKED_DNS_PROBE=1 KATCH_PORT=$capture_katch_port \
+  "$ENTRYPOINT" --verify-capture "$workdir/interleaved-katch-connect-during-blocked-dns-probe.log" "$capture_katch_ip" >"$workdir/out" 2>&1 ||
+  fail "a split Katch connect resumed while another PID's blocked DNS probe was pending was rejected: $(cat "$workdir/out")"
 
 cat > "$workdir/failed-split-blocked-dns-probe.log" <<EOF
 153 connect(3, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("$capture_katch_ip")}, 16 <unfinished ...>
