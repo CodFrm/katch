@@ -73,9 +73,10 @@ type CacheObject struct {
 // Expired 判断这条记录在 now（秒）是否已经过期。
 //
 // 不可变对象永不过期（决策 7）：它的内容按摘要寻址，改不了，也就没有「过期」
-// 这回事；可变对象到点即失效，宁可多回一次源，也不能发出过期的 tag 或 InRelease。
+// 这回事——包括历史行里 ExpiresAt 还带着非零值的那些，读取时一律当不过期；
+// 可变对象到点即失效，宁可多回一次源，也不能发出过期的 tag 或 InRelease。
 func (c *CacheObject) Expired(now int64) bool {
-	if c.ExpiresAt == 0 || (c.Immutable && c.StoredAt == 0) {
+	if c.Immutable || c.ExpiresAt == 0 {
 		return false
 	}
 	return now >= c.ExpiresAt

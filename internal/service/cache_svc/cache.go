@@ -49,14 +49,13 @@ var ErrCacheUnavailable = errors.New("缓存不可用")
 // ErrPutIncomplete 写入缓存至少要有上游、键和内容。
 var ErrPutIncomplete = errors.New("缓存写入缺少上游、键或内容")
 
+// 缓存状态标记的值是对外契约，与读它的 metrics 中间件共用一份常量：两边各写
+// 一遍字符串，改一处就会让指标悄悄把命中记成回源（同 GitSourceHeader 的先例）。
 const (
-	// cacheStatusHeader 让调用方（以及运维）看得见这次响应是不是缓存命中。
-	cacheStatusHeader = "X-Katch-Cache"
-	cacheStatusHit    = "HIT"
-	cacheStatusMiss   = "MISS"
-	// cacheStatusRevalidated 过期副本带着上游 validator 回源、上游答 304：联系过上游，
-	// 所以不是 HIT；正文出自盘上那份，所以也不是一次整份 MISS（决策 10）。
-	cacheStatusRevalidated = "REVALIDATED"
+	cacheStatusHeader      = metrics.CacheStatusHeader
+	cacheStatusHit         = metrics.CacheStatusHit
+	cacheStatusMiss        = metrics.CacheStatusMiss
+	cacheStatusRevalidated = metrics.CacheStatusRevalidated
 )
 
 const (
@@ -316,7 +315,11 @@ func (c *cacheSvc) Get(ctx context.Context, target *proxy_svc.Target) (io.ReadCl
 		if err != nil {
 			return nil, nil, err
 		}
-		return drainPromotedHead(body, stampPassthroughMiss(meta, m))
+		// 与下面 GET 分支同一套收口：fetchAndCache 的结果要么是 fetchOriginMiss
+		// 盖过 MISS 的回源应答（伪造的归因头已在那一层被压掉），要么是航班/盘上
+		// 给出的权威 HIT——再无条件盖一次 MISS 会把后者改标，与指标、与同一航班
+		// GET 的标法分叉。
+		return drainPromotedHead(body, m.stamp(meta))
 	}
 	if !writableRequest(target) && !stale {
 		body, meta, err = fetchOriginMiss(ctx, target)
@@ -720,10 +723,7 @@ func (c *cacheSvc) getTransformed(ctx context.Context, target *proxy_svc.Target,
 			logger.Ctx(ctx).Warn("写转换后缓存失败", zap.String("key", key), zap.Error(err))
 		}
 	}
-	body, responseMeta, err := transformedResponse(target, result.Body, outMeta, cacheStatusMiss)
-	if err != nil {
-		return nil, nil, err
-	}
+	body, responseMeta := transformedResponse(target, result.Body, outMeta, cacheStatusMiss)
 	return body, attribution.stamp(responseMeta), nil
 }
 
@@ -760,7 +760,7 @@ func acceptedMediaType(got string, accepted []string) bool {
 
 func transformedResponse(target *proxy_svc.Target, payload []byte, meta *proxy_svc.Meta,
 	cacheStatus string,
-) (io.ReadCloser, *proxy_svc.Meta, error) {
+) (io.ReadCloser, *proxy_svc.Meta) {
 	header := meta.Header.Clone()
 	header.Set(cacheStatusHeader, cacheStatus)
 	conditions := target.Header.Clone()
@@ -769,7 +769,7 @@ func transformedResponse(target *proxy_svc.Target, payload []byte, meta *proxy_s
 	outcome := evaluateConditional(conditions, header.Get("Etag"), "")
 	reader := bytes.NewReader(payload)
 	body, out := representationResponse(target, io.NopCloser(reader), reader, header, int64(len(payload)), outcome)
-	return body, out, nil
+	return body, out
 }
 
 func (c *cacheSvc) urlRewriter(snapshot *proxy_svc.RewriteSnapshot) packageprofile.RewriteURL {
@@ -1531,6 +1531,14 @@ func durationSeconds(duration time.Duration) int64 {
 func effectiveExpiration(now time.Time, ttl int64, immutable bool,
 	object *cache_entity.CacheObject,
 ) int64 {
+	// 不可变对象不因时间过期（spec 决策 7）：内容按摘要或树位置寻址，淘汰只走
+	// 配额 LRU。源站的 max-age/Expires 说的是「CDN 上那份副本还新鲜多久」，把它
+	// 当成本地到期时刻，一个 Age 已被 CDN 消耗殆尽的不可变对象（sum.golang.org 的
+	// 满 tile 就是 max-age=10800、Age 上万秒的形状）存进来几秒后就过期，又没有
+	// validator 可条件回源，只能整份重取。
+	if immutable {
+		return 0
+	}
 	lifetime := int64(math.MaxInt64)
 	directives := parseCacheControl(object.CacheControl)
 	for _, name := range []string{"s-maxage", "max-age"} {
@@ -1798,7 +1806,7 @@ func (c *cacheSvc) Sweep(ctx context.Context) (int64, error) {
 		return 0, nil
 	}
 	repo := cache_repo.CacheObject()
-	now := time.Now().Unix()
+	now := c.now().Unix()
 	var removed int64
 	for {
 		expired, err := repo.ExpiredBefore(ctx, now, sweepBatch)

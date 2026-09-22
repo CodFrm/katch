@@ -38,6 +38,12 @@ func evaluateConditional(header http.Header, etag, lastModified string) conditio
 			matched, ok := evaluateIfMatch(value, etag)
 			if ok {
 				if !matched {
+					if strings.TrimSpace(etag) == "" {
+						// 条件有效，但这份副本没有任何可参与强比较的 ETag：判不了
+						// 成败，交回源去问——与下面 If-None-Match 的同名分支同一
+						// 策略。副本上有 ETag（哪怕只是弱的）时照常按强比较判 412。
+						return conditionUnresolved
+					}
 					return conditionPreconditionFailed
 				}
 				ifMatchPresent = true
@@ -102,43 +108,25 @@ func evaluateConditional(header http.Header, etag, lastModified string) conditio
 	return conditionNone
 }
 
-// evaluateIfMatch parses the list and applies the strong comparison function.
+// evaluateIfMatch applies the strong comparison function to the list.
 // A wildcard succeeds because this function is only called for a selected local representation.
 func evaluateIfMatch(value, storedValue string) (matched, valid bool) {
 	if strings.TrimSpace(value) == "*" {
 		return true, true
 	}
 	stored, storedStrong := parseStrongETag(storedValue)
-	s := strings.TrimSpace(value)
-	seen := false
-	for {
-		s = strings.TrimLeft(s, " \t")
-		if s == "" {
-			break
-		}
-		if s[0] == ',' {
-			s = s[1:]
-			continue
-		}
-		weak := strings.HasPrefix(s, "W/")
-		tag, rest, ok := scanETag(s)
-		if !ok {
-			return false, false
-		}
-		seen = true
-		if !weak && storedStrong && tag == stored {
+	tags, weaks, ok := parseETagList(value)
+	if !ok {
+		return false, false
+	}
+	// 整张表都读完才给结论：`"a", 碎片` 这样的后半段坏列表按 RFC 得整条忽略，
+	// 不能因为前一项已经比中就提前放行。
+	for index, tag := range tags {
+		if !weaks[index] && storedStrong && tag == stored {
 			matched = true
 		}
-		s = strings.TrimLeft(rest, " \t")
-		if s == "" {
-			break
-		}
-		if s[0] != ',' {
-			return false, false
-		}
-		s = s[1:]
 	}
-	return matched, seen
+	return matched, true
 }
 
 func parseStrongETag(value string) (string, bool) {
@@ -151,15 +139,24 @@ func parseStrongETag(value string) (string, bool) {
 
 // parseIfNoneMatch 解析 If-None-Match 的取值，返回表里的 opaque tag、是否星号、
 // 以及语法是否有效。
+func parseIfNoneMatch(value string) (tags []string, wildcard bool, ok bool) {
+	if strings.TrimSpace(value) == "*" {
+		return nil, true, true
+	}
+	tags, _, ok = parseETagList(value)
+	return tags, false, ok
+}
+
+// parseETagList 解析一个 entity-tag 列表（RFC 9110 §5.6.1.2 的 #entity-tag），
+// 返回逐项的 opaque tag 与弱标识。If-Match 的强比较要知道每一项带不带 W/，
+// If-None-Match 的弱比较不用，共用这一个扫描器。
 //
 // 逗号只在引号之外才分隔两个 tag：opaque tag 自己可以含逗号（RFC 9110 §8.8.1 的
 // etagc 包含 `,`），按逗号直接切会把一个合法的校验符切成两个读不懂的碎片。空元素
-// 按 §5.6.1.2 容忍并忽略；但整张表一个 tag 都没有就是无效，得回源。
-func parseIfNoneMatch(value string) (tags []string, wildcard bool, ok bool) {
-	s := strings.TrimSpace(value)
-	if s == "*" {
-		return nil, true, true
-	}
+// 按 §5.6.1.2 容忍并忽略；但整张表一个 tag 都没有就是无效，得回源。星号是整条
+// 头的语义而不是列表元素，由两个调用方各自先行处理。
+func parseETagList(value string) (tags []string, weaks []bool, ok bool) {
+	s := value
 	for {
 		s = strings.TrimLeft(s, " \t")
 		if s == "" {
@@ -169,24 +166,26 @@ func parseIfNoneMatch(value string) (tags []string, wildcard bool, ok bool) {
 			s = s[1:]
 			continue
 		}
+		weak := strings.HasPrefix(s, "W/")
 		tag, rest, valid := scanETag(s)
 		if !valid {
-			return nil, false, false
+			return nil, nil, false
 		}
 		tags = append(tags, tag)
+		weaks = append(weaks, weak)
 		s = strings.TrimLeft(rest, " \t")
 		if s == "" {
 			break
 		}
 		if s[0] != ',' {
-			return nil, false, false
+			return nil, nil, false
 		}
 		s = s[1:]
 	}
 	if len(tags) == 0 {
-		return nil, false, false
+		return nil, nil, false
 	}
-	return tags, false, true
+	return tags, weaks, true
 }
 
 // parseETag 解析单个 entity-tag，返回去掉引号与弱标识的 opaque tag。

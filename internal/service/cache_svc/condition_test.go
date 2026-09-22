@@ -136,6 +136,23 @@ func TestEvaluateConditional(t *testing.T) {
 			{"请求日期无效按未提供处理", header("If-Modified-Since", "not a date"), "", "", conditionNone},
 			{"If-Modified-Since 但副本没有 Last-Modified", header("If-Modified-Since", lastModified), "", "", conditionUnresolved},
 			{"If-Modified-Since 但副本日期读不懂", header("If-Modified-Since", lastModified), "", "not a date", conditionUnresolved},
+			// If-Match 一组：副本上没有可强比较的 ETag 时判不了成败，交回源——
+			// 与 If-None-Match 的同名分支同一策略，不能替上游回一个本地 412。
+			{"If-Match 匹配", header("If-Match", `"v1", "other"`), `"v1"`, "", conditionNone},
+			{"If-Match 不匹配", header("If-Match", `"other"`), `"v1"`, "", conditionPreconditionFailed},
+			{"If-Match 星号对现有表示成立", header("If-Match", "*"), "", "", conditionNone},
+			{"If-Match 但副本没有 ETag", header("If-Match", `"v1"`), "", "", conditionUnresolved},
+			{"If-Match 弱 tag 不能强比较", header("If-Match", `W/"v1"`), `"v1"`, "", conditionPreconditionFailed},
+			{"If-Match 副本是弱 ETag 时不能强比较", header("If-Match", `"v1"`), `W/"v1"`, "", conditionPreconditionFailed},
+			{"If-Match 后半段语法坏整条忽略", header("If-Match", `"v1", junk`), `"v1"`, "", conditionNone},
+			{"If-Match 匹配压过 If-Unmodified-Since", header(
+				"If-Match", `"v1"`, "If-Unmodified-Since", "Tue, 20 Oct 2015 07:28:00 GMT"), `"v1"`, lastModified, conditionNone},
+			{"If-Unmodified-Since 资源较新", header(
+				"If-Unmodified-Since", "Tue, 20 Oct 2015 07:28:00 GMT"), `"v1"`, lastModified, conditionPreconditionFailed},
+			{"If-Unmodified-Since 资源未变", header(
+				"If-Unmodified-Since", lastModified), `"v1"`, lastModified, conditionNone},
+			{"If-Unmodified-Since 但副本没有 Last-Modified", header(
+				"If-Unmodified-Since", lastModified), `"v1"`, "", conditionUnresolved},
 		}
 		for _, c := range cases {
 			convey.Convey(c.name, func() {
