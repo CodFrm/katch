@@ -90,3 +90,88 @@ type SearchOption struct {
 	Offset     int
 	Limit      int
 }
+
+// 缓存键的变体段：路径（含查询串）之后是 0x1F，再接 VariantTag 与 VariantDigestLen 位
+// 十六进制摘要。写键的一侧（cache_svc）与按键搜索的一侧（cache_repo）共用这一份形状。
+const (
+	// VariantTag 变体段在分隔符之后的固定开头。
+	VariantTag = "accept="
+	// VariantDigestLen 变体段里摘要的十六进制位数。
+	VariantDigestLen = 16
+)
+
+// UpstreamTreeStat 目录树根上一个上游的合计。
+type UpstreamTreeStat struct {
+	UpstreamID   int64 `gorm:"column:upstream_id"`
+	Count        int64 `gorm:"column:count"`
+	Pinned       int64 `gorm:"column:pinned"`
+	Size         int64 `gorm:"column:size"`
+	LastAccessAt int64 `gorm:"column:last_access_at"`
+}
+
+// PrefixTreeStat 一个目录（键前缀）下的合计。
+//
+// Objects 与 Dirs 只数直接的一层，供分页算「目录在前、对象在后」的偏移；
+// 其余几项是递归到底的合计。
+type PrefixTreeStat struct {
+	Count        int64 `gorm:"column:count"`
+	Pinned       int64 `gorm:"column:pinned"`
+	Size         int64 `gorm:"column:size"`
+	LastAccessAt int64 `gorm:"column:last_access_at"`
+	Objects      int64 `gorm:"column:objects"`
+	Dirs         int64 `gorm:"column:dirs"`
+}
+
+// TreeDir 一层里的一个子目录与它之下（递归）的合计。
+type TreeDir struct {
+	Name         string `gorm:"column:name"`
+	Count        int64  `gorm:"column:count"`
+	Pinned       int64  `gorm:"column:pinned"`
+	Size         int64  `gorm:"column:size"`
+	LastAccessAt int64  `gorm:"column:last_access_at"`
+}
+
+// TreeOption 列目录树的一层。
+//
+// Prefix 是键的前缀，以 / 开头也以 / 结尾（上游根就是 "/"）。
+type TreeOption struct {
+	UpstreamID int64
+	Prefix     string
+	Offset     int
+	Limit      int
+}
+
+// TreeSearchOption 在一个目录下搜索对象。
+//
+// UpstreamID 大于 0 时限定在该上游的 Prefix 之下；为 0 表示在根上搜索，
+// 范围是 UpstreamIDs 列出的上游，HostMatched 里的上游（主机名命中关键字）整体算命中。
+type TreeSearchOption struct {
+	UpstreamID  int64
+	Prefix      string
+	UpstreamIDs []int64
+	HostMatched []int64
+	Keyword     string
+	Limit       int
+}
+
+// TreeMatchOption 搜索结果里一个目录的合计。
+//
+// Prefix 是这个目录的键前缀；SearchPrefix 是发起搜索的那个目录的键前缀
+// （根上搜索时为空），关键字只和它之下的部分比。AllMatched 表示这个上游的
+// 主机名已经命中，目录下的对象全部算命中。
+type TreeMatchOption struct {
+	UpstreamID   int64
+	Prefix       string
+	SearchPrefix string
+	Keyword      string
+	AllMatched   bool
+}
+
+// TreeMatchStat 搜索结果里一个目录的合计，以及其中命中的部分。
+type TreeMatchStat struct {
+	Count        int64 `gorm:"column:count"`
+	Size         int64 `gorm:"column:size"`
+	LastAccessAt int64 `gorm:"column:last_access_at"`
+	MatchedCount int64 `gorm:"column:matched_count"`
+	MatchedSize  int64 `gorm:"column:matched_size"`
+}

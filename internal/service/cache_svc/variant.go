@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/CodFrm/katch/internal/model/entity/cache_entity"
 	"github.com/CodFrm/katch/internal/proxy/dispatch"
 	"github.com/CodFrm/katch/internal/proxy/packageprofile"
 	"github.com/CodFrm/katch/internal/service/proxy_svc"
@@ -45,7 +46,7 @@ func cacheVariant(target *proxy_svc.Target) string {
 		return ""
 	}
 	sum := sha256.Sum256([]byte(accept))
-	return "accept=" + hex.EncodeToString(sum[:8])
+	return cache_entity.VariantTag + hex.EncodeToString(sum[:cache_entity.VariantDigestLen/2])
 }
 
 // cacheKeyForRepresentation extends the legacy key only where a package profile owns identity.

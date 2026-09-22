@@ -4,6 +4,8 @@ import {
   fetchAdminEvents,
   fetchAdminOverview,
   fetchAdminUpstreams,
+  fetchCacheImages,
+  fetchCacheTree,
   fetchGitMirrors,
   fetchRecentRequests,
   fetchRules,
@@ -11,11 +13,13 @@ import {
   fetchUpstreamCacheSizes,
   fetchUpstreamSeries,
   fetchUpstreamStats,
-  searchCacheObjects,
+  searchCacheTree,
   type AdminResult,
   type AdminRuleItem,
   type AdminUpstreamItem,
-  type CacheSearchResult,
+  type CacheImageItem,
+  type CacheTreeNode,
+  type CacheTreeSearchResult,
   type EventItem,
   type GitMirrorItem,
   type RecentRequestItem,
@@ -47,7 +51,7 @@ function useRejectOnUnauthorized(onUnauthorized: () => void) {
   return ref
 }
 
-function unwrap<T>(result: AdminResult<T>, reject: () => void): T | null {
+export function unwrap<T>(result: AdminResult<T>, reject: () => void): T | null {
   if (result.ok) {
     return result.data
   }
@@ -304,42 +308,235 @@ export function useAdminRules(
   return { data: rules, reload }
 }
 
+/** 目录树里已经取到的一层：到目前为止接起来的子项与下一批从哪儿接。 */
+export interface CacheTreeLayer {
+  totalCount: number
+  totalPinned: number
+  totalSize: number
+  children: CacheTreeNode[]
+  hasMore: boolean
+  nextOffset: number
+}
+
+export interface CacheTreeView {
+  /** 当前目录那一层，还没问到或者第一次就没读出来时是 null。 */
+  current: CacheTreeLayer | null
+  /** 就地展开的目录各自的那一层，按目录路径取；还在取的不在表里。 */
+  layers: Record<string, CacheTreeLayer>
+  /** 就地展开着的目录路径。 */
+  expanded: string[]
+  /**
+   * 当前目录或展开着的某一层最近一次没读出来（目录不合法、够不到后端、后端出错）。
+   * 读不出来不等于空目录：当成空层给，界面就会说「这个目录下没有缓存对象」，把一次
+   * 故障说成了事实。
+   */
+  failed: boolean
+  /** 展开或收起一个目录。 */
+  toggle: (path: string) => void
+  /** 把某一层的下一批接在后面。 */
+  loadMore: (path: string) => void
+  /** 写操作之后重取当前目录与展开着的各层（各自从第一批取起）。 */
+  reload: () => void
+}
+
+interface TreeState {
+  /** 这份状态属于哪个当前目录：换了目录，手里展开的那些就属于别人了。 */
+  root: string
+  layers: Record<string, CacheTreeLayer>
+  expanded: string[]
+  /** 最近一次没读出来的那些层，按目录路径记；重新读出来或收起时划掉。 */
+  failed: string[]
+}
+
 /**
- * 缓存对象的一页。还没问到时是 null——「一个对象都没有」和「还没问到」在界面上
- * 是两句不同的话，前者该说「没有匹配的对象」，后者什么都不该说。
+ * 缓存对象目录树：当前目录一层，加上就地展开的那些目录各自的一层。
+ *
+ * 一次只问一层、一层一批，由服务端聚合：APT 的 pool/main/ 这种目录可以有上万个子项，
+ * 前端拿平铺结果自己拼树的话，每层的对象数和体积在只拿到一页时都是错的。
  */
-export function useCacheObjects(
-  key: string,
-  query: { keyword: string; upstreamID: number; page: number },
-  onUnauthorized: () => void
-): Reloadable<CacheSearchResult | null> {
+export function useCacheTree(key: string, path: string, onUnauthorized: () => void): CacheTreeView {
   const reject = useRejectOnUnauthorized(onUnauthorized)
-  const [result, setResult] = useState<CacheSearchResult | null>(null)
+  const [state, setState] = useState<TreeState>({
+    root: path,
+    layers: {},
+    expanded: [],
+    failed: [],
+  })
   const [token, reload] = useReloadToken()
-  const { keyword, upstreamID, page } = query
+  const latest = useRef(state)
+  useEffect(() => {
+    latest.current = state
+  }, [state])
+  // 眼下的当前目录。展开与加载更多的请求不跟着换目录取消，回来时要是已经换了目录，
+  // 它们不许把状态拨回旧目录——那会把新目录已经取到的那一层扔掉，页面停在一片空白上。
+  const activePath = useRef(path)
+  useEffect(() => {
+    activePath.current = path
+  }, [path])
+  // 每一层的「代」：从第一批问起（展开、重取）或收起都换一代，接下一批沿用当代。
+  // 展开与加载更多发出的请求没有跟着谁一起取消，回来得晚的那些靠代号认出来扔掉——
+  // 否则先发后到的旧一批会盖掉清除之后重取的新一批。
+  const generations = useRef(new Map<string, number>())
+  const nextGeneration = useCallback((dir: string) => {
+    const generation = (generations.current.get(dir) ?? 0) + 1
+    generations.current.set(dir, generation)
+    return generation
+  }, [])
+
+  const load = useCallback(
+    (root: string, dir: string, offset: number, signal?: AbortSignal) => {
+      const generation = offset > 0 ? (generations.current.get(dir) ?? 0) : nextGeneration(dir)
+      return fetchCacheTree(key, dir, offset, signal).then((result) => {
+        if (signal?.aborted || generations.current.get(dir) !== generation) {
+          return
+        }
+        const data = unwrap(result, () => reject.current())
+        setState((current) => {
+          if (root !== activePath.current) {
+            return current
+          }
+          const base: TreeState =
+            current.root === root ? current : { root, layers: {}, expanded: [], failed: [] }
+          const previous = base.layers[dir]
+          if (offset > 0 && previous?.nextOffset !== offset) {
+            // 同一批被连点了两次，或者这一层在此期间从头重取过：这一批已经不接在末尾了。
+            return current
+          }
+          const failed = base.failed.filter((item) => item !== dir)
+          if (!data) {
+            // 记下这一层没读出来，已经接上的那些（翻下一批、写操作之后重取）留着。
+            return { ...base, failed: [...failed, dir] }
+          }
+          const children = data.children ?? []
+          const layer: CacheTreeLayer = {
+            totalCount: data.total_count,
+            totalPinned: data.total_pinned,
+            totalSize: data.total_size,
+            children: offset > 0 && previous ? [...previous.children, ...children] : children,
+            hasMore: data.has_more,
+            nextOffset: data.next_offset,
+          }
+          return { ...base, failed, layers: { ...base.layers, [dir]: layer } }
+        })
+      })
+    },
+    [key, reject, nextGeneration]
+  )
 
   useEffect(() => {
     const controller = new AbortController()
-    void searchCacheObjects(key, { keyword, upstreamID, page }, controller.signal).then(
-      (response) => {
-        if (!controller.signal.aborted) {
-          setResult(unwrap(response, () => reject.current()))
-        }
-      }
-    )
+    const snapshot = latest.current
+    const expanded = snapshot.root === path ? snapshot.expanded : []
+    for (const dir of [path, ...expanded]) {
+      void load(path, dir, 0, controller.signal)
+    }
     return () => controller.abort()
-  }, [key, keyword, upstreamID, page, token, reject])
+  }, [path, token, load])
 
-  return { data: result, reload }
+  const toggle = useCallback(
+    (dir: string) => {
+      const snapshot = latest.current
+      const open = snapshot.root === path && snapshot.expanded.includes(dir)
+      setState((current) => {
+        const base: TreeState =
+          current.root === path ? current : { root: path, layers: {}, expanded: [], failed: [] }
+        if (open) {
+          // 收起时把这一层扔掉：再展开时重新问一遍，不拿一份可能已经过时的给人看。
+          const layers = { ...base.layers }
+          delete layers[dir]
+          return {
+            ...base,
+            layers,
+            expanded: base.expanded.filter((item) => item !== dir),
+            failed: base.failed.filter((item) => item !== dir),
+          }
+        }
+        return { ...base, expanded: [...base.expanded, dir] }
+      })
+      if (open) {
+        // 还在路上的那些属于收起之前，回来了也不再接。
+        nextGeneration(dir)
+      } else {
+        void load(path, dir, 0)
+      }
+    },
+    [path, load, nextGeneration]
+  )
+
+  const loadMore = useCallback(
+    (dir: string) => {
+      const layer = latest.current.root === path ? latest.current.layers[dir] : undefined
+      if (layer?.hasMore) {
+        void load(path, dir, layer.nextOffset)
+      }
+    },
+    [path, load]
+  )
+
+  const own = state.root === path
+  return {
+    current: own ? (state.layers[path] ?? null) : null,
+    layers: own ? state.layers : {},
+    expanded: own ? state.expanded : [],
+    failed: own && state.failed.length > 0,
+    toggle,
+    loadMore,
+    reload,
+  }
 }
 
-/** 按上游分的缓存占用（主机名 → 字节数），容量条按它分段。 */
+/**
+ * 在一个目录下搜索，没有搜索词时是 null，还没问到时也是 null。
+ *
+ * 结果带着它是哪个目录、哪个词问出来的：换了词或目录之后，上一次的结果不许挂在
+ * 这一次的输入下面。
+ */
+export function useCacheTreeSearch(
+  key: string,
+  path: string,
+  keyword: string,
+  onUnauthorized: () => void
+): Reloadable<CacheTreeSearchResult | null> & { failed: boolean } {
+  const reject = useRejectOnUnauthorized(onUnauthorized)
+  const [loaded, setLoaded] = useState<{
+    path: string
+    keyword: string
+    /** 没读出来时是 null。 */
+    result: CacheTreeSearchResult | null
+  } | null>(null)
+  const [token, reload] = useReloadToken()
+
+  useEffect(() => {
+    if (keyword === '') {
+      return
+    }
+    const controller = new AbortController()
+    void searchCacheTree(key, path, keyword, controller.signal).then((response) => {
+      if (controller.signal.aborted) {
+        return
+      }
+      // 读不出来单独记着，而不是按没有匹配给：那会把一次故障说成「没有匹配的对象」。
+      setLoaded({ path, keyword, result: unwrap(response, () => reject.current()) })
+    })
+    return () => controller.abort()
+  }, [key, path, keyword, token, reject])
+
+  const own = keyword !== '' && loaded?.path === path && loaded.keyword === keyword
+  return {
+    data: own ? loaded.result : null,
+    failed: own && loaded.result === null,
+    reload,
+  }
+}
+
+/** 按上游分的缓存占用（主机名 → 字节数），容量条按它分段。清缓存之后要跟着刷新。 */
 export function useUpstreamCacheSizes(
   key: string,
   onUnauthorized: () => void
-): { host: string; cacheBytes: number }[] {
+): Reloadable<{ host: string; cacheBytes: number }[]> {
   const reject = useRejectOnUnauthorized(onUnauthorized)
   const [sizes, setSizes] = useState<{ host: string; cacheBytes: number }[]>([])
+  const [token, reload] = useReloadToken()
 
   useEffect(() => {
     const controller = new AbortController()
@@ -351,9 +548,9 @@ export function useUpstreamCacheSizes(
       setSizes(list.map((item) => ({ host: item.host, cacheBytes: item.cache_bytes })))
     })
     return () => controller.abort()
-  }, [key, reject])
+  }, [key, token, reject])
 
-  return sizes
+  return { data: sizes, reload }
 }
 
 /** 全部运行时设置，还没读到时是 null。 */
@@ -376,6 +573,133 @@ export function useAdminSettings(
   }, [key, token, reject])
 
   return { data: settings, reload }
+}
+
+export interface CacheImagesView {
+  data: CacheImageItem[]
+  total: number
+  hasMore: boolean
+  /**
+   * 最近一次没读出来。读不出来不等于没有镜像：当成空列表给，界面就会说「没有镜像缓存」，
+   * 把一次故障说成了事实（同 CacheTreeView.failed）。
+   */
+  failed: boolean
+  /** 把下一批接在后面。 */
+  loadMore: () => void
+  /** 写操作之后重取（从第一批取起）。 */
+  reload: () => void
+}
+
+interface ImagesState {
+  upstreamID: number
+  keyword: string
+  list: CacheImageItem[]
+  total: number
+  hasMore: boolean
+  nextOffset: number
+  failed: boolean
+}
+
+const EMPTY_IMAGES: ImagesState = {
+  upstreamID: 0,
+  keyword: '',
+  list: [],
+  total: 0,
+  hasMore: false,
+  nextOffset: 0,
+  failed: false,
+}
+
+/**
+ * 按仓库列出镜像，一页一批、由服务端聚合（同 useCacheTree 的理由）。
+ *
+ * 换了上游筛选或搜索词就是另外一次查询：旧一批已经接起来的列表属于上一次的
+ * 参数组合，不能借着「加载更多」接在新参数的结果后面。
+ */
+export function useCacheImages(
+  key: string,
+  upstreamID: number,
+  keyword: string,
+  onUnauthorized: () => void
+): CacheImagesView {
+  const reject = useRejectOnUnauthorized(onUnauthorized)
+  const [state, setState] = useState<ImagesState>({ ...EMPTY_IMAGES, upstreamID, keyword })
+  const [token, reload] = useReloadToken()
+  const latest = useRef(state)
+  useEffect(() => {
+    latest.current = state
+  }, [state])
+
+  // 从第一批问起就换一代，接下一批沿用当代：理由同 useCacheTree。
+  const generation = useRef(0)
+
+  const load = useCallback(
+    (targetUpstreamID: number, targetKeyword: string, offset: number, signal?: AbortSignal) => {
+      const current = offset > 0 ? generation.current : ++generation.current
+      return fetchCacheImages(
+        key,
+        { upstreamID: targetUpstreamID, keyword: targetKeyword, offset },
+        signal
+      ).then((result) => {
+        if (signal?.aborted || generation.current !== current) {
+          return
+        }
+        const data = unwrap(result, () => reject.current())
+        setState((state) => {
+          const own = state.upstreamID === targetUpstreamID && state.keyword === targetKeyword
+          if (offset > 0 && !(own && state.nextOffset === offset)) {
+            // 同一批被连点了两次，或者参数在此期间换过：这一批已经不接在末尾了。
+            return state
+          }
+          if (!data) {
+            // 已经接上的那些（翻下一批、写操作之后重取）留着，只记下这次没读出来。
+            return own
+              ? { ...state, failed: true }
+              : {
+                  ...EMPTY_IMAGES,
+                  upstreamID: targetUpstreamID,
+                  keyword: targetKeyword,
+                  failed: true,
+                }
+          }
+          const list = data.list ?? []
+          return {
+            upstreamID: targetUpstreamID,
+            keyword: targetKeyword,
+            list: offset > 0 ? [...state.list, ...list] : list,
+            total: data.total,
+            hasMore: data.has_more,
+            nextOffset: data.next_offset,
+            failed: false,
+          }
+        })
+      })
+    },
+    [key, reject]
+  )
+
+  useEffect(() => {
+    const controller = new AbortController()
+    void load(upstreamID, keyword, 0, controller.signal)
+    return () => controller.abort()
+  }, [upstreamID, keyword, token, load])
+
+  const loadMore = useCallback(() => {
+    const snapshot = latest.current
+    if (snapshot.upstreamID === upstreamID && snapshot.keyword === keyword && snapshot.hasMore) {
+      void load(upstreamID, keyword, snapshot.nextOffset)
+    }
+  }, [upstreamID, keyword, load])
+
+  const own = state.upstreamID === upstreamID && state.keyword === keyword
+  return {
+    data: own ? state.list : [],
+    total: own ? state.total : 0,
+    hasMore: own ? state.hasMore : false,
+    failed: own && state.failed,
+    loadMore,
+    reload,
+  }
 }
 
 /** 全部 git 本地镜像。规模有配额顶着，后端不分页（同 useAdminRules）。 */

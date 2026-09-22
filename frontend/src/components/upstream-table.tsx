@@ -38,8 +38,8 @@ function formatSize(bytes: number): string {
 export function UpstreamTable({ upstreams }: { upstreams: UpstreamItem[] }) {
   const { t } = useTranslation()
   const columns = [
-    { key: 'host', width: 'w-[220px]' },
-    { key: 'protocols', width: 'w-[120px]' },
+    { key: 'host', width: 'w-[240px]' },
+    { key: 'protocols', width: 'w-[140px]' },
     { key: 'profile', width: 'w-[110px]' },
     { key: 'readiness', width: 'w-[200px]' },
     { key: 'hitRate', width: 'w-[90px]' },

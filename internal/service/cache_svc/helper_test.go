@@ -188,6 +188,18 @@ func newFakeRepo(t *testing.T, stampAccess bool) *fakeRepo {
 			delete(f.rows, id)
 			return nil
 		})
+	m.EXPECT().DeleteUnchanged(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().
+		DoAndReturn(func(_ any, id int64, digest string, skipPinned bool) (bool, error) {
+			f.waitDelete()
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			row, ok := f.rows[id]
+			if !ok || row.Digest != digest || (skipPinned && row.Pinned) {
+				return false, nil
+			}
+			delete(f.rows, id)
+			return true, nil
+		})
 	m.EXPECT().DeleteExpired(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().
 		DoAndReturn(func(_ any, id, before int64) (bool, error) {
 			f.waitDelete()
@@ -345,6 +357,37 @@ func newFakeRepo(t *testing.T, stampAccess bool) *fakeRepo {
 				if row.UpstreamID == upstreamID {
 					list = append(list, clone(row))
 				}
+			}
+			return list, nil
+		})
+	// ListByPrefix 供按目录清除用：和真实实现一样按「键以前缀开头」匹配，
+	// 不排除子目录里的对象——这正是按目录清除要连子目录一起收走的地方。
+	m.EXPECT().ListByPrefix(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().
+		DoAndReturn(func(_ any, upstreamID int64, prefix string) ([]*cache_entity.CacheObject, error) {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			list := make([]*cache_entity.CacheObject, 0)
+			for _, row := range f.rows {
+				if row.UpstreamID == upstreamID && strings.HasPrefix(row.Key, prefix) {
+					list = append(list, clone(row))
+				}
+			}
+			return list, nil
+		})
+	// ScanByUpstream 同真实实现：按 id 升序、只给 id 大于 afterID 的至多 limit 条。
+	m.EXPECT().ScanByUpstream(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().
+		DoAndReturn(func(_ any, upstreamID, afterID int64, limit int) ([]*cache_entity.CacheObject, error) {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			list := make([]*cache_entity.CacheObject, 0)
+			for _, row := range f.rows {
+				if row.UpstreamID == upstreamID && row.ID > afterID {
+					list = append(list, clone(row))
+				}
+			}
+			sort.Slice(list, func(i, j int) bool { return list[i].ID < list[j].ID })
+			if len(list) > limit {
+				list = list[:limit]
 			}
 			return list, nil
 		})

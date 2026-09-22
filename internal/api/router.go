@@ -73,7 +73,9 @@ func Router(_ context.Context, root *mux.Router) error {
 		storageAware(ruleCtr.Delete), storageAware(ruleCtr.Test))
 	cacheCtr := cache_ctr.NewCache()
 	adminGroup.Bind(storageAware(cacheCtr.Search), storageAware(cacheCtr.Purge),
-		storageAware(cacheCtr.Pin))
+		storageAware(cacheCtr.Pin), storageAware(cacheCtr.Tree), storageAware(cacheCtr.TreeSearch),
+		storageAware(cacheCtr.TreePurge), storageAware(cacheCtr.Images), storageAware(cacheCtr.ImageTags),
+		storageAware(cacheCtr.ImagePurge))
 	// git 本地镜像同一道闸：删镜像和清缓存一样是破坏性操作。
 	gitCtr := git_ctr.NewGit()
 	adminGroup.Bind(storageAware(gitCtr.List), storageAware(gitCtr.Delete))

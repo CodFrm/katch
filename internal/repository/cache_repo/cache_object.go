@@ -22,6 +22,9 @@ type CacheObjectRepo interface {
 	FindByKey(ctx context.Context, upstreamID int64, key string) (*cache_entity.CacheObject, error)
 	Save(ctx context.Context, object *cache_entity.CacheObject) error
 	Delete(ctx context.Context, id int64) error
+	// DeleteUnchanged 人手清除用：只在记录仍指着 digest（列出之后没被拉取按新内容写回）
+	// 时删除，skipPinned 为真时还要求它仍未被 pin。返回是否真的删掉了。
+	DeleteUnchanged(ctx context.Context, id int64, digest string, skipPinned bool) (bool, error)
 	// DeleteExpired 只在记录仍满足过期清理条件时删除，避免删掉并发提升的旧记录。
 	DeleteExpired(ctx context.Context, id, before int64) (bool, error)
 	// Touch 命中时只更新访问时间与命中数，不整行写回。
@@ -62,6 +65,28 @@ type CacheObjectRepo interface {
 	CountByDigest(ctx context.Context, digest string) (int64, error)
 	Search(ctx context.Context, opt *cache_entity.SearchOption) ([]*cache_entity.CacheObject, int64, error)
 	ListByUpstream(ctx context.Context, upstreamID int64) ([]*cache_entity.CacheObject, error)
+
+	// 下面几条是管理界面的目录树（实现见 cache_tree.go）。层级不落表，按键前缀现算：
+	// 键以 / 开头，查询串之前的 `/` 才是目录分隔，查询串里的 `/` 不算。
+
+	// StatByUpstream 树根：每个有缓存对象的上游一行合计。
+	StatByUpstream(ctx context.Context) ([]*cache_entity.UpstreamTreeStat, error)
+	// StatByPrefix 一个目录下的合计，以及直接子目录数与直接对象数。
+	StatByPrefix(ctx context.Context, upstreamID int64, prefix string) (*cache_entity.PrefixTreeStat, error)
+	// ListTreeDirs 一层的子目录，按名称排序。
+	ListTreeDirs(ctx context.Context, opt *cache_entity.TreeOption) ([]*cache_entity.TreeDir, error)
+	// ListTreeObjects 一层的对象（不在任何子目录里的记录），按键排序。
+	ListTreeObjects(ctx context.Context, opt *cache_entity.TreeOption) ([]*cache_entity.CacheObject, error)
+	// SearchTree 目录下不区分大小写的子串搜索，返回前 Limit 条与命中总数。
+	SearchTree(ctx context.Context, opt *cache_entity.TreeSearchOption) ([]*cache_entity.CacheObject, int64, error)
+	// StatTreeMatch 搜索结果里一个目录的合计与命中部分的合计。
+	StatTreeMatch(ctx context.Context, opt *cache_entity.TreeMatchOption) (*cache_entity.TreeMatchStat, error)
+	// ListByPrefix 前缀下（递归到底，不排除子目录）全部对象，供按目录清除用。
+	ListByPrefix(ctx context.Context, upstreamID int64, prefix string) ([]*cache_entity.CacheObject, error)
+
+	// ScanByUpstream 管理界面的容器镜像视图（实现见 cache_image.go）：按 id 升序取
+	// 一个上游里 id 大于 afterID 的至多 limit 条记录，只含镜像聚合用得上的列。
+	ScanByUpstream(ctx context.Context, upstreamID, afterID int64, limit int) ([]*cache_entity.CacheObject, error)
 }
 
 var defaultCacheObject CacheObjectRepo
@@ -112,6 +137,15 @@ func (c *cacheObjectRepo) Save(ctx context.Context, object *cache_entity.CacheOb
 
 func (c *cacheObjectRepo) Delete(ctx context.Context, id int64) error {
 	return db.Ctx(ctx).Where("id=?", id).Delete(&cache_entity.CacheObject{}).Error
+}
+
+func (c *cacheObjectRepo) DeleteUnchanged(ctx context.Context, id int64, digest string, skipPinned bool) (bool, error) {
+	where, args := "id=? AND digest=?", []any{id, digest}
+	if skipPinned {
+		where, args = where+" AND pinned=?", append(args, false)
+	}
+	result := db.Ctx(ctx).Where(where, args...).Delete(&cache_entity.CacheObject{})
+	return result.RowsAffected > 0, result.Error
 }
 
 func (c *cacheObjectRepo) DeleteExpired(ctx context.Context, id, before int64) (bool, error) {
