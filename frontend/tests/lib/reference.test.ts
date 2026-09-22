@@ -19,7 +19,7 @@ describe('parseReference 识别', () => {
     name: string
     input: string
     host: string
-    kind: 'registry' | 'static'
+    kind: 'registry' | 'static' | 'git'
     target: string
     command: string
   }[] = [
@@ -102,6 +102,22 @@ describe('parseReference 识别', () => {
       kind: 'static',
       target: 'github.com/foo/bar/releases/download/v1/x.tgz',
       command: 'curl -fLO https://katch.dev/github.com/foo/bar/releases/download/v1/x.tgz',
+    },
+    {
+      name: '开了 git 的上游把以 .git 结尾的地址识别成仓库',
+      input: 'https://github.com/agentre-hub/agentre-server.git',
+      host: 'github.com',
+      kind: 'git',
+      target: 'github.com/agentre-hub/agentre-server.git',
+      command: 'git clone https://katch.dev/github.com/agentre-hub/agentre-server.git',
+    },
+    {
+      name: '只开 static 的上游不因 .git 后缀被识别成仓库',
+      input: 'https://deb.debian.org/debian/archive.git',
+      host: 'deb.debian.org',
+      kind: 'static',
+      target: 'deb.debian.org/debian/archive.git',
+      command: 'curl -fLO https://katch.dev/deb.debian.org/debian/archive.git',
     },
     {
       name: '两侧空白与多余斜杠不影响识别',

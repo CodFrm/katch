@@ -1,6 +1,7 @@
 import { useTranslation } from 'react-i18next'
 
 import { ScreenHeader } from '@/components/admin/admin-shell'
+import { Table } from '@/components/ui/table'
 import { useAdminAction } from '@/hooks/use-admin-action'
 import { useGitMirrors } from '@/hooks/use-admin-data'
 import { deleteGitMirror, type GitMirrorItem } from '@/lib/api'
@@ -58,7 +59,7 @@ export function GitMirrorsScreen({
           </p>
         )}
 
-        <table aria-label={t('admin.git.title')} className="w-full text-left">
+        <Table aria-label={t('admin.git.title')} className="min-w-[760px] table-fixed text-left">
           <thead>
             <tr className="border-border text-ink-3 border-b text-[11px] tracking-[0.12em]">
               <th scope="col" className="py-2 font-normal">
@@ -86,7 +87,7 @@ export function GitMirrorsScreen({
               <MirrorRow key={mirror.id} mirror={mirror} onDelete={() => remove(mirror)} />
             ))}
           </tbody>
-        </table>
+        </Table>
         {mirrors.data.length === 0 && (
           <p className="text-muted-foreground text-[13px]">{t('admin.git.empty')}</p>
         )}
@@ -98,6 +99,7 @@ export function GitMirrorsScreen({
 function MirrorRow({ mirror, onDelete }: { mirror: GitMirrorItem; onDelete: () => void }) {
   const { t } = useTranslation()
   const size = formatBytes(mirror.size_bytes)
+  const repository = `${mirror.host}${mirror.repo}`
 
   function stampOf(seconds: number): string {
     if (seconds <= 0) {
@@ -114,8 +116,9 @@ function MirrorRow({ mirror, onDelete }: { mirror: GitMirrorItem; onDelete: () =
   return (
     <tr className="border-border border-b">
       <td className="text-foreground py-2.5 font-mono text-[13px]">
-        {mirror.host}
-        {mirror.repo}
+        <span className="block truncate pr-4" title={repository}>
+          {repository}
+        </span>
       </td>
       <td className="py-2.5">
         <span className={cn('flex items-center gap-[7px] text-[12.5px]', 'text-foreground')}>

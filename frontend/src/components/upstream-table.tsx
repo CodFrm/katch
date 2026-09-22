@@ -38,10 +38,10 @@ function formatSize(bytes: number): string {
 export function UpstreamTable({ upstreams }: { upstreams: UpstreamItem[] }) {
   const { t } = useTranslation()
   const columns = [
-    { key: 'host', width: 'w-[280px]' },
-    { key: 'protocols', width: 'w-[150px]' },
-    { key: 'hitRate', width: 'w-[110px]' },
-    { key: 'cached', width: 'w-[110px]' },
+    { key: 'host', width: 'w-[240px]' },
+    { key: 'protocols', width: 'w-[140px]' },
+    { key: 'hitRate', width: 'w-[90px]' },
+    { key: 'cached', width: 'w-[90px]' },
     { key: 'status', width: '' },
   ] as const
 
@@ -53,7 +53,7 @@ export function UpstreamTable({ upstreams }: { upstreams: UpstreamItem[] }) {
           {t('upstreams.count', { count: upstreams.length })}
         </span>
       </div>
-      <Table className="text-[13px]">
+      <Table className="min-w-[640px] table-fixed text-[13px]">
         <TableHeader>
           <TableRow className="border-border hover:bg-transparent">
             {columns.map((column) => (
@@ -73,7 +73,9 @@ export function UpstreamTable({ upstreams }: { upstreams: UpstreamItem[] }) {
           {upstreams.map((upstream) => (
             <TableRow key={upstream.host} className="border-border hover:bg-transparent">
               <TableCell className="text-foreground px-0 py-2.5 font-mono">
-                {upstream.host}
+                <span className="block truncate pr-4" title={upstream.host}>
+                  {upstream.host}
+                </span>
               </TableCell>
               <TableCell className="text-muted-foreground px-0 py-2.5">
                 {protocolLabels(upstream.protocols, t)}

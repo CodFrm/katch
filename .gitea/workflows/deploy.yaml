@@ -1,0 +1,137 @@
+# Gitea（gitea.icodef.com）的部署流水线。它和 GitHub 上那套是分工，不是备份关系：
+#
+#   GitHub → ci.yml / nightly.yml / release.yml / docker-publish.yml —— 检查与发版，
+#            产物进 ghcr.io；仍然照旧跑。
+#   Gitea  → 这个文件 —— 只干一件事：main 有新提交，就把线上那台 katch 更新掉。
+#
+# 因此这里不重复 lint，只把 make test 走一遍当作发布闸（编译类问题由下面的镜像构建挡住，
+# 单测挡住的是「编得过却不对」）。
+#
+# 部署目标：k3s-master-1 那台集群的 ns app，release 名 katch。集群相关的值在
+# deploy/helm/katch/values-ggnb.yaml；镜像推 gitea.icodef.com 而不是 ghcr ——
+# 那个 registry 在集群里已经有拉取凭据（ns app 的 dockersecret）。
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+env:
+  # 版本写死，理由与 GitHub 的 ci.yml 相同：工具链漂移会让「本地全绿、CI 挂」变成猜谜。
+  PNPM_VERSION: 10.11.0
+  # runner 是内网那台 docker 主机：默认源要么慢要么不通，secret 里已经有自建的那份。
+  GOPROXY: ${{ secrets.GOPROXY && secrets.GOPROXY || 'https://goproxy.cn,direct' }}
+  # 别换成别的 registry：集群节点的拉取凭据只配了 gitea.icodef.com。
+  DOCKER_REGISTRY: ${{ secrets.DOCKER_REGISTRY && secrets.DOCKER_REGISTRY || 'gitea.icodef.com' }}
+  NAMESPACE: app
+  RELEASE: katch
+
+# 发布不能互相取消：中断发生在 helm 换镜像的中途就是旧 Pod 没了、新的还没起来，
+# 留下一个比「等一会儿」糟得多的状态。排队比取消安全。
+concurrency:
+  group: deploy-katch-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # 用 npm 装而不是 pnpm/action-setup：少依赖一个镜像里的 action，
+      # 版本号又和 GitHub 那边一样是写死的。
+      - name: Install pnpm
+        run: |
+          set -euo pipefail
+          npm install --global pnpm@${{ env.PNPM_VERSION }}
+          pnpm --version
+
+      - name: Test
+        run: make test
+
+      - name: Set up Docker Buildx
+        uses: actions/setup-buildx-action@v3
+
+      - name: Login to registry
+        uses: actions/login-action@v3
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - name: Resolve the version
+        id: vars
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse --short=7 HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag=main.$sha" >> "$GITHUB_OUTPUT"
+
+      # 复用 deploy/Dockerfile：三段式，前端与后端都在容器里构建，CGO_ENABLED=0
+      # 那道闸也就跟着跑了一遍。两个 tag：
+      #   main.<短 sha>  这次发布的确切版本，回滚时指着它
+      #   main           跟分支走，只用来一眼看出「线上这条线到哪了」
+      - name: Build and push image
+        uses: actions/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.DOCKER_REGISTRY }}/${{ github.repository }}:${{ steps.vars.outputs.tag }}
+            ${{ env.DOCKER_REGISTRY }}/${{ github.repository }}:main
+          cache-from: type=gha,scope=katch-image
+          cache-to: type=gha,scope=katch-image,mode=max,ignore-error=true
+          build-args: |
+            VERSION=${{ steps.vars.outputs.tag }}
+            COMMIT=${{ steps.vars.outputs.sha }}
+
+      - name: Set up Helm
+        uses: actions/setup-helm@v4
+        with:
+          version: v3.13.1
+
+      # kubeconfig 只落在这次 job 的工作区里，job 的容器一结束就没了。
+      # 不用 k8s-set-context 那个 action：写文件这一步自己就能把「context 名对不对」
+      # 摆在日志里，将来出问题少一层要猜的东西。
+      - name: Write kubeconfig
+        env:
+          KUBE_CONFIG: ${{ secrets.K3S_KUBE_CONFIG }}
+        run: |
+          set -euo pipefail
+          # 必须用**仓库级**的 K3S_KUBE_CONFIG：codfrm 用户级的 KUBE_CONFIG 指向的是
+          # 另一套集群，名字不带 K3S 就是为了不让人顺手拿错。
+          : "${KUBE_CONFIG:?缺少 secret K3S_KUBE_CONFIG（指向 k3s-master-1，context 名为 k8s-context）}"
+          install -d -m 700 "$HOME/.kube"
+          printf '%s\n' "$KUBE_CONFIG" > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+          grep -q 'k8s-context' "$HOME/.kube/config" || {
+            echo "kubeconfig 里没有 k8s-context，下面 helm 会用到错的 context" >&2
+            exit 1
+          }
+
+      # 不加 --wait：集群里那个 deploy SA 没有 list replicasets 的权限，而 helm 判断
+      # rollout 完成要读它，带上就是一句 "replicasets.apps is forbidden" 直接失败。
+      # 升级有没有真的起起来，看 Pod。
+      - name: Deploy ${{ env.RELEASE }}
+        env:
+          IMAGE_REPOSITORY: ${{ env.DOCKER_REGISTRY }}/${{ github.repository }}
+          TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          set -euo pipefail
+          export KUBECONFIG="$HOME/.kube/config"
+          helm upgrade --install "$RELEASE" deploy/helm/katch \
+            --namespace "$NAMESPACE" \
+            -f deploy/helm/katch/values-ggnb.yaml \
+            --set image.repository="$IMAGE_REPOSITORY" \
+            --set image.tag="$TAG"

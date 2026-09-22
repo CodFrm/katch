@@ -205,7 +205,15 @@ func startLiveKatch(t *testing.T) (*gin.Engine, *liveOrigin) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cache_svc.Register(cache_svc.New(store, cache_svc.Options{}))
+	cacheSvc := cache_svc.New(store, cache_svc.Options{})
+	cache_svc.Register(cacheSvc)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := cacheSvc.Quiesce(ctx); err != nil {
+			t.Errorf("等待后台缓存任务结束: %v", err)
+		}
+	})
 	proxy_svc.Register(proxy_svc.New(proxy_svc.Options{}))
 
 	testMux := muxtest.NewTestMux()

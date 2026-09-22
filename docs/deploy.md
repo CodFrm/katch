@@ -167,14 +167,18 @@ kubectl apply -k deploy/kubernetes/
 
 ## 放在反代后面
 
-katch 自己不做 TLS，要 HTTPS 就在前面加一层。那一层有两件事必须调，否则症状
-不是「不能用」而是「巨慢」或者「大文件传一半断」：
+katch 自己不做 TLS，要 HTTPS 就在前面加一层。那一层有三件事必须调，否则症状
+不是「不能用」而是「巨慢」、「大文件传一半断」或者单独的某个上游整个 502：
 
 1. **关掉响应缓冲。** 不关的话，一个几 GB 的镜像层会先被反代整个收下来再转给客户端，
    既把首字节推迟到整体下载完成，又能把反代的盘写满。katch 这边是 `io.Copy` 流式
    转发的，缓冲会把这个设计整个抵消掉。
 2. **把读写超时调大。** 大对象在慢网络上会传很久，nginx 默认 60 秒会在中途把连接
    切断，客户端看到的是一个下到一半的文件。
+3. **把响应头缓冲调大。** nginx 默认 4k，而 github.com 一个 HTML 页面的响应头就有
+   5KB（一堆 Set-Cookie），超了之后 ingress 会直接 502，日志里是
+   `upstream sent too big header while reading response header from upstream`。
+   这个错看起来像回源挂了，实际上 katch 已经拉到并转发了——直连 service 是 200。
 
 ingress-nginx 的写法（chart 和裸 manifests 里都已经是默认值）：
 
@@ -183,10 +187,11 @@ nginx.ingress.kubernetes.io/proxy-buffering: "off"
 nginx.ingress.kubernetes.io/proxy-read-timeout: "900"
 nginx.ingress.kubernetes.io/proxy-send-timeout: "900"
 nginx.ingress.kubernetes.io/proxy-body-size: "0"
+nginx.ingress.kubernetes.io/proxy-buffer-size: "16k"
 ```
 
 独立 nginx 的对应写法是 `proxy_buffering off;`、`proxy_read_timeout 900s;`、
-`client_max_body_size 0;`。
+`client_max_body_size 0;`、`proxy_buffer_size 16k;`。
 
 还有一条：**反代必须把整个 `/` 都转给 katch**，不能按前缀挑。路径的第一段就是上游
 主机名，挑路径等于把上游挑着代理，而且每加一个上游都要回来改一次反代配置。
@@ -220,7 +225,25 @@ chart 里 `metrics.serviceMonitor.enabled=true` 可以生成一个 ServiceMonito
 **界面上的命中率不依赖 Prometheus**：那是库里的分钟桶（决策 16），
 装不装外部监控都不影响后台能看。
 
+## CI（Gitea Actions）
+
+`main` 有新提交时，Gitea（gitea.icodef.com）会跑
+[`.gitea/workflows/deploy.yaml`](../.gitea/workflows/deploy.yaml)：走一遍 `make test`、
+构建 `gitea.icodef.com/codfrm/katch:main.<短 sha>`，再 `helm upgrade --install` 到
+k3s-master-1 那台集群的 ns `app`，release 名 `katch`。GitHub 上那套
+（ci / nightly / release）不受影响，管的是 ghcr.io 上的发版镜像与 Release。
+
+集群相关的值入库在
+[`deploy/helm/katch/values-ggnb.yaml`](../deploy/helm/katch/values-ggnb.yaml)：域名
+`katch.ggnb.top`、`ssd-nfs-client`、ingress class `k3s-main-nginx`、通配证书
+`ggnb-top-tls`。拉镜像的 `dockersecret` 也是 ns app 里本来就有的那份。
+
+升级跑在 runner 上，不登机器，也不带 `--wait`（集群里那个 deploy SA 没有读
+replicasets 的权限，而 helm 判断 rollout 完成要读它）：升起来没有要看 Pod。
+
 ## 升级
+
+手动升级（CI 之外的路子）：
 
 ```bash
 # compose
@@ -244,5 +267,6 @@ helm upgrade katch deploy/helm/katch --reuse-values --set image.tag=0.2.0
 | 后台全是 401 | `admin.initialKey` 没配，或者库里已经有一个轮换过的密钥了（配置文件覆盖不了它） |
 | 后台「最近请求」整块是空的 | 这个上游确实没被拉过，或者历史已经被 `recent_request_retention_seconds` 裁掉。日志开关、日志文件在不在卷里都不影响这块面板 |
 | 升级卡在 `ContainerCreating` | `strategy` 不是 `Recreate`，RWO 的卷把新旧 Pod 锁死了 |
+| Pod 停在 `ImagePullBackOff`，报 401 | `dockersecret` 过期或没了（镜像在 gitea 私有包里，节点匿名拉不到）。见上面「CI」 |
 | 界面上停用了上游，可还在回源 | 开了多副本。见「为什么只能一个副本」 |
 | 大文件传一半断 / 首字节特别慢 | 反代的响应缓冲没关、超时没调大。见「放在反代后面」 |

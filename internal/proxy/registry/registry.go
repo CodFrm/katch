@@ -358,26 +358,35 @@ func lifetime(expiresIn int) time.Duration {
 // 回源路径 = /v2 + （可能补过 library/ 的）仓库名 + 动词段。拿不出仓库名的请求
 // （/v2/、_catalog 之类）原样补上 /v2 前缀，scope 交给挑战去说。
 func upstreamPath(path string, libraryCompletion bool) (string, string) {
-	repository, tail := splitRepository(path)
+	repository, tail := SplitRepository(path)
 	if repository == "" {
 		return "/v2" + path, ""
 	}
-	// 补全只看记录上的标志，不看主机名：新加一个需要补全的 registry 应该是加
-	// 一条记录，而不是改这里的代码（决策 12）。
-	if libraryCompletion && !strings.Contains(repository, "/") {
-		repository = "library/" + repository
-	}
+	repository = CompleteLibrary(repository, libraryCompletion)
 	return "/v2/" + repository + tail, "repository:" + repository + ":pull"
 }
 
 // verbs registry 协议里仓库名之后的那一段。仓库名可以有任意多段，靠它们断句。
 var verbs = map[string]bool{"manifests": true, "blobs": true, "tags": true, "referrers": true}
 
-// splitRepository 把「仓库名」和「动词段」切开。
+// CompleteLibrary 按上游记录上的开关把不含 / 的仓库名补成 library/<名>。
+//
+// 补全只看记录上的标志，不看主机名：新加一个需要补全的 registry 应该是加
+// 一条记录，而不是改这里的代码（决策 12）。导出给管理界面的镜像视图用：
+// 归并 x 与 library/x 两组缓存键必须和回源时的补全是同一条规则。
+func CompleteLibrary(repository string, libraryCompletion bool) string {
+	if libraryCompletion && !strings.Contains(repository, "/") {
+		return "library/" + repository
+	}
+	return repository
+}
+
+// SplitRepository 把上游侧路径（以 / 开头、不含 /v2）切成「仓库名」和「动词段」，
+// 拿不出仓库名时两者都是空串。
 //
 // 取最后一个动词段而不是第一个：仓库名本身可以叫 blobs（library/blobs/manifests/7），
-// 取第一个会把仓库名切掉半截。
-func splitRepository(path string) (string, string) {
+// 取第一个会把仓库名切掉半截。导出给管理界面的镜像视图用，切分规则只此一份。
+func SplitRepository(path string) (string, string) {
 	segments := strings.Split(strings.TrimPrefix(path, "/"), "/")
 	for i := len(segments) - 1; i >= 1; i-- {
 		if verbs[segments[i]] {

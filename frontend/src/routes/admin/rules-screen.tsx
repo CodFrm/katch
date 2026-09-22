@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next'
 
 import { RuleTester } from '@/components/admin/rule-tester'
 import { Input } from '@/components/ui/input'
+import { Table } from '@/components/ui/table'
 import { useAdminRules } from '@/hooks/use-admin-data'
 import { useAdminAction } from '@/hooks/use-admin-action'
 import {
@@ -229,7 +230,7 @@ export function RulesScreen({
           </form>
         )}
 
-        <table aria-label={t('admin.rules.title')} className="w-full text-left">
+        <Table aria-label={t('admin.rules.title')} className="min-w-[640px] table-fixed text-left">
           <thead>
             <tr className="border-border text-ink-3 border-b text-[11px] tracking-[0.12em]">
               <th scope="col" className="w-[92px] py-2 font-normal">
@@ -259,8 +260,16 @@ export function RulesScreen({
                     {t(`admin.rules.action.${rule.action}`)}
                   </span>
                 </td>
-                <td className="text-foreground py-2.5 font-mono text-[13px]">{rule.pattern}</td>
-                <td className="text-muted-foreground py-2.5 text-[13px]">{rule.note}</td>
+                <td className="text-foreground min-w-0 py-2.5 font-mono text-[13px]">
+                  <span className="block truncate pr-4" title={rule.pattern}>
+                    {rule.pattern}
+                  </span>
+                </td>
+                <td className="text-muted-foreground min-w-0 py-2.5 text-[13px]">
+                  <span className="block truncate pr-4" title={rule.note}>
+                    {rule.note}
+                  </span>
+                </td>
                 <td className="py-2.5">
                   <div className="flex items-center gap-3">
                     <button
@@ -289,7 +298,7 @@ export function RulesScreen({
               </tr>
             ))}
           </tbody>
-        </table>
+        </Table>
         {scoped.length === 0 && (
           <p className="text-muted-foreground text-[13px]">{t('admin.rules.empty')}</p>
         )}

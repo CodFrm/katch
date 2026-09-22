@@ -54,6 +54,7 @@
       "upstreams": "上游",
       "cache": "缓存对象",
       "git": "Git 镜像",
+      "images": "容器镜像",
       "settings": "设置",
       "addUpstream": "添加上游"
     },
@@ -206,7 +207,10 @@
       "cacheObjectNotFound": "这个缓存对象已经不在了。",
       "purgeTargetRequired": "要先说清楚清哪一个对象或哪个上游。",
       "settingKeyUnknown": "有一项设置这台 katch 不认识，界面可能比后端新。",
-      "settingValueInvalid": "有一项设置的取值不合法，改成允许的范围再保存。"
+      "settingValueInvalid": "有一项设置的取值不合法，改成允许的范围再保存。",
+      "cacheTreePathInvalid": "目录路径不合法，刷新一下再试。",
+      "cacheImageRepositoryInvalid": "仓库名不合法，刷新一下再试。",
+      "cacheImageReferenceInvalid": "tag 不合法，刷新一下再试。"
     },
     "rules": {
       "title": "访问规则",
@@ -272,9 +276,8 @@
       "quota": "/ 配额 {{size}}",
       "watermark": "达到 {{percent}}% 触发 LRU 回收",
       "search": "搜索缓存对象",
-      "searchPlaceholder": "library/*",
+      "searchPlaceholder": "在当前目录下搜索路径",
       "found": "命中 {{total}} 个",
-      "filterUpstream": "按上游筛选",
       "allUpstreams": "全部上游",
       "selected": "已选 {{total}} 项",
       "purge": "清除",
@@ -287,12 +290,31 @@
       "purged": "清除了 {{removed}} 个对象",
       "purgedWithSkipped": "清除了 {{removed}} 个对象，{{skipped}} 个已固定的对象保留",
       "columns": {
-        "object": "对象",
-        "upstream": "上游",
+        "name": "名称",
+        "count": "对象数",
         "size": "大小",
         "hits": "命中",
         "lastAccess": "最后访问",
         "operations": "操作"
+      },
+      "tree": {
+        "crumbs": "目录路径",
+        "summary": "{{count}} 个对象 · {{size}}",
+        "expand": "展开 {{name}}",
+        "collapse": "收起 {{name}}",
+        "enter": "进入 {{name}}",
+        "variant": "变体",
+        "loadMore": "加载更多",
+        "emptyDir": "这个目录下没有缓存对象。",
+        "loadFailed": "这一层没有读出来，稍后刷新再试。",
+        "searchFailed": "搜索没有完成，稍后再试。",
+        "matched": "匹配 {{count}}",
+        "truncated": "只显示了前 {{shown}} 个匹配，输入更具体的路径或先进入目录。",
+        "purgeDir": "清除本目录",
+        "purgeQuestion": "清除 {{path}} 下 {{count}} 个未固定的对象？",
+        "purgeConfirm": "确认清除",
+        "purgeCancel": "取消",
+        "purged": "清除 {{removed}} 个，跳过 {{skipped}} 个已固定"
       }
     },
     "git": {
@@ -314,6 +336,36 @@
         "ready": "已就绪",
         "failed": "失败",
         "rejected": "超限穿透"
+      }
+    },
+    "images": {
+      "title": "容器镜像",
+      "countUnit": "个镜像",
+      "sizeNote": "体积按该仓库下已缓存对象合计，共用层会在各自镜像里各算一次。",
+      "search": "搜索容器镜像",
+      "searchPlaceholder": "按仓库名或 tag 搜索",
+      "upstreamFilter": "按上游筛选",
+      "allUpstreams": "全部上游",
+      "empty": "没有镜像缓存。",
+      "loadFailed": "镜像列表没有读出来，稍后刷新再试。",
+      "tagsFailed": "tag 列表没有读出来，稍后刷新再试。",
+      "loadMore": "加载更多",
+      "expand": "展开 {{name}}",
+      "collapse": "收起 {{name}}",
+      "variants": "{{count}} 个变体",
+      "expired": "已过期，下次拉取回源",
+      "delete": "删除",
+      "deleteConfirm": "确认删除",
+      "deleteCancel": "取消",
+      "deleteImageQuestion": "删除镜像 {{name}}？将清除其下 {{count}} 个未固定的对象。",
+      "deleteTagQuestion": "删除 tag {{name}}？将清除其下 {{count}} 个未固定的对象。",
+      "columns": {
+        "name": "名称",
+        "tagCount": "Tag 数",
+        "size": "体积",
+        "hits": "命中",
+        "lastAccess": "最后访问",
+        "operations": "操作"
       }
     },
     "settings": {

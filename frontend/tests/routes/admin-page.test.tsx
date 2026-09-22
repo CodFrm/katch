@@ -390,6 +390,9 @@ describe('后台概览', () => {
     renderAdmin()
 
     const stream = await screen.findByRole('table', { name: '最近事件' })
+    expect(stream).toHaveClass('table-fixed', 'min-w-[600px]')
+    expect(stream.parentElement).toHaveAttribute('data-slot', 'table-container')
+    expect(stream.parentElement).toHaveClass('min-w-0', 'overflow-x-auto')
     const rows = within(stream).getAllByRole('row')
     expect(rows[0]).toHaveTextContent('pypi.org 回源连续失败，已进入退避')
     expect(rows[0]).toHaveTextContent('降级')
@@ -398,6 +401,10 @@ describe('后台概览', () => {
     expect(rows[1]).toHaveTextContent('管理员')
     expect(rows[2]).toHaveTextContent('淘汰 142 个冷对象，腾出 142 GB')
     expect(rows[3]).toHaveTextContent('添加上游 pypi.org')
+
+    const description = within(rows[0]).getByText('pypi.org 回源连续失败，已进入退避')
+    expect(description).toHaveClass('block', 'truncate')
+    expect(description).toHaveAttribute('title', 'pypi.org 回源连续失败，已进入退避')
 
     for (const raw of ['upstream_degraded', 'rule_created', 'cache_reclaimed', 'system', 'admin']) {
       expect(within(stream).queryByText(raw)).not.toBeInTheDocument()
@@ -500,6 +507,9 @@ describe('后台上游详情', () => {
     renderAdmin('/admin/upstreams/1')
 
     const table = await screen.findByRole('table', { name: '最近请求' })
+    expect(table).toHaveClass('table-fixed', 'min-w-[640px]')
+    expect(table.parentElement).toHaveAttribute('data-slot', 'table-container')
+    expect(table.parentElement).toHaveClass('min-w-0', 'overflow-x-auto')
     const rows = within(table).getAllByRole('row').slice(1)
     expect(rows).toHaveLength(4)
 
@@ -510,6 +520,9 @@ describe('后台上游详情', () => {
     expect(first[2]).toBe('命中')
     expect(first[3]).toBe('41 MB')
     expect(first[4]).toBe('900 ms')
+    const object = within(rows[0]).getByText('library/redis:7')
+    expect(object).toHaveClass('block', 'truncate')
+    expect(object).toHaveAttribute('title', 'library/redis:7')
     // 时刻精确到秒：同一分钟里的几次拉取要分得出先后。
     expect(first[0]).toMatch(/^\d{2}:\d{2}:\d{2}$/)
 

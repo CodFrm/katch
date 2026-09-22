@@ -1,5 +1,6 @@
 import { useTranslation } from 'react-i18next'
 
+import { Table } from '@/components/ui/table'
 import type { EventItem } from '@/lib/api'
 import { actorKey, describeEvent, type EventTone } from '@/lib/events'
 import { formatStamp } from '@/lib/format'
@@ -31,7 +32,10 @@ export function EventStream({ events }: { events: EventItem[] }) {
       {events.length === 0 ? (
         <p className="text-ink-3 text-[12.5px]">{t('admin.events.empty')}</p>
       ) : (
-        <table aria-label={t('admin.events.title')} className="w-full border-collapse">
+        <Table
+          aria-label={t('admin.events.title')}
+          className="min-w-[600px] table-fixed border-collapse"
+        >
           <tbody>
             {events.map((event) => {
               const view = describeEvent(event)
@@ -39,6 +43,7 @@ export function EventStream({ events }: { events: EventItem[] }) {
               const enums = Object.fromEntries(
                 Object.entries(view.enums).map(([field, key]) => [field, t(key)])
               )
+              const description = t(view.key, { ...view.values, ...enums })
               return (
                 <tr key={event.id} className="border-border border-b">
                   <td className="text-ink-3 w-24 py-2 font-mono text-xs">
@@ -59,7 +64,9 @@ export function EventStream({ events }: { events: EventItem[] }) {
                     </span>
                   </td>
                   <td className="text-foreground py-2 text-[12.5px]">
-                    {t(view.key, { ...view.values, ...enums })}
+                    <span className="block truncate pr-4" title={description}>
+                      {description}
+                    </span>
                   </td>
                   <td className="text-ink-3 w-24 py-2 text-right text-xs">
                     {t(actorKey(event.actor))}
@@ -68,7 +75,7 @@ export function EventStream({ events }: { events: EventItem[] }) {
               )
             })}
           </tbody>
-        </table>
+        </Table>
       )}
     </section>
   )

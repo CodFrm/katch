@@ -61,7 +61,13 @@ type Response struct {
 // 这几个头缺了会真的坏事——没有 Range 就没有断点续传和分段拉取，没有条件请求头
 // 就每次都要整份重下，没有 Accept 时 registry 不知道该给哪个 manifest 版本，
 // 没有 Content-Type 上游认不出这是一个 upload-pack 请求，没有 Git-Protocol
-// 协商会退回协议 v0（决策 10）。多出来的这两项各有确定用途，白名单仍是白名单。
+// 协商会退回协议 v0（决策 10）。Content-Encoding 与 Content-Type 同一类：它说的
+// 是**请求体自己**是什么形态，漏了它而请求体还是压缩字节，上游就会按明文去解它
+// （git 对超过 1KB 的协商请求体正是这么发的）。
+//
+// 入口解开了编码的那种请求，转发的头里会把 Content-Encoding 摘掉（web 包的
+// gitRequestBody），否则就是反过来的同一个错：声明 gzip、送的却是明文。
+// 多出来的这几项各有确定用途，白名单仍是白名单。
 var forwardedRequestHeaders = []string{
 	"Accept",
 	"Accept-Encoding",
@@ -71,6 +77,7 @@ var forwardedRequestHeaders = []string{
 	"If-Modified-Since",
 	"User-Agent",
 	"Content-Type",
+	"Content-Encoding",
 	"Git-Protocol",
 }
 
