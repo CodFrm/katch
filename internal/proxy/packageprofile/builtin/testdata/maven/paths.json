@@ -1,0 +1,80 @@
+[
+  {
+    "name": "central release jar",
+    "host": "repo1.maven.org",
+    "path": "/org/junit/jupiter/junit-jupiter-api/5.11.0/junit-jupiter-api-5.11.0.jar",
+    "class": "immutable"
+  },
+  {
+    "name": "canonical central release pom",
+    "host": "repo.maven.apache.org",
+    "path": "/org/junit/jupiter/junit-jupiter-api/5.11.0/junit-jupiter-api-5.11.0.pom",
+    "class": "immutable"
+  },
+  {
+    "name": "gradle module metadata",
+    "host": "repo.maven.apache.org",
+    "path": "/org/jetbrains/kotlin/kotlin-stdlib/2.0.20/kotlin-stdlib-2.0.20.module",
+    "class": "immutable"
+  },
+  {
+    "name": "release checksum",
+    "host": "repo.maven.apache.org",
+    "path": "/org/junit/jupiter/junit-jupiter-api/5.11.0/junit-jupiter-api-5.11.0.jar.sha256",
+    "class": "immutable"
+  },
+  {
+    "name": "release signature checksum",
+    "host": "repo.maven.apache.org",
+    "path": "/org/junit/jupiter/junit-jupiter-api/5.11.0/junit-jupiter-api-5.11.0.pom.asc.sha1",
+    "class": "immutable"
+  },
+  {
+    "name": "artifact metadata",
+    "host": "repo.maven.apache.org",
+    "path": "/org/junit/jupiter/junit-jupiter-api/maven-metadata.xml",
+    "class": "mutable"
+  },
+  {
+    "name": "metadata checksum",
+    "host": "repo.maven.apache.org",
+    "path": "/org/junit/jupiter/junit-jupiter-api/maven-metadata.xml.sha512",
+    "class": "mutable"
+  },
+  {
+    "name": "non unique snapshot",
+    "host": "repo.maven.apache.org",
+    "path": "/com/example/demo/1.2-SNAPSHOT/demo-1.2-SNAPSHOT.jar",
+    "class": "mutable"
+  },
+  {
+    "name": "unique snapshot remains changing",
+    "host": "repo.maven.apache.org",
+    "path": "/com/example/demo/1.2-SNAPSHOT/demo-1.2-20260916.120000-3.jar",
+    "class": "mutable"
+  },
+  {
+    "name": "snapshot signature",
+    "host": "repo.maven.apache.org",
+    "path": "/com/example/demo/1.2-SNAPSHOT/demo-1.2-SNAPSHOT.jar.asc",
+    "class": "mutable"
+  },
+  {
+    "name": "unknown repository release is revalidated",
+    "host": "packages.example.test",
+    "path": "/com/example/demo/1.2.0/demo-1.2.0.jar",
+    "class": "mutable"
+  },
+  {
+    "name": "directory is not a representation",
+    "host": "repo.maven.apache.org",
+    "path": "/org/junit/jupiter/junit-jupiter-api/5.11.0/",
+    "class": "unknown"
+  },
+  {
+    "name": "unrelated file is not a maven artifact",
+    "host": "repo.maven.apache.org",
+    "path": "/robots.txt",
+    "class": "unknown"
+  }
+]

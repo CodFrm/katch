@@ -1,5 +1,15 @@
 env: DEV
-debug: true
+# debug 关着：cago 把这一项传给 gorm 的日志器，打开时它会把每一个
+# ErrRecordNotFound 都按 ERROR 级别、带 ANSI 转义写出去。而「缓存里没有这个对象」
+# 「setting 表里还没有这个键」本来就是正常路径上最常见的两次查询，于是下面那个
+# 专收 error 的文件会变成 100% 的 record not found——值班时最该看的那一个文件里
+# 一行真错误都没有。
+#
+# 它顺带还管两件本地开发会想要的事：gin 的 debug 模式与逐请求日志、以及一路
+# Debug 级别的人读格式控制台输出；关掉后控制台是 logger.level 下的 JSON。本地调试
+# 时可以自己打开，代价是上面说的 error 文件噪音。只想看 SQL 就开 db 段里的 debug
+# （那一项走的是 orm.Debug()，不碰日志器）。
+debug: false
 
 # source 不能省。cago 的 Config.init() 会无条件读这个键，缺失时启动直接失败
 # （"config key not found: source"）。改用 etcd 时这里填 etcd 并补上连接段。
@@ -24,12 +34,16 @@ db:
   #   driver: "mysql"
   #   dsn: "user:pass@tcp(127.0.0.1:3306)/katch?charset=utf8mb4&parseTime=True&loc=Local"
   driver: "sqlite"
-  # 两个 pragma 都不能省：
-  #   journal_mode(WAL)  —— 默认的 DELETE 模式下读会阻塞写，缓存元数据是读多写少，
-  #                         不开 WAL 一上并发就互相卡。
-  #   busy_timeout(5000) —— sqlite 遇到锁默认**立刻**返回 SQLITE_BUSY 而不是等待，
-  #                         不设这个值，并发写会直接报 "database is locked"。
-  dsn: "file:./data/katch.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+  # 三个 pragma 都不能省：
+  #   journal_mode(WAL)     —— 默认的 DELETE 模式下读会阻塞写，缓存元数据是读多写少，
+  #                            不开 WAL 一上并发就互相卡。
+  #   busy_timeout(5000)    —— sqlite 遇到锁默认**立刻**返回 SQLITE_BUSY 而不是等待，
+  #                            不设这个值，并发写会直接报 "database is locked"。
+  #   synchronous(NORMAL)   —— 默认的 FULL 在 WAL 下每次提交都 fsync，而缓存正往同一块盘
+  #                            写大文件，一次提交能卡几百毫秒到几秒，等锁的写还会超过上面
+  #                            的 5 秒直接失败。NORMAL 只在断电或系统崩溃时可能丢最后几个
+  #                            事务（进程崩溃不丢），对缓存元数据的代价是下次重新回源。
+  dsn: "file:./data/katch.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)"
   prefix: "katch_"
   debug: false
   # sqlite 是单文件，写入本来就串行，连接数开大只会增加锁竞争。切到 mysql 时这几项
@@ -56,6 +70,10 @@ git:
   # 总配额、单仓体积上限、同步超时与同步并发是运行时项，在界面的「设置」里改。
   dir: ./data/mirrors
 
+# 上游、package profile、companion 和 site_domain 都是运行时数据，不放在这个文件里：
+# 上游与 profile 在管理后台的「上游」页维护，site_domain 在「设置」页维护。生成客户端
+# 配置前必须设置 site_domain；后台会逐项检查 profile 要求的 companion 主机、transport
+# 和 profile。真实客户端阻断公网矩阵通过前，界面只显示待验证，不提供可复制配置。
 admin:
   # 管理接口（/api/v1/admin/*）的**初始**密钥。密钥以 bcrypt 哈希存在库的 setting
   # 表里，这里的值只在库中尚无密钥时生效一次；之后的轮换在界面上完成，改这里不会

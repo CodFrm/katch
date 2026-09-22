@@ -1,0 +1,8 @@
+{
+  "name": "goproxy",
+  "image": "katch/package-client-go:1.26.0",
+  "setup": "set -eu\ncat > go.mod <<'EOF'\nmodule katch.example/e2e\n\ngo 1.26\n\nrequire rsc.io/quote v1.5.2\nEOF\ncat > main.go <<'EOF'\npackage main\n\nimport (\n\t\"fmt\"\n\t\"rsc.io/quote\"\n)\n\nfunc main() {\n\tfmt.Println(quote.Hello())\n}\nEOF",
+  "run": "set -eu\nexport GOPROXY=\"${KATCH_URL%/}/proxy.golang.org\"\nunset GOSUMDB\ntest \"$(go env GOSUMDB)\" = \"sum.golang.org\"\ngo mod download -json rsc.io/quote@v1.5.2 > download.json\ngo mod tidy\ngo run . > output.txt\ngo version",
+  "assert": "set -eu\ngrep -F 'Hello, world.' output.txt\ngrep -E '^rsc.io/quote v1\\.5\\.2 h1:' go.sum\ngrep -E '^rsc.io/quote v1\\.5\\.2/go.mod h1:' go.sum\ngo mod verify\njq -e '.Path == \"rsc.io/quote\" and .Version == \"v1.5.2\" and (.Sum | startswith(\"h1:\")) and (.GoModSum | startswith(\"h1:\"))' download.json >/dev/null",
+  "required_upstreams": ["proxy.golang.org", "sum.golang.org"]
+}

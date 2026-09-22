@@ -1,10 +1,22 @@
 package cache
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/smartystreets/goconvey/convey"
 )
+
+// presetPatterns 是表单五个预设会填进上游的那几组普通模式。它们是纯数据，同一个
+// 表格同时写在 spec、frontend/src/lib/upstream-presets.ts 和这里；这组用例锚定的是
+// 引擎读它们的结果。关键一条：Go 不能再写宽泛的 `/@v/`——那样会变的 `@v/list`
+// 也会被当成不可变对象永久缓存（spec 问题 3）。
+var presetPatterns = map[string][]string{
+	"apt":  {"/pool/"},
+	"go":   {"/@v/*.info", "/@v/*.mod", "/@v/*.zip"},
+	"git":  {"/????????????????????????????????????????/"},
+	"pypi": {"/packages/??/??/????????????????????????????????????????????????????????????????/"},
+}
 
 // TestIsImmutable 决策 13：「哪些路径不可变」是每条上游记录上的数据，不是代码里
 // 按 host 分支判断出来的。这里验的是那张模式表怎么读。
@@ -32,6 +44,34 @@ func TestIsImmutable(t *testing.T) {
 		for _, c := range cases {
 			convey.Convey(c.name, func() {
 				convey.So(IsImmutable(c.patterns, c.path), convey.ShouldEqual, c.want)
+			})
+		}
+	})
+
+	convey.Convey("表单预设的代表路径与反例", t, func() {
+		representative := []struct {
+			name   string
+			preset string
+			path   string
+			want   bool
+		}{
+			{"APT 的 pool/ 命中", "apt", "/debian/pool/main/n/nginx/nginx_1.22.deb", true},
+			{"APT 的 InRelease 保持可变", "apt", "/debian/dists/stable/InRelease", false},
+			{"Go 版本文件 .info 命中", "go", "/github.com/gin-gonic/gin/@v/v1.12.0.info", true},
+			{"Go 版本文件 .mod 命中", "go", "/github.com/gin-gonic/gin/@v/v1.12.0.mod", true},
+			{"Go 版本文件 .zip 命中", "go", "/github.com/gin-gonic/gin/@v/v1.12.0.zip", true},
+			{"Go 的 @v/list 保持可变", "go", "/github.com/gin-gonic/gin/@v/list", false},
+			{"Go 的 @latest 保持可变", "go", "/github.com/gin-gonic/gin/@latest", false},
+			{"Git 40 位 commit 命中", "git",
+				"/foo/bar/" + strings.Repeat("0", 40) + "/x.sh", true},
+			{"Git 分支名路径保持可变", "git", "/foo/bar/main/x.sh", false},
+			{"PyPI 包文件命中", "pypi",
+				"/packages/ab/cd/" + strings.Repeat("a", 64) + "/requests-2.32.0-py3-none-any.whl", true},
+			{"PyPI 项目索引保持可变", "pypi", "/simple/requests/", false},
+		}
+		for _, c := range representative {
+			convey.Convey(c.name, func() {
+				convey.So(IsImmutable(presetPatterns[c.preset], c.path), convey.ShouldEqual, c.want)
 			})
 		}
 	})

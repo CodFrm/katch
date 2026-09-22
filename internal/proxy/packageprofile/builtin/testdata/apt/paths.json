@@ -1,0 +1,58 @@
+[
+  {
+    "path": "/debian/pool/main/h/hello/hello_2.10-3_amd64.deb",
+    "class": "immutable"
+  },
+  {
+    "path": "/ubuntu/pool/main/a/apt/apt_2.8.3_amd64.deb",
+    "class": "immutable"
+  },
+  {
+    "path": "/debian/dists/bookworm/main/binary-amd64/by-hash/SHA256/0123456789abcdef",
+    "class": "immutable"
+  },
+  {
+    "path": "/dists/stable/main/i18n/by-hash/SHA256/abcdef0123456789",
+    "class": "immutable"
+  },
+  {
+    "path": "/debian/dists/bookworm/InRelease",
+    "class": "mutable"
+  },
+  {
+    "path": "/debian/dists/bookworm/Release",
+    "class": "mutable"
+  },
+  {
+    "path": "/debian/dists/bookworm/Release.gpg",
+    "class": "mutable"
+  },
+  {
+    "path": "/debian/dists/bookworm/main/binary-amd64/Packages.xz",
+    "class": "mutable"
+  },
+  {
+    "path": "/debian/dists/bookworm/main/source/Sources.gz",
+    "class": "mutable"
+  },
+  {
+    "path": "/debian/dists/bookworm/main/i18n/Translation-en.xz",
+    "class": "mutable"
+  },
+  {
+    "path": "/debian/poolside/main/example.deb",
+    "class": "unknown"
+  },
+  {
+    "path": "/debian/dists-staging/bookworm/InRelease",
+    "class": "unknown"
+  },
+  {
+    "path": "/debian/by-hash/SHA256/0123456789abcdef",
+    "class": "unknown"
+  },
+  {
+    "path": "/debian/README",
+    "class": "unknown"
+  }
+]

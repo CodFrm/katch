@@ -1,17 +1,29 @@
 package cache_svc
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"io"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/smartystreets/goconvey/convey"
 
+	"github.com/CodFrm/katch/internal/cache"
+	"github.com/CodFrm/katch/internal/metrics"
 	"github.com/CodFrm/katch/internal/model/entity/cache_entity"
+	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
+	"github.com/CodFrm/katch/internal/proxy/packageprofile"
+	"github.com/CodFrm/katch/internal/service/proxy_svc"
 )
 
 // TestGet_SecondPullIsServedFromDisk 目标的第一条：两次相同拉取只回源一次，
@@ -339,7 +351,7 @@ func TestGet_UncacheableResponsesArePassThrough(t *testing.T) {
 			convey.So(len(repo.all()), convey.ShouldEqual, 0)
 		})
 
-		convey.Convey("HEAD 不进缓存", func() {
+		convey.Convey("static HEAD 不进缓存", func() {
 			o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Length", "12")
 			})
@@ -415,6 +427,941 @@ func TestGet_OriginFailureIsNotCached(t *testing.T) {
 	})
 }
 
+// TestGet_RewriteDropsStaleValidators 失败与恢复：上游重写同一路径且这次没带
+// validator 时，上一份内容的校验值必须跟着覆盖掉。
+//
+// 留着旧的 ETag，客户端会拿一个对不上的强校验符去做条件请求；上游说「不知道这个
+// 标识」，而我们的命中却回放它，等于替上游背书了一份它从未声明过的事实。
+func TestGet_RewriteDropsStaleValidators(t *testing.T) {
+	convey.Convey("重写内容时上一份的 validator 不能留下", t, func() {
+		checksumHeaders := map[string]string{
+			"X-Checksum-MD5":    "42f7e9ac3c79f7ba5b3a2e81d2d52a92",
+			"X-Checksum-SHA1":   "8f4e3c42b6d9c76e8797c60d345320ef4cf54f39",
+			"X-Checksum-SHA256": "8ea44e1f012d62eeb020cd8be16f9c602ee7ac28e46026d136a29ab80d34f4d2",
+			"X-Checksum-SHA512": "1a2b3c4d5e6f77889900aabbccddeeff00112233445566778899aabbccddeeff" +
+				"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		}
+		var served atomic.Int64
+		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			if served.Add(1) == 1 {
+				w.Header().Set("Etag", `"v1"`)
+				w.Header().Set("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+				for name, value := range checksumHeaders {
+					w.Header().Set(name, value)
+				}
+				_, _ = io.WriteString(w, "v1")
+				return
+			}
+			// 第二份没有 validator 或 checksum：旧的必须被清掉。
+			_, _ = io.WriteString(w, "v2")
+		})
+		svc, repo, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+		ctx := context.Background()
+		// 不在 /pool/ 里，按 TTL 可变（staticUpstream 的不可变模式只有 /pool/）。
+		const key = "/dists/stable/InRelease"
+
+		r, _, err := svc.Get(ctx, target("deb.debian.org", key))
+		convey.So(err, convey.ShouldBeNil)
+		_, _ = io.ReadAll(r)
+		convey.So(r.Close(), convey.ShouldBeNil)
+		_, firstHit := pullWith(t, svc, target("deb.debian.org", key))
+		convey.So(firstHit.Header.Get("Etag"), convey.ShouldEqual, `"v1"`)
+		for name, value := range checksumHeaders {
+			convey.So(firstHit.Header.Get(name), convey.ShouldEqual, value)
+		}
+		first := repo.byKey(key)
+		convey.So(first, convey.ShouldNotBeNil)
+		convey.So(first.ETag, convey.ShouldEqual, `"v1"`)
+		convey.So(first.LastModified, convey.ShouldEqual, "Wed, 21 Oct 2015 07:28:00 GMT")
+
+		// 把这条记录拨到过期，让它必须回源重取。
+		repo.expire(key)
+		r2, _, err := svc.Get(ctx, target("deb.debian.org", key))
+		convey.So(err, convey.ShouldBeNil)
+		body, err := io.ReadAll(r2)
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(r2.Close(), convey.ShouldBeNil)
+		convey.So(string(body), convey.ShouldEqual, "v2")
+		convey.So(o.hits.Load(), convey.ShouldEqual, 2)
+		// 过期重取不留下第二条记录。
+		convey.So(len(repo.all()), convey.ShouldEqual, 1)
+
+		_, secondHit := pullWith(t, svc, target("deb.debian.org", key))
+		convey.So(secondHit.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
+		convey.So(secondHit.Header.Get("Etag"), convey.ShouldBeEmpty)
+		convey.So(secondHit.Header.Get("Last-Modified"), convey.ShouldBeEmpty)
+		for name := range checksumHeaders {
+			convey.So(secondHit.Header.Get(name), convey.ShouldBeEmpty)
+		}
+		// 库里也不能留着上一份的校验值。
+		rewritten := repo.byKey(key)
+		convey.So(rewritten.ETag, convey.ShouldBeEmpty)
+		convey.So(rewritten.LastModified, convey.ShouldBeEmpty)
+		convey.So(rewritten.Digest, convey.ShouldEqual, digestOfString("v2"))
+	})
+}
+
+// TestPut_LeavesValidatorsEmpty 直接写缓存的管理/内部路径没有上游响应头，
+// 落库的 validator 必须为空，命中也不许回放一个从未存在过的校验符。
+func TestPut_LeavesValidatorsEmpty(t *testing.T) {
+	convey.Convey("直接写入的缓存对象没有 validator", t, func() {
+		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Etag", `"should-not-leak"`)
+			_, _ = io.WriteString(w, "origin")
+		})
+		svc, repo, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+		const key = "/pool/manual.deb"
+		convey.So(svc.Put(context.Background(), &PutRequest{
+			UpstreamID: 7, Key: key,
+			Content: strings.NewReader("manual"), ContentType: "text/plain", Immutable: true,
+		}), convey.ShouldBeNil)
+		put := repo.byKey(key)
+		convey.So(put, convey.ShouldNotBeNil)
+		convey.So(put.ETag, convey.ShouldBeEmpty)
+		convey.So(put.LastModified, convey.ShouldBeEmpty)
+
+		_, hitMeta := pullWith(t, svc, target("deb.debian.org", key))
+		convey.So(hitMeta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
+		convey.So(hitMeta.Header.Get("Etag"), convey.ShouldBeEmpty)
+		convey.So(hitMeta.Header.Get("Last-Modified"), convey.ShouldBeEmpty)
+		// 命中由磁盘服务，没有回源。
+		convey.So(o.hits.Load(), convey.ShouldEqual, 0)
+	})
+}
+
+// TestGet_HeadServedFromDisk 持有新鲜完整副本时，普通 HEAD 由本地 200 应答。
+//
+// 「与 GET 相同的元数据」是这条的全部意义：HEAD 是客户端在不下载正文的前提下
+// 核对一份内容的那条路，元数据只要少一个（长度、类型、validator），客户端就会
+// 得出一个与 GET 不同的结论——而它据此决定要不要接着 GET。
+func TestGet_HeadServedFromDisk(t *testing.T) {
+	convey.Convey("新鲜副本的普通 HEAD 本地命中且不发响应体", t, func() {
+		const body = "package bytes"
+		const etag = `"v1"`
+		const lastModified = "Wed, 21 Oct 2015 07:28:00 GMT"
+		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/vnd.debian.binary-package")
+			w.Header().Set("Etag", etag)
+			w.Header().Set("Last-Modified", lastModified)
+			_, _ = io.WriteString(w, body)
+		})
+		const path = "/pool/main/n/nginx.deb"
+		svc, repo, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+		pullWith(t, svc, target("deb.debian.org", path))
+
+		head := target("deb.debian.org", path)
+		head.Method = http.MethodHead
+		got, meta, err := svc.Get(context.Background(), head)
+		convey.So(err, convey.ShouldBeNil)
+		payload, err := io.ReadAll(got)
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(got.Close(), convey.ShouldBeNil)
+		convey.So(string(payload), convey.ShouldBeEmpty)
+		convey.So(meta.StatusCode, convey.ShouldEqual, http.StatusOK)
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
+		convey.So(meta.Header.Get("Content-Type"), convey.ShouldEqual, "application/vnd.debian.binary-package")
+		convey.So(meta.Header.Get("Content-Length"), convey.ShouldEqual, strconv.Itoa(len(body)))
+		convey.So(meta.ContentLength, convey.ShouldEqual, int64(len(body)))
+		convey.So(meta.Header.Get("Etag"), convey.ShouldEqual, etag)
+		convey.So(meta.Header.Get("Last-Modified"), convey.ShouldEqual, lastModified)
+		// 本地答完，没有回源。
+		convey.So(o.hits.Load(), convey.ShouldEqual, 1)
+		// HEAD 不该产生或改写任何记录。
+		convey.So(len(repo.all()), convey.ShouldEqual, 1)
+	})
+}
+
+// TestGet_HeadWithoutCopyPassesThrough 验证没有可用副本时 static HEAD 继续透传，
+// 也不写缓存。
+//
+// HEAD 响应本身没有响应体，把它「下」进缓存只会留下一条零字节、却声称自己是一份
+// 完整对象的记录。registry manifest 的冷 HEAD 由专门分支发 canonical GET 填充，
+// 不改变这里守住的 generic/static HEAD 透传行为。
+func TestGet_HeadWithoutCopyPassesThrough(t *testing.T) {
+	convey.Convey("无副本的 static HEAD 透传且不创建记录", t, func() {
+		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Length", "12")
+		})
+		svc, repo, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+		head := target("deb.debian.org", "/pool/main/n/nginx.deb")
+		head.Method = http.MethodHead
+		got, meta, err := svc.Get(context.Background(), head)
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(got.Close(), convey.ShouldBeNil)
+		convey.So(meta.StatusCode, convey.ShouldEqual, http.StatusOK)
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldNotEqual, cacheStatusHit)
+		convey.So(o.hits.Load(), convey.ShouldEqual, 1)
+		convey.So(len(repo.all()), convey.ShouldEqual, 0)
+	})
+}
+
+// TestGet_IfNoneMatchIsEvaluatedLocally If-None-Match 的弱比较、逗号列表与星号。
+//
+// 匹配返回 304、不匹配返回缓存的 200，两条都不能回源：回源一次就抵消了条件
+// 请求省下来的那次传输，而 304 的意义正是「不必再传一遍」。
+func TestGet_IfNoneMatchIsEvaluatedLocally(t *testing.T) {
+	convey.Convey("If-None-Match 在本地求值", t, func() {
+		const body = "package bytes"
+		const etag = `"v1"`
+		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			w.Header().Set("Etag", etag)
+			_, _ = io.WriteString(w, body)
+		})
+		const path = "/pool/main/n/nginx.deb"
+		svc, _, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+		pullWith(t, svc, target("deb.debian.org", path))
+
+		cases := []struct {
+			name   string
+			value  string
+			status int
+			body   string
+			method string
+		}{
+			{"强比较命中", `"v1"`, http.StatusNotModified, "", ""},
+			{"弱 tag 命中", `W/"v1"`, http.StatusNotModified, "", ""},
+			{"列表里任一项命中", `"a", W/"v1", "b"`, http.StatusNotModified, "", ""},
+			{"星号命中", "*", http.StatusNotModified, "", ""},
+			{"均不匹配返回缓存的 200", `"a", "b"`, http.StatusOK, body, ""},
+			{"语法无效按未提供处理", "v1", http.StatusOK, body, ""},
+			{"HEAD 同样按弱比较求值", `W/"v1"`, http.StatusNotModified, "", http.MethodHead},
+		}
+		for _, c := range cases {
+			convey.Convey(c.name, func() {
+				tg := target("deb.debian.org", path)
+				if c.method != "" {
+					tg.Method = c.method
+				}
+				tg.Header.Set("If-None-Match", c.value)
+				got, meta, err := svc.Get(context.Background(), tg)
+				convey.So(err, convey.ShouldBeNil)
+				payload, err := io.ReadAll(got)
+				convey.So(err, convey.ShouldBeNil)
+				convey.So(got.Close(), convey.ShouldBeNil)
+				convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
+				convey.So(meta.StatusCode, convey.ShouldEqual, c.status)
+				convey.So(string(payload), convey.ShouldEqual, c.body)
+				if c.status == http.StatusNotModified {
+					// 304 不带实体，也就不声明实体长度与类型。
+					convey.So(meta.Header.Get("Content-Length"), convey.ShouldBeEmpty)
+					convey.So(meta.Header.Get("Content-Type"), convey.ShouldBeEmpty)
+				}
+			})
+		}
+		// 所有条件都由本地答完，一次都没有回源。
+		convey.Convey("条件请求不回源", func() {
+			convey.So(o.hits.Load(), convey.ShouldEqual, 1)
+		})
+	})
+}
+
+// TestGet_IfModifiedSinceOnlyWithoutIfNoneMatch If-Modified-Since 只在没有
+// If-None-Match 时求值，且资源未晚于请求时间才返回 304。
+func TestGet_IfModifiedSinceOnlyWithoutIfNoneMatch(t *testing.T) {
+	convey.Convey("If-Modified-Since 的优先级与日期比较", t, func() {
+		const body = "package bytes"
+		const etag = `"v1"`
+		const lastModified = "Wed, 21 Oct 2015 07:28:00 GMT"
+		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			w.Header().Set("Etag", etag)
+			w.Header().Set("Last-Modified", lastModified)
+			_, _ = io.WriteString(w, body)
+		})
+		const path = "/pool/main/n/nginx.deb"
+		svc, _, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+		pullWith(t, svc, target("deb.debian.org", path))
+
+		cases := []struct {
+			name   string
+			inm    string
+			ims    string
+			status int
+			body   string
+		}{
+			{"资源时间等于请求时间", "", lastModified, http.StatusNotModified, ""},
+			{"资源早于请求时间", "", "Thu, 22 Oct 2015 07:28:00 GMT", http.StatusNotModified, ""},
+			{"资源较新", "", "Tue, 20 Oct 2015 07:28:00 GMT", http.StatusOK, body},
+			{"请求日期无效按未提供处理", "", "not a date", http.StatusOK, body},
+			{"If-None-Match 不匹配压过 If-Modified-Since", `"other"`, lastModified, http.StatusOK, body},
+			{"If-None-Match 命中压过日期", etag, "Tue, 20 Oct 2015 07:28:00 GMT", http.StatusNotModified, ""},
+		}
+		for _, c := range cases {
+			convey.Convey(c.name, func() {
+				tg := target("deb.debian.org", path)
+				if c.inm != "" {
+					tg.Header.Set("If-None-Match", c.inm)
+				}
+				if c.ims != "" {
+					tg.Header.Set("If-Modified-Since", c.ims)
+				}
+				got, meta, err := svc.Get(context.Background(), tg)
+				convey.So(err, convey.ShouldBeNil)
+				payload, err := io.ReadAll(got)
+				convey.So(err, convey.ShouldBeNil)
+				convey.So(got.Close(), convey.ShouldBeNil)
+				convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
+				convey.So(meta.StatusCode, convey.ShouldEqual, c.status)
+				convey.So(string(payload), convey.ShouldEqual, c.body)
+				if c.status == http.StatusNotModified {
+					convey.So(meta.Header.Get("Content-Length"), convey.ShouldBeEmpty)
+				}
+			})
+		}
+		convey.Convey("条件请求不回源", func() {
+			convey.So(o.hits.Load(), convey.ShouldEqual, 1)
+		})
+	})
+}
+
+// TestGet_IfModifiedSinceNeedsStoredDate 有效条件但副本没有可解析的 Last-Modified
+// 时继续透传，而不是猜一个结论。
+func TestGet_IfModifiedSinceNeedsStoredDate(t *testing.T) {
+	convey.Convey("缺 Last-Modified 的副本遇到有效 If-Modified-Since 时回源", t, func() {
+		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = io.WriteString(w, "body")
+		})
+		const path = "/pool/main/n/nginx.deb"
+		svc, _, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+		pullWith(t, svc, target("deb.debian.org", path))
+
+		tg := target("deb.debian.org", path)
+		tg.Header.Set("If-Modified-Since", "Wed, 21 Oct 2015 07:28:00 GMT")
+		got, meta, err := svc.Get(context.Background(), tg)
+		convey.So(err, convey.ShouldBeNil)
+		_, _ = io.ReadAll(got)
+		convey.So(got.Close(), convey.ShouldBeNil)
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldNotEqual, cacheStatusHit)
+		convey.So(o.hits.Load(), convey.ShouldEqual, 2)
+	})
+}
+
+// TestGet_ConditionalWithoutValidatorPassesThrough 有效条件存在但副本缺少对应
+// validator 时，判断交回上游——历史记录因此不会得到一个推测出来的 304。
+func TestGet_ConditionalWithoutValidatorPassesThrough(t *testing.T) {
+	convey.Convey("缺 validator 的条件请求透传", t, func() {
+		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = io.WriteString(w, "body")
+		})
+		const path = "/pool/main/n/nginx.deb"
+		svc, repo, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+		pullWith(t, svc, target("deb.debian.org", path))
+
+		get := target("deb.debian.org", path)
+		get.Header.Set("If-None-Match", `"v1"`)
+		body, meta, err := svc.Get(context.Background(), get)
+		convey.So(err, convey.ShouldBeNil)
+		_, _ = io.ReadAll(body)
+		convey.So(body.Close(), convey.ShouldBeNil)
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldNotEqual, cacheStatusHit)
+		convey.So(o.hits.Load(), convey.ShouldEqual, 2)
+
+		head := target("deb.debian.org", path)
+		head.Method = http.MethodHead
+		head.Header.Set("If-None-Match", `"v1"`)
+		body, _, err = svc.Get(context.Background(), head)
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(body.Close(), convey.ShouldBeNil)
+		convey.So(o.hits.Load(), convey.ShouldEqual, 3)
+
+		// 透传不写缓存：记录的 validator 仍是空，数量也没有变。
+		convey.So(len(repo.all()), convey.ShouldEqual, 1)
+		convey.So(repo.byKey(path).ETag, convey.ShouldBeEmpty)
+	})
+}
+
+// TestGet_NonWritablePassthroughOverridesUpstreamHit 验证本跳直接回源时，不能继承
+// 上游 katch 的缓存归因。
+func TestGet_NonWritablePassthroughOverridesUpstreamHit(t *testing.T) {
+	convey.Convey("HEAD 与条件请求的上游 HIT 必须覆盖为本跳 MISS", t, func() {
+		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set(cacheStatusHeader, cacheStatusHit)
+			_, _ = io.WriteString(w, "body")
+		})
+		svc, repo, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+
+		head := target("deb.debian.org", "/pool/head.deb")
+		head.Method = http.MethodHead
+		body, meta, err := svc.Get(context.Background(), head)
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(body.Close(), convey.ShouldBeNil)
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusMiss)
+		convey.So(meta.Header.Get(metrics.MissHeader), convey.ShouldEqual, string(metrics.MissFirst))
+
+		conditional := target("deb.debian.org", "/pool/conditional.deb")
+		conditional.Header.Set("If-None-Match", `"v1"`)
+		body, meta, err = svc.Get(context.Background(), conditional)
+		convey.So(err, convey.ShouldBeNil)
+		_, _ = io.ReadAll(body)
+		convey.So(body.Close(), convey.ShouldBeNil)
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusMiss)
+		convey.So(meta.Header.Get(metrics.MissHeader), convey.ShouldEqual, string(metrics.MissFirst))
+		convey.So(len(repo.all()), convey.ShouldEqual, 0)
+		convey.So(o.hits.Load(), convey.ShouldEqual, 2)
+	})
+}
+
+// TestGet_IfRangePassesThrough If-Range 与 Range 一样完整透传，且不写对象缓存。
+func TestGet_IfRangePassesThrough(t *testing.T) {
+	convey.Convey("带 If-Range 的请求不进缓存", t, func() {
+		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = io.WriteString(w, "full body")
+		})
+		svc, repo, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+		tg := target("deb.debian.org", "/pool/part.deb")
+		tg.Header.Set("If-Range", `"v1"`)
+		body, meta, err := svc.Get(context.Background(), tg)
+		convey.So(err, convey.ShouldBeNil)
+		got, _ := io.ReadAll(body)
+		convey.So(body.Close(), convey.ShouldBeNil)
+		convey.So(string(got), convey.ShouldEqual, "full body")
+		convey.So(meta.StatusCode, convey.ShouldEqual, http.StatusOK)
+		convey.So(len(repo.all()), convey.ShouldEqual, 0)
+	})
+}
+
+// TestGet_RangeAndIfRangePassThroughMarkMiss 带 Range 或 If-Range 的请求完整透传，
+// 但仍是真实回源：X-Katch-Cache 必须标成 MISS，手上有新鲜完整副本时也一样。
+//
+// 客户端只看得到「没有 HIT」时无法判定这一次回了源，运维验证与指标归因都少一档；
+// 只标 MISS 而不读不写那份副本，才能让同一 URL 的普通 GET 继续命中。
+func TestGet_RangeAndIfRangePassThroughMarkMiss(t *testing.T) {
+	const payload = "hello world"
+	origin := func() *originStub {
+		return newOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			if r.Header.Get("Range") != "" {
+				w.Header().Set("Content-Range", "bytes 0-4/11")
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = io.WriteString(w, "hello")
+				return
+			}
+			_, _ = io.WriteString(w, payload)
+		})
+	}
+
+	convey.Convey("上游 HIT 不能冒充本地命中", t, func() {
+		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set(cacheStatusHeader, cacheStatusHit)
+			_, _ = io.WriteString(w, payload)
+		})
+		svc, _, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+		tg := target("deb.debian.org", "/pool/upstream-hit.deb")
+		tg.Header.Set("Range", "bytes=0-4")
+
+		body, meta, err := svc.Get(context.Background(), tg)
+		convey.So(err, convey.ShouldBeNil)
+		_, _ = io.ReadAll(body)
+		convey.So(body.Close(), convey.ShouldBeNil)
+		// 这台 katch 确实回了源；上游自己的缓存状态不能改变本跳归因。
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusMiss)
+		convey.So(o.hits.Load(), convey.ShouldEqual, 1)
+	})
+
+	convey.Convey("没有副本时 Range 与 If-Range 就标 MISS", t, func() {
+		o := origin()
+		svc, repo, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+		const path = "/pool/part.deb"
+
+		rangeTg := target("deb.debian.org", path)
+		rangeTg.Header.Set("Range", "bytes=0-4")
+		body, meta, err := svc.Get(context.Background(), rangeTg)
+		convey.So(err, convey.ShouldBeNil)
+		got, _ := io.ReadAll(body)
+		convey.So(body.Close(), convey.ShouldBeNil)
+		convey.So(string(got), convey.ShouldEqual, "hello")
+		convey.So(meta.StatusCode, convey.ShouldEqual, http.StatusPartialContent)
+		convey.So(meta.Header.Get("Content-Range"), convey.ShouldEqual, "bytes 0-4/11")
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusMiss)
+
+		ifRangeTg := target("deb.debian.org", path)
+		ifRangeTg.Header.Set("If-Range", `"v1"`)
+		body, meta, err = svc.Get(context.Background(), ifRangeTg)
+		convey.So(err, convey.ShouldBeNil)
+		got, _ = io.ReadAll(body)
+		convey.So(body.Close(), convey.ShouldBeNil)
+		convey.So(string(got), convey.ShouldEqual, payload)
+		convey.So(meta.StatusCode, convey.ShouldEqual, http.StatusOK)
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusMiss)
+
+		// 两次都越过对象缓存：没有留下任何记录。
+		convey.So(len(repo.all()), convey.ShouldEqual, 0)
+		convey.So(o.hits.Load(), convey.ShouldEqual, 2)
+	})
+
+	convey.Convey("有新鲜完整副本时 Range 本地命中且不动副本", t, func() {
+		o := origin()
+		svc, repo, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+		const path = "/pool/part.deb"
+
+		// 先落一份新鲜完整副本，后续范围选择只读取这份完整内容。
+		_, first := pullWith(t, svc, target("deb.debian.org", path))
+		convey.So(first.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusMiss)
+		row := repo.byKey(path)
+		convey.So(row, convey.ShouldNotBeNil)
+
+		// 没有 Range 时 If-Range 没有语义，按普通完整缓存命中处理。
+		ifRangeTg := target("deb.debian.org", path)
+		ifRangeTg.Header.Set("If-Range", `"v1"`)
+		body, meta, err := svc.Get(context.Background(), ifRangeTg)
+		convey.So(err, convey.ShouldBeNil)
+		got, _ := io.ReadAll(body)
+		convey.So(body.Close(), convey.ShouldBeNil)
+		convey.So(string(got), convey.ShouldEqual, payload)
+		convey.So(meta.StatusCode, convey.ShouldEqual, http.StatusOK)
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
+
+		rangeTg := target("deb.debian.org", path)
+		rangeTg.Header.Set("Range", "bytes=0-4")
+		body, meta, err = svc.Get(context.Background(), rangeTg)
+		convey.So(err, convey.ShouldBeNil)
+		got, _ = io.ReadAll(body)
+		convey.So(body.Close(), convey.ShouldBeNil)
+		convey.So(string(got), convey.ShouldEqual, "hello")
+		convey.So(meta.StatusCode, convey.ShouldEqual, http.StatusPartialContent)
+		convey.So(meta.Header.Get("Content-Range"), convey.ShouldEqual, "bytes 0-4/11")
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
+
+		convey.So(len(repo.all()), convey.ShouldEqual, 1)
+		convey.So(repo.byKey(path).Digest, convey.ShouldEqual, row.Digest)
+		_, hit := pullWith(t, svc, target("deb.debian.org", path))
+		convey.So(hit.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
+		convey.So(o.hits.Load(), convey.ShouldEqual, 1)
+	})
+}
+
+// TestGet_ConditionalOnAbsentStaleOrBrokenCopyPassesThrough 条件请求遇到没有可用
+// 副本的三种形态时一律透传：无副本、已过期、磁盘上的字节已损坏。
+//
+// 本地拿不出一份可信的副本时硬答一个 304，就是告诉客户端「你手上那份就是最新的」——
+// 而这句话没有任何根据。
+func TestGet_ConditionalOnAbsentStaleOrBrokenCopyPassesThrough(t *testing.T) {
+	convey.Convey("条件请求在无可用副本时透传", t, func() {
+		const etag = `"v1"`
+		origin := func() *originStub {
+			return newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/plain")
+				w.Header().Set("Etag", etag)
+				_, _ = io.WriteString(w, "body")
+			})
+		}
+		convey.Convey("无副本", func() {
+			o := origin()
+			svc, repo, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+			tg := target("deb.debian.org", "/pool/main/n/nginx.deb")
+			tg.Header.Set("If-None-Match", etag)
+			got, meta, err := svc.Get(context.Background(), tg)
+			convey.So(err, convey.ShouldBeNil)
+			_, _ = io.ReadAll(got)
+			convey.So(got.Close(), convey.ShouldBeNil)
+			convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldNotEqual, cacheStatusHit)
+			convey.So(o.hits.Load(), convey.ShouldEqual, 1)
+			convey.So(len(repo.all()), convey.ShouldEqual, 0)
+		})
+
+		convey.Convey("已过期", func() {
+			o := origin()
+			svc, repo, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+			// 不在 /pool/ 下，按 TTL 可变。
+			const key = "/dists/stable/InRelease"
+			pullWith(t, svc, target("deb.debian.org", key))
+			repo.expire(key)
+			tg := target("deb.debian.org", key)
+			tg.Header.Set("If-None-Match", etag)
+			got, meta, err := svc.Get(context.Background(), tg)
+			convey.So(err, convey.ShouldBeNil)
+			_, _ = io.ReadAll(got)
+			convey.So(got.Close(), convey.ShouldBeNil)
+			convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldNotEqual, cacheStatusHit)
+			convey.So(o.hits.Load(), convey.ShouldEqual, 2)
+		})
+
+		convey.Convey("副本损坏", func() {
+			o := origin()
+			svc, repo, store := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+			const key = "/pool/main/n/broken.deb"
+			pullWith(t, svc, target("deb.debian.org", key))
+			corruptBlob(t, store, repo, key)
+			tg := target("deb.debian.org", key)
+			tg.Header.Set("If-None-Match", etag)
+			got, meta, err := svc.Get(context.Background(), tg)
+			convey.So(err, convey.ShouldBeNil)
+			_, _ = io.ReadAll(got)
+			convey.So(got.Close(), convey.ShouldBeNil)
+			convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldNotEqual, cacheStatusHit)
+			convey.So(o.hits.Load(), convey.ShouldEqual, 2)
+			// 坏记录已被丢弃，不会再冒充一份可用的副本。
+			convey.So(len(repo.all()), convey.ShouldEqual, 0)
+		})
+	})
+}
+
+func TestGet_ConcurrentTransformedFillsShareGenerationKey(t *testing.T) {
+	release := make(chan struct{})
+	o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{}`)
+	})
+	profile := testProfile{
+		description:    packageprofile.Description{Profile: upstream_entity.PackageProfileNPM, Name: "test"},
+		representation: packageprofile.Representation{Class: packageprofile.ClassMutable, Transform: true, MediaTypes: []string{"application/json"}},
+		transform: func(_ context.Context, in packageprofile.TransformRequest) (*packageprofile.TransformResult, error) {
+			return &packageprofile.TransformResult{Body: in.Body, ContentType: "application/json"}, nil
+		},
+	}
+	up := staticUpstream("registry.example.com")
+	up.PackageProfile = upstream_entity.PackageProfileNPM
+	svc, _, _ := setupSvc(t, o, up, transformingOptions(t, profile, 23))
+
+	const clients = 8
+	var started sync.WaitGroup
+	started.Add(clients)
+	errs := make(chan error, clients)
+	for range clients {
+		go func() {
+			started.Done()
+			body, _, err := svc.Get(context.Background(), target(up.Host, "/metadata"))
+			if err == nil {
+				_, err = io.ReadAll(body)
+				_ = body.Close()
+			}
+			errs <- err
+		}()
+	}
+	started.Wait()
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+	for range clients {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := o.hits.Load(); got != 1 {
+		t.Fatalf("canonical origin fills = %d, want 1", got)
+	}
+}
+
+func TestGet_TransformedMetadataUsesCanonicalIdentityAndKatchHeaders(t *testing.T) {
+	convey.Convey("transformable metadata uses one canonical identity representation", t, func() {
+		var gotMethod string
+		var gotHeader http.Header
+		o := newOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+			gotMethod = r.Method
+			gotHeader = r.Header.Clone()
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.Header().Set("Etag", `"origin"`)
+			w.Header().Set("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+			_, _ = io.WriteString(w, `{"url":"origin"}`)
+		})
+		profile := testProfile{
+			description: packageprofile.Description{Profile: upstream_entity.PackageProfileNPM, Name: "test"},
+			representation: packageprofile.Representation{Class: packageprofile.ClassMutable, Transform: true,
+				MediaTypes: []string{"application/json"}},
+			transform: func(_ context.Context, in packageprofile.TransformRequest) (*packageprofile.TransformResult, error) {
+				return &packageprofile.TransformResult{Body: bytes.ToUpper(in.Body), ContentType: "application/json"}, nil
+			},
+		}
+		up := staticUpstream("registry.example.com")
+		up.PackageProfile = upstream_entity.PackageProfileNPM
+		svc, repo, _ := setupSvc(t, o, up, transformingOptions(t, profile, 17))
+
+		tg := target(up.Host, "/metadata")
+		tg.Method = http.MethodHead
+		tg.Header.Set("Range", "bytes=0-3")
+		tg.Header.Set("If-None-Match", `"client-copy"`)
+		tg.Header.Set("Accept-Encoding", "gzip")
+		body, meta, err := svc.Get(context.Background(), tg)
+		convey.So(err, convey.ShouldBeNil)
+		payload, err := io.ReadAll(body)
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(body.Close(), convey.ShouldBeNil)
+		convey.So(string(payload), convey.ShouldBeEmpty)
+		convey.So(meta.StatusCode, convey.ShouldEqual, http.StatusOK)
+		convey.So(gotMethod, convey.ShouldEqual, http.MethodGet)
+		convey.So(gotHeader.Get("Accept-Encoding"), convey.ShouldEqual, "identity")
+		convey.So(gotHeader.Get("Range"), convey.ShouldBeEmpty)
+		convey.So(gotHeader.Get("If-None-Match"), convey.ShouldBeEmpty)
+
+		transformed := `{"URL":"ORIGIN"}`
+		sum := sha256.Sum256([]byte(transformed))
+		wantETag := `"sha256:` + hex.EncodeToString(sum[:]) + `"`
+		convey.So(meta.Header.Get("Etag"), convey.ShouldEqual, wantETag)
+		convey.So(meta.Header.Get("Last-Modified"), convey.ShouldBeEmpty)
+		convey.So(meta.Header.Get("Content-Encoding"), convey.ShouldBeEmpty)
+		convey.So(meta.Header.Get("Content-Length"), convey.ShouldEqual, strconv.Itoa(len(transformed)))
+		convey.So(meta.Header.Get("Content-Type"), convey.ShouldEqual, "application/json")
+		convey.So(len(repo.all()), convey.ShouldEqual, 1)
+		convey.So(repo.all()[0].Key, convey.ShouldContainSubstring, "generation=17")
+
+		got, hit := pullWith(t, svc, target(up.Host, "/metadata"))
+		convey.So(got, convey.ShouldEqual, transformed)
+		convey.So(hit.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusHit)
+		convey.So(o.hits.Load(), convey.ShouldEqual, int64(1))
+	})
+}
+
+func TestGet_TransformedMetadataRejectsInvalidOriginRepresentations(t *testing.T) {
+	cases := []struct {
+		name         string
+		contentType  string
+		encoding     string
+		body         []byte
+		transformErr error
+	}{
+		{name: "oversized", contentType: "application/json", body: bytes.Repeat([]byte("x"), maxTransformBytes+1)},
+		{name: "wrong media", contentType: "text/plain", body: []byte(`{}`)},
+		{name: "encoded", contentType: "application/json", encoding: "gzip", body: []byte(`{}`)},
+		{name: "malformed", contentType: "application/json", body: []byte(`{`), transformErr: packageprofile.ErrInvalidMetadata},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var transforms atomic.Int64
+			o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", tc.contentType)
+				if tc.encoding != "" {
+					w.Header().Set("Content-Encoding", tc.encoding)
+				}
+				_, _ = w.Write(tc.body)
+			})
+			profile := testProfile{
+				description: packageprofile.Description{Profile: upstream_entity.PackageProfileNPM, Name: "test"},
+				representation: packageprofile.Representation{Class: packageprofile.ClassMutable, Transform: true,
+					MediaTypes: []string{"application/json"}},
+				transform: func(_ context.Context, in packageprofile.TransformRequest) (*packageprofile.TransformResult, error) {
+					transforms.Add(1)
+					if tc.transformErr != nil {
+						return nil, tc.transformErr
+					}
+					return &packageprofile.TransformResult{Body: in.Body, ContentType: "application/json"}, nil
+				},
+			}
+			up := staticUpstream("registry.example.com")
+			up.PackageProfile = upstream_entity.PackageProfileNPM
+			svc, repo, _ := setupSvc(t, o, up, transformingOptions(t, profile, 1))
+			body, meta, err := svc.Get(context.Background(), target(up.Host, "/metadata"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer body.Close()
+			if meta.StatusCode != http.StatusBadGateway {
+				t.Fatalf("status = %d", meta.StatusCode)
+			}
+			if len(repo.all()) != 0 {
+				t.Fatal("invalid metadata was cached")
+			}
+			if tc.name != "malformed" && transforms.Load() != 0 {
+				t.Fatal("transform ran before admission")
+			}
+		})
+	}
+}
+
+func TestGet_VaryAdmissionAndCanonicalization(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		vary       string
+		wantCached bool
+		wantVary   string
+	}{
+		{name: "declared plus encoding", vary: "Accept-Encoding, Accept", wantCached: true, wantVary: "Accept"},
+		{name: "undeclared", vary: "User-Agent"},
+		{name: "wildcard", vary: "*"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/octet-stream")
+				w.Header().Set("Vary", tc.vary)
+				_, _ = io.WriteString(w, "artifact")
+			})
+			profile := testProfile{
+				description:    packageprofile.Description{Profile: upstream_entity.PackageProfileNPM, Name: "test"},
+				representation: packageprofile.Representation{Class: packageprofile.ClassImmutable, Variants: []string{"Accept"}},
+				transform: func(context.Context, packageprofile.TransformRequest) (*packageprofile.TransformResult, error) {
+					return nil, errors.New("unexpected")
+				},
+			}
+			up := staticUpstream("files.example.com")
+			up.PackageProfile = upstream_entity.PackageProfileNPM
+			svc, repo, _ := setupSvc(t, o, up, transformingOptions(t, profile, 1))
+			tg := target(up.Host, "/artifact")
+			tg.Header.Set("Accept", "application/octet-stream")
+			_, first := pullWith(t, svc, tg)
+			_, second := pullWith(t, svc, tg)
+			if tc.wantCached {
+				if o.hits.Load() != 1 || len(repo.all()) != 1 {
+					t.Fatalf("hits=%d rows=%d", o.hits.Load(), len(repo.all()))
+				}
+				if second.Header.Get("Vary") != tc.wantVary {
+					t.Fatalf("Vary = %q", second.Header.Get("Vary"))
+				}
+				if first.Header.Get("Vary") != tc.wantVary {
+					t.Fatalf("miss Vary = %q", first.Header.Get("Vary"))
+				}
+			} else if o.hits.Load() != 2 || len(repo.all()) != 0 {
+				t.Fatalf("uncacheable response: hits=%d rows=%d", o.hits.Load(), len(repo.all()))
+			}
+		})
+	}
+}
+
+func TestGet_FreshnessAgeAndSafeHeaderReplay(t *testing.T) {
+	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	clock := now
+	o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Cache-Control", "public, max-age=30")
+		w.Header().Set("Date", now.Add(-10*time.Second).Format(http.TimeFormat))
+		w.Header().Set("Age", "5")
+		w.Header().Set("Expires", now.Add(20*time.Second).Format(http.TimeFormat))
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Disposition", `attachment; filename="pkg.tgz"`)
+		w.Header().Set("Docker-Content-Digest", "sha256:origin")
+		w.Header().Set("X-Origin-Secret", "do-not-store")
+		w.Header().Set("Set-Cookie", "session=secret")
+		w.Header().Set("Ratelimit-Remaining", "1")
+		_, _ = io.WriteString(w, "artifact")
+	})
+	profile := testProfile{
+		description:    packageprofile.Description{Profile: upstream_entity.PackageProfileNPM, Name: "test"},
+		representation: packageprofile.Representation{Class: packageprofile.ClassMutable},
+		transform: func(context.Context, packageprofile.TransformRequest) (*packageprofile.TransformResult, error) {
+			return nil, errors.New("unexpected")
+		},
+	}
+	up := staticUpstream("files.example.com")
+	up.PackageProfile = upstream_entity.PackageProfileNPM
+	up.MutableTTLSeconds = 60
+	opt := transformingOptions(t, profile, 1)
+	opt.Now = func() time.Time { return clock }
+	svc, repo, _ := setupSvc(t, o, up, opt)
+	pullWith(t, svc, target(up.Host, "/artifact"))
+	row := repo.byKey("/artifact")
+	if row == nil {
+		t.Fatal("cache row missing")
+	}
+	if row.ExpiresAt != now.Unix()+20 {
+		t.Fatalf("expires_at = %d", row.ExpiresAt)
+	}
+
+	clock = clock.Add(5 * time.Second)
+	_, hit := pullWith(t, svc, target(up.Host, "/artifact"))
+	if hit.Header.Get("Age") != "15" {
+		t.Fatalf("Age = %q", hit.Header.Get("Age"))
+	}
+	for name, want := range map[string]string{
+		"Cache-Control": "public, max-age=30", "Date": now.Add(-10 * time.Second).Format(http.TimeFormat),
+		"Expires": now.Add(20 * time.Second).Format(http.TimeFormat), "Accept-Ranges": "bytes",
+		"Content-Disposition": `attachment; filename="pkg.tgz"`, "Docker-Content-Digest": "sha256:origin",
+	} {
+		if got := hit.Header.Get(name); got != want {
+			t.Fatalf("%s = %q, want %q", name, got, want)
+		}
+	}
+	for _, name := range []string{"X-Origin-Secret", "Set-Cookie", "Ratelimit-Remaining", "Content-Encoding"} {
+		if got := hit.Header.Get(name); got != "" {
+			t.Fatalf("unsafe %s replayed as %q", name, got)
+		}
+	}
+}
+
+func TestGet_MustRevalidateAllowsFreshReuseAndRejectsStale(t *testing.T) {
+	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	clock := now
+	var o *originStub
+	o = newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Cache-Control", "public, max-age=60, must-revalidate")
+		w.Header().Set("Date", now.Format(http.TimeFormat))
+		w.Header().Set("Age", "10")
+		_, _ = io.WriteString(w, "body-"+strconv.FormatInt(o.hits.Load(), 10))
+	})
+	opt := Options{Now: func() time.Time { return clock }}
+	svc, repo, _ := setupSvc(t, o, staticUpstream("files.example.com"), opt)
+	tg := target("files.example.com", "/service-index.json")
+
+	first, _ := pullWith(t, svc, tg)
+	clock = clock.Add(49 * time.Second)
+	second, hit := pullWith(t, svc, tg)
+	if first != "body-1" || second != first {
+		t.Fatalf("fresh bodies = %q, %q", first, second)
+	}
+	if got := o.hits.Load(); got != 1 {
+		t.Fatalf("fresh origin hits = %d, want 1", got)
+	}
+	if got := hit.Header.Get("Cache-Control"); got != "public, max-age=60, must-revalidate" {
+		t.Fatalf("Cache-Control = %q", got)
+	}
+	if row := repo.byKey("/service-index.json"); row == nil || row.RequiresRevalidation {
+		t.Fatalf("fresh must-revalidate row = %+v", row)
+	}
+
+	clock = clock.Add(time.Second)
+	stale, _ := pullWith(t, svc, tg)
+	if stale != "body-2" {
+		t.Fatalf("stale response body = %q, want revalidated body", stale)
+	}
+	if got := o.hits.Load(); got != 2 {
+		t.Fatalf("stale origin hits = %d, want 2", got)
+	}
+}
+
+func TestGet_NoCacheStillRevalidatesEveryReuse(t *testing.T) {
+	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Cache-Control", "public, max-age=60, no-cache")
+		w.Header().Set("Date", now.Format(http.TimeFormat))
+		_, _ = io.WriteString(w, "body")
+	})
+	svc, repo, _ := setupSvc(t, o, staticUpstream("files.example.com"), Options{
+		Now: func() time.Time { return now },
+	})
+	tg := target("files.example.com", "/service-index.json")
+
+	pullWith(t, svc, tg)
+	pullWith(t, svc, tg)
+	pullWith(t, svc, tg)
+	if got := o.hits.Load(); got != 3 {
+		t.Fatalf("origin hits = %d, want 3", got)
+	}
+	if row := repo.byKey("/service-index.json"); row == nil || !row.RequiresRevalidation {
+		t.Fatalf("no-cache row = %+v", row)
+	}
+}
+
+func TestGet_CacheControlStoragePolicyAndAgeOverflow(t *testing.T) {
+	for _, directive := range []string{"no-store", "private"} {
+		t.Run(directive, func(t *testing.T) {
+			o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Cache-Control", directive)
+				_, _ = io.WriteString(w, "body")
+			})
+			svc, repo, _ := setupSvc(t, o, staticUpstream("files.example.com"), Options{})
+			pullWith(t, svc, target("files.example.com", "/x"))
+			pullWith(t, svc, target("files.example.com", "/x"))
+			if len(repo.all()) != 0 || o.hits.Load() != 2 {
+				t.Fatalf("rows=%d hits=%d", len(repo.all()), o.hits.Load())
+			}
+		})
+	}
+	t.Run("origin age overflow is stale", func(t *testing.T) {
+		o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Cache-Control", "public, max-age=60")
+			w.Header().Set("Age", strconv.FormatInt(math.MaxInt64, 10))
+			_, _ = io.WriteString(w, "body")
+		})
+		svc, repo, _ := setupSvc(t, o, staticUpstream("files.example.com"), Options{})
+		pullWith(t, svc, target("files.example.com", "/x"))
+		pullWith(t, svc, target("files.example.com", "/x"))
+		if len(repo.all()) != 1 || o.hits.Load() != 2 {
+			t.Fatalf("rows=%d hits=%d", len(repo.all()), o.hits.Load())
+		}
+	})
+}
+
 func waitForKey(repo *fakeRepo, key string, timeout time.Duration) *cache_entity.CacheObject {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -424,4 +1371,142 @@ func waitForKey(repo *fakeRepo, key string, timeout time.Duration) *cache_entity
 		time.Sleep(10 * time.Millisecond)
 	}
 	return nil
+}
+
+// TestGet_ReaderNeverSeesEOFWhileFinishedFlightIsAttachable 读者拿到 EOF 之前，这一趟下载必须
+// 已经从合并表里摘掉。
+//
+// 以前 pump 先 finish 再 forget：两步之间，一个刚判定「手上那份过期了、要续期」的请求会搭上
+// 这趟已经下完的旧 flight，attach 看到 done 就拿旧副本答成 HIT——过期副本没经上游确认就发了
+// 出去。满载的 CI 上它表现为「上游 503 时应答 200」「新记录没写进去却拿旧副本切片」。
+// 用例持住合并表的锁：旧次序下读者照样读到 EOF、flight 却还挂在表上；新次序下 forget 在前，
+// 锁放开之前读者拿不到 EOF。
+func TestGet_ReaderNeverSeesEOFWhileFinishedFlightIsAttachable(t *testing.T) {
+	release := make(chan struct{})
+	o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "5")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-release
+		_, _ = io.WriteString(w, "index")
+	})
+	svc, _, _ := setupSvc(t, o, staticUpstream("deb.debian.org"), Options{})
+	cs := svc.(*cacheSvc)
+
+	body, _, err := svc.Get(context.Background(), target("deb.debian.org", "/dists/stable/InRelease"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs.mu.Lock()
+	close(release)
+	read := make(chan error, 1)
+	go func() {
+		_, err := io.ReadAll(body)
+		read <- err
+	}()
+	select {
+	case err := <-read:
+		attachable := len(cs.inflight)
+		cs.mu.Unlock()
+		if err == nil && attachable > 0 {
+			t.Fatalf("读者已经读到 EOF，合并表里却还挂着 %d 趟下完的 flight", attachable)
+		}
+	case <-time.After(500 * time.Millisecond):
+		cs.mu.Unlock()
+		if err := <-read; err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = body.Close()
+}
+
+// TestFetchAndCache_RechecksDiskBeforeLeadingANewFetch 查盘未命中之后、登记 flight 之前，上一趟
+// 可能已经下完、落库并从合并表里摘掉了。那时再开一趟回源就是白打上游：满载的 CI 上
+// TestGet_ConcurrentPullsCoalesceIntoOneOriginFetch 因此偶发两次回源。成为 leader 之前再查一次盘。
+func TestFetchAndCache_RechecksDiskBeforeLeadingANewFetch(t *testing.T) {
+	o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "shared layer")
+	})
+	up := staticUpstream("deb.debian.org")
+	svc, _, _ := setupSvc(t, o, up, Options{})
+	const path = "/pool/base.deb"
+	pullWith(t, svc, target(up.Host, path))
+
+	// 模拟晚到的那个请求：它查盘时还没有记录，走到这里时上一趟已经收尾。
+	body, meta, err := svc.(*cacheSvc).fetchAndCache(context.Background(), target(up.Host, path), up, path,
+		true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := io.ReadAll(body)
+	_ = body.Close()
+	if string(payload) != "shared layer" {
+		t.Fatalf("正文 = %q", payload)
+	}
+	if got := meta.Header.Get(cacheStatusHeader); got != cacheStatusHit {
+		t.Fatalf("X-Katch-Cache = %q，要的是直接由盘上那份应答", got)
+	}
+	if got := o.hits.Load(); got != 1 {
+		t.Fatalf("origin hits = %d，上一趟已经落库，不该再回源", got)
+	}
+}
+
+// TestFlight_LateJoinerBetweenCommitAndFinishStillShares 晚到的读者落在「临时文件已经提交改名、
+// 这一趟还没收尾」之间，也要共读这一份，而不是退回自己回源。
+//
+// pump 的次序是字节写完 → Commit（把临时文件改名成内容摘要）→ 落库 → finish。以前 attach
+// 在没 done 时只认临时文件名，这个窗口里打开失败就返回 errNotCoalescable，调用方于是透传
+// 再打一次上游。满载的 CI 上 TestGet_ConcurrentPullsCoalesceIntoOneOriginFetch 的「两次回源」
+// 就是它：一个被调度得晚的等待者正好醒在这个窗口里。
+func TestFlight_LateJoinerBetweenCommitAndFinishStillShares(t *testing.T) {
+	store, err := cache.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer, err := store.Create()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = writer.Close() }()
+	f := newFlight(store)
+	f.start(&proxy_svc.Meta{StatusCode: http.StatusOK, Header: http.Header{}, ContentLength: 5}, writer.Name())
+	if _, err := writer.Write([]byte("layer")); err != nil {
+		t.Fatal(err)
+	}
+	f.publish(5)
+	digest, _, err := writer.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type attached struct {
+		body string
+		err  error
+	}
+	got := make(chan attached, 1)
+	go func() {
+		body, _, err := f.attach(context.Background())
+		if err != nil {
+			got <- attached{err: err}
+			return
+		}
+		payload, readErr := io.ReadAll(body)
+		_ = body.Close()
+		got <- attached{body: string(payload), err: readErr}
+	}()
+	select {
+	case early := <-got:
+		// 还没收尾就先回来了：只可能是退回自己回源的那个出口。
+		t.Fatalf("提交之后、收尾之前的读者没能共读：%+v", early)
+	case <-time.After(100 * time.Millisecond):
+	}
+	f.finish(digest, nil)
+	select {
+	case res := <-got:
+		if res.err != nil || res.body != "layer" {
+			t.Fatalf("晚到的读者 = %+v，要共读这一份", res)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("收尾之后晚到的读者仍没拿到内容")
+	}
 }

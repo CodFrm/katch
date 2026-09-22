@@ -11,6 +11,11 @@
 # 真二进制——生产的 NoRoute、真配置、真 sqlite 只有在这里才走得到。
 set -euo pipefail
 
+# 黑盒测试只打 127.0.0.1，必须把 shell 里的代理设置整个摘掉：curl 对 127.0.0.1
+# 同样会走 http_proxy（no_proxy 没盖住它时），一个会拦 /metrics 的代理能让
+# 「端点 200 ✓、正文没有指标 ✗」稳定复现——两头都绿、只有这一台红的那种假故障。
+export no_proxy='*' NO_PROXY='*'
+
 BIN=${BIN:-./bin/katch}
 PORT=${PORT:-18080}
 BASE="http://127.0.0.1:${PORT}"
@@ -50,7 +55,11 @@ curl -s "${BASE}/api/v1/system/version" | grep -q '"version"' || fail "版本接
 echo "✓ 版本接口返回体包含 version"
 
 check /metrics 200 "Prometheus 指标端点可用"
-curl -s "${BASE}/metrics" | grep -q "^go_" || fail "/metrics 没有输出任何指标"
+# 断言看的是 go_* 这类真实指标行，不是 200 就算过；失败时把实际收到的开头带出来，
+# 好分清「收到的是 HTML（请求根本没到 katch）」和「收到的是空正文」。
+metrics_body=$(curl -s "${BASE}/metrics")
+echo "$metrics_body" | grep -q "^go_" \
+  || fail "/metrics 没有输出任何指标，实际收到开头：$(echo "$metrics_body" | head -c 120)"
 echo "✓ /metrics 输出了指标"
 
 check / 200 "SPA 首页可用"

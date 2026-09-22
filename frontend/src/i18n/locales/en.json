@@ -27,6 +27,84 @@
     "static": "Static files",
     "git": "Git repository"
   },
+  "package": {
+    "profile": {
+      "none": "None",
+      "npm": "npm",
+      "pypi": "PyPI",
+      "goproxy": "Go modules",
+      "maven": "Maven",
+      "cargo": "Cargo",
+      "nuget": "NuGet",
+      "rubygems": "RubyGems",
+      "apt": "APT",
+      "rpm": "DNF / YUM",
+      "apk": "Alpine APK",
+      "composer": "Composer 2",
+      "homebrew": "Homebrew"
+    },
+    "client": {
+      "npm": "npm",
+      "pnpm": "pnpm",
+      "yarn_classic": "Yarn Classic",
+      "yarn_berry": "Yarn Berry",
+      "bun": "Bun",
+      "pip": "pip",
+      "uv": "uv",
+      "poetry": "Poetry",
+      "go": "Go",
+      "maven": "Maven",
+      "gradle": "Gradle",
+      "sbt": "sbt",
+      "cargo": "Cargo",
+      "dotnet": "dotnet",
+      "nuget": "NuGet",
+      "gem": "gem",
+      "bundler": "Bundler",
+      "apt": "APT",
+      "dnf": "DNF",
+      "yum": "YUM",
+      "apk": "apk",
+      "composer": "Composer 2",
+      "homebrew": "Homebrew"
+    },
+    "readiness": {
+      "label": "Package mirror readiness",
+      "configured": "Configuration ready",
+      "incomplete": "Configuration incomplete",
+      "runtimeVerified": "Verified with blocked public egress",
+      "runtimePending": "Not yet verified with a real client",
+      "runtimeVerifiedShort": "Runtime verified",
+      "runtimePendingShort": "Runtime verification pending",
+      "notApplicable": "Not configured"
+    },
+    "missing": {
+      "profile": "This adapter is not registered in this build.",
+      "site_domain": "Set the public domain before generating client configuration.",
+      "upstream_disabled": "Enable this upstream.",
+      "static_transport": "Enable the Static files protocol."
+    },
+    "companion": {
+      "ready": " · ready",
+      "missing": " · missing upstream",
+      "disabled": " · upstream paused",
+      "transport": " · wrong protocol",
+      "profile": " · wrong package profile",
+      "requirement": " · requires {{transport}} / {{profile}}"
+    },
+    "constraint": {
+      "trailing_slash": "Keep the trailing slash shown in the configuration.",
+      "old_lockfile": "Existing lockfiles with public absolute URLs may need registry-host mapping or regeneration.",
+      "no_fallback": "Do not add a direct fallback; mirror failures must stay closed.",
+      "fixed_base": "Use the fixed katch base URL, not a mirror list or dynamically selected mirror.",
+      "sparse_only": "This configuration covers Cargo sparse index, not the Git index.",
+      "read_only": "Restore, install and search are read-only; push and authenticated feeds are unsupported.",
+      "no_dynamic_mirrors": "Leave mirrorlist and metalink empty.",
+      "dist_only": "Composer support is limited to Composer 2 dist installs.",
+      "bottles_only": "Homebrew support is limited to standard Bottle installs, not source builds.",
+      "insecure_localhost": "Plain HTTP is only for localhost development; configure the client's explicit insecure-localhost exception."
+    }
+  },
   "status": {
     "normal": "Normal",
     "degraded": "Throttled"
@@ -192,10 +270,25 @@
         "host": "Upstream host",
         "origin": "Origin address",
         "protocols": "Upstream protocols",
+        "packageProfile": "Package profile",
         "defaultPolicy": "Default policy",
         "note": "Note",
         "save": "Save upstream",
-        "cancel": "Cancel"
+        "cancel": "Cancel",
+        "cachePolicy": "Cache policy",
+        "cachePolicyHint": "A preset only fills the patterns below; the saved request carries the patterns, not the preset name.",
+        "immutablePatterns": "Immutable path patterns",
+        "mutableTTL": "Mutable object TTL (seconds)",
+        "mutableTTLHint": "0 means the global default TTL.",
+        "ttlInvalid": "TTL must be a non-negative integer",
+        "profileNeedsStatic": "A package profile requires the Static files protocol"
+      },
+      "preset": {
+        "custom": "Custom",
+        "apt": "APT packages",
+        "go": "Go module proxy",
+        "git": "Git commit static files",
+        "pypi": "PyPI files"
       }
     },
     "error": {

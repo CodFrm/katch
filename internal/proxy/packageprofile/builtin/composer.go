@@ -1,0 +1,304 @@
+package builtin
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"mime"
+	"net/url"
+	"regexp"
+	"strings"
+
+	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
+	"github.com/CodFrm/katch/internal/proxy/packageprofile"
+)
+
+const (
+	composerPackageToken       = "%package%"
+	composerPackagePlaceholder = "__KATCH_COMPOSER_PACKAGE__"
+)
+
+var composerFullCommitSHA = regexp.MustCompile(`^[0-9A-Fa-f]{40}$`)
+
+type composerProfile struct{}
+
+func init() {
+	packageprofile.MustRegister(composerProfile{})
+}
+
+func (composerProfile) Describe() packageprofile.Description {
+	return packageprofile.Description{
+		Profile: upstream_entity.PackageProfileComposer,
+		Name:    "Composer 2",
+	}
+}
+
+func (composerProfile) Classify(request packageprofile.Request) packageprofile.Representation {
+	if request.Path == "/packages.json" ||
+		(strings.HasPrefix(request.Path, "/p2/") && strings.HasSuffix(request.Path, ".json")) {
+		return packageprofile.Representation{
+			Class:      packageprofile.ClassMutable,
+			Transform:  true,
+			MediaTypes: []string{"application/json"},
+		}
+	}
+	if isComposerGitHubFullSHADist(request.Host, request.Path) {
+		return packageprofile.Representation{
+			Class:    packageprofile.ClassImmutable,
+			Variants: []string{"Authorization"},
+		}
+	}
+	return packageprofile.Representation{}
+}
+
+func isComposerGitHubFullSHADist(host, path string) bool {
+	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	switch host {
+	case "api.github.com":
+		return len(parts) == 5 && parts[0] == "repos" && validComposerGitHubName(parts[1]) &&
+			validComposerGitHubName(parts[2]) && parts[3] == "zipball" && composerFullCommitSHA.MatchString(parts[4])
+	case "codeload.github.com":
+		return len(parts) == 4 && validComposerGitHubName(parts[0]) && validComposerGitHubName(parts[1]) &&
+			parts[2] == "legacy.zip" && composerFullCommitSHA.MatchString(parts[3])
+	default:
+		return false
+	}
+}
+
+func validComposerGitHubName(value string) bool {
+	if value == "" || value == "." || value == ".." || strings.Contains(value, `\`) {
+		return false
+	}
+	decoded, err := url.PathUnescape(value)
+	return err == nil && decoded != "." && decoded != ".." && !strings.ContainsAny(decoded, `/\`)
+}
+
+func (composerProfile) Transform(
+	ctx context.Context,
+	request packageprofile.TransformRequest,
+) (*packageprofile.TransformResult, error) {
+	if request.Source == nil || request.RewriteURL == nil || strings.TrimSpace(request.SiteBaseURL) == "" {
+		return nil, packageprofile.ErrUnavailable
+	}
+	mediaType, _, err := mime.ParseMediaType(request.ContentType)
+	if err != nil || mediaType != "application/json" {
+		return nil, packageprofile.ErrInvalidMetadata
+	}
+
+	var body []byte
+	sourcePath := request.Source.Path
+	switch {
+	case strings.HasSuffix(sourcePath, "/packages.json"):
+		body, err = rewriteComposerRoot(ctx, request.Body, request.Source, request.RewriteURL)
+	case strings.Contains(sourcePath, "/p2/") && strings.HasSuffix(sourcePath, ".json"):
+		body, err = rewriteComposerPackages(ctx, request.Body, request.Source, request.RewriteURL)
+	default:
+		return nil, packageprofile.ErrInvalidMetadata
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &packageprofile.TransformResult{Body: body, ContentType: "application/json"}, nil
+}
+
+func (composerProfile) Companions() []packageprofile.Companion {
+	return []packageprofile.Companion{
+		composerCompanion("api.github.com", upstream_entity.PackageProfileComposer),
+		composerCompanion("codeload.github.com", upstream_entity.PackageProfileComposer),
+	}
+}
+
+func (composerProfile) Guidance() packageprofile.Guidance {
+	return packageprofile.Guidance{
+		Clients: []string{"composer"},
+		Configuration: []string{
+			"composer config --global repos.packagist composer https://<katch>/<upstream>",
+			"composer install --prefer-dist",
+		},
+		Constraints:     []string{"dist_only", "old_lockfile"},
+		RuntimeVerified: true,
+	}
+}
+
+func rewriteComposerRoot(
+	ctx context.Context,
+	body []byte,
+	source *url.URL,
+	rewrite packageprofile.RewriteURL,
+) ([]byte, error) {
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(body, &document); err != nil {
+		return nil, packageprofile.ErrInvalidMetadata
+	}
+	var metadataURL string
+	if err := json.Unmarshal(document["metadata-url"], &metadataURL); err != nil {
+		return nil, packageprofile.ErrInvalidMetadata
+	}
+	rewritten, err := rewriteComposerTemplate(ctx, metadataURL, source, rewrite)
+	if err != nil {
+		return nil, err
+	}
+	document["metadata-url"], err = json.Marshal(rewritten)
+	if err != nil {
+		return nil, fmt.Errorf("marshal composer metadata-url: %w", err)
+	}
+	return marshalComposerDocument(document)
+}
+
+func rewriteComposerTemplate(
+	ctx context.Context,
+	template string,
+	source *url.URL,
+	rewrite packageprofile.RewriteURL,
+) (string, error) {
+	if strings.Count(template, composerPackageToken) != 1 || strings.Contains(template, composerPackagePlaceholder) {
+		return "", packageprofile.ErrInvalidMetadata
+	}
+	parsed, err := resolveComposerURL(
+		strings.Replace(template, composerPackageToken, composerPackagePlaceholder, 1), source,
+	)
+	if err != nil {
+		return "", err
+	}
+	rewritten, err := rewrite(ctx, parsed, composerCompanion(
+		parsed.Hostname(), upstream_entity.PackageProfileComposer,
+	))
+	if err != nil {
+		return "", err
+	}
+	if rewritten == nil {
+		return "", packageprofile.ErrUnavailable
+	}
+	result := rewritten.String()
+	if strings.Count(result, composerPackagePlaceholder) != 1 {
+		return "", packageprofile.ErrInvalidMetadata
+	}
+	return strings.Replace(result, composerPackagePlaceholder, composerPackageToken, 1), nil
+}
+
+func rewriteComposerPackages(
+	ctx context.Context,
+	body []byte,
+	source *url.URL,
+	rewrite packageprofile.RewriteURL,
+) ([]byte, error) {
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(body, &document); err != nil {
+		return nil, packageprofile.ErrInvalidMetadata
+	}
+	var packages map[string][]json.RawMessage
+	if err := json.Unmarshal(document["packages"], &packages); err != nil {
+		return nil, packageprofile.ErrInvalidMetadata
+	}
+	for name, versions := range packages {
+		for index, version := range versions {
+			rewritten, err := rewriteComposerVersion(ctx, version, source, rewrite)
+			if err != nil {
+				return nil, err
+			}
+			versions[index] = rewritten
+		}
+		packages[name] = versions
+	}
+	var err error
+	document["packages"], err = json.Marshal(packages)
+	if err != nil {
+		return nil, fmt.Errorf("marshal composer packages: %w", err)
+	}
+	return marshalComposerDocument(document)
+}
+
+func rewriteComposerVersion(
+	ctx context.Context,
+	body json.RawMessage,
+	source *url.URL,
+	rewrite packageprofile.RewriteURL,
+) (json.RawMessage, error) {
+	var version map[string]json.RawMessage
+	if err := json.Unmarshal(body, &version); err != nil {
+		return nil, packageprofile.ErrInvalidMetadata
+	}
+	distBody, hasDist := version["dist"]
+	if !hasDist || string(distBody) == "null" {
+		return body, nil
+	}
+	var dist map[string]json.RawMessage
+	if err := json.Unmarshal(distBody, &dist); err != nil {
+		return nil, packageprofile.ErrInvalidMetadata
+	}
+	urlBody, hasURL := dist["url"]
+	if !hasURL {
+		return body, nil
+	}
+	var rawURL string
+	if err := json.Unmarshal(urlBody, &rawURL); err != nil {
+		return nil, packageprofile.ErrInvalidMetadata
+	}
+	parsed, err := resolveComposerURL(rawURL, source)
+	if err != nil {
+		return nil, err
+	}
+	rewritten, err := rewrite(ctx, parsed, composerCompanion(
+		parsed.Hostname(), upstream_entity.PackageProfileComposer,
+	))
+	if err != nil {
+		if errors.Is(err, packageprofile.ErrUnavailable) {
+			return nil, packageprofile.ErrUnavailable
+		}
+		return nil, err
+	}
+	if rewritten == nil {
+		return nil, packageprofile.ErrUnavailable
+	}
+	dist["url"], err = json.Marshal(rewritten.String())
+	if err != nil {
+		return nil, fmt.Errorf("marshal composer dist URL: %w", err)
+	}
+	version["dist"], err = json.Marshal(dist)
+	if err != nil {
+		return nil, fmt.Errorf("marshal composer dist: %w", err)
+	}
+	return json.Marshal(version)
+}
+
+func resolveComposerURL(raw string, source *url.URL) (*url.URL, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, packageprofile.ErrInvalidMetadata
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return nil, packageprofile.ErrInvalidMetadata
+	}
+	if !parsed.IsAbs() {
+		if source == nil {
+			return nil, packageprofile.ErrInvalidMetadata
+		}
+		parsed = source.ResolveReference(parsed)
+	}
+	if parsed.User != nil || parsed.Hostname() == "" ||
+		(parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return nil, packageprofile.ErrInvalidMetadata
+	}
+	return parsed, nil
+}
+
+func composerCompanion(
+	host string,
+	profile upstream_entity.PackageProfile,
+) packageprofile.Companion {
+	return packageprofile.Companion{
+		Host:      host,
+		Profile:   profile,
+		Transport: upstream_entity.ProtocolStatic,
+	}
+}
+
+func marshalComposerDocument(document map[string]json.RawMessage) ([]byte, error) {
+	body, err := json.Marshal(document)
+	if err != nil {
+		return nil, fmt.Errorf("marshal composer metadata: %w", err)
+	}
+	return body, nil
+}

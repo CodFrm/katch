@@ -40,6 +40,8 @@ export function UpstreamTable({ upstreams }: { upstreams: UpstreamItem[] }) {
   const columns = [
     { key: 'host', width: 'w-[240px]' },
     { key: 'protocols', width: 'w-[140px]' },
+    { key: 'profile', width: 'w-[110px]' },
+    { key: 'readiness', width: 'w-[200px]' },
     { key: 'hitRate', width: 'w-[90px]' },
     { key: 'cached', width: 'w-[90px]' },
     { key: 'status', width: '' },
@@ -53,7 +55,7 @@ export function UpstreamTable({ upstreams }: { upstreams: UpstreamItem[] }) {
           {t('upstreams.count', { count: upstreams.length })}
         </span>
       </div>
-      <Table className="min-w-[640px] table-fixed text-[13px]">
+      <Table className="min-w-[640px] table-fixed text-[13px] lg:min-w-[880px]">
         <TableHeader>
           <TableRow className="border-border hover:bg-transparent">
             {columns.map((column) => (
@@ -79,6 +81,47 @@ export function UpstreamTable({ upstreams }: { upstreams: UpstreamItem[] }) {
               </TableCell>
               <TableCell className="text-muted-foreground px-0 py-2.5">
                 {protocolLabels(upstream.protocols, t)}
+              </TableCell>
+              <TableCell className="text-foreground px-0 py-2.5">
+                {t(`package.profile.${upstream.package_profile}`)}
+              </TableCell>
+              <TableCell className="px-0 py-2.5 pr-4">
+                {upstream.package_readiness ? (
+                  <span
+                    className={
+                      upstream.package_readiness.ready ? 'text-muted-foreground' : 'text-warn'
+                    }
+                  >
+                    {t(
+                      upstream.package_readiness.ready
+                        ? upstream.package_readiness.guidance.runtime_verified
+                          ? 'package.readiness.runtimeVerifiedShort'
+                          : 'package.readiness.runtimePendingShort'
+                        : 'package.readiness.incomplete'
+                    )}
+                    {!upstream.package_readiness.ready &&
+                      upstream.package_readiness.missing.map((requirement) => (
+                        <span key={requirement} className="block">
+                          {t(`package.missing.${requirement}`)}
+                        </span>
+                      ))}
+                    {!upstream.package_readiness.ready &&
+                      upstream.package_readiness.companions
+                        .filter((companion) => !companion.ready)
+                        .map((companion) => (
+                          <span
+                            key={companion.host}
+                            className="block truncate font-mono"
+                            title={companion.host}
+                          >
+                            {companion.host}
+                            {t(`package.companion.${companion.reason ?? 'missing'}`)}
+                          </span>
+                        ))}
+                  </span>
+                ) : (
+                  <span className="text-ink-3">{t('package.readiness.notApplicable')}</span>
+                )}
               </TableCell>
               <TableCell className="text-foreground px-0 py-2.5 font-mono">
                 {`${formatPercent(upstream.hit_rate)}%`}

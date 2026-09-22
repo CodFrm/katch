@@ -9,6 +9,8 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/cago-frame/cago/pkg/logger"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/CodFrm/katch/internal/metrics"
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
+	"github.com/CodFrm/katch/internal/proxy/destination"
 	"github.com/CodFrm/katch/internal/proxy/dispatch"
 	"github.com/CodFrm/katch/internal/proxy/origin"
 	"github.com/CodFrm/katch/internal/proxy/registry"
@@ -65,6 +68,9 @@ type Meta struct {
 	StatusCode    int
 	Header        http.Header
 	ContentLength int64
+	// SourceURL is the final origin response URL used only by metadata transforms.
+	// Response writers must not expose it to anonymous clients.
+	SourceURL *url.URL
 }
 
 // ProxySvc 拉取路径的业务操作。
@@ -86,6 +92,10 @@ type Gate interface {
 type Options struct {
 	// Gate 退避闸。nil 表示不退避，一律放行。
 	Gate Gate
+	// RewriteConfig 提供目标白名单的同版本快照。
+	RewriteConfig RewriteConfigSource
+	// DestinationResolver 可由测试替换；nil 时从 RewriteConfig 构造。
+	DestinationResolver destination.DestinationResolver
 	// Runtime 运行时设置的来源，nil 表示进程级的那一个（setting_svc）。
 	//
 	// 回源并发上限、上游超时与重试次数都从这里现读，不在构造时抄成字段：
@@ -125,17 +135,55 @@ func (p *proxySvc) metrics() *metrics.Recorder {
 
 // New 构造拉取路径的业务层。
 func New(opt Options) ProxySvc {
-	client := origin.New()
+	if opt.RewriteConfig == nil {
+		opt.RewriteConfig = NewRewriteConfigSource()
+	}
+	if opt.DestinationResolver == nil {
+		opt.DestinationResolver = destination.New(destination.Options{
+			Source: destinationConfigSource{source: opt.RewriteConfig},
+		})
+	}
+	client := origin.New(origin.Options{Resolver: opt.DestinationResolver})
 	if opt.Runtime == nil {
 		opt.Runtime = setting_svc.Setting()
 	}
-	return &proxySvc{
-		origin:   client,
-		registry: registry.New(registry.Options{Origin: client, Metrics: opt.Metrics}),
+	proxy := &proxySvc{
+		origin: client,
+		registry: registry.New(registry.Options{
+			Origin: client, Resolver: opt.DestinationResolver, Metrics: opt.Metrics,
+		}),
 		gate:     opt.Gate,
 		runtime:  opt.Runtime,
 		recorder: opt.Metrics,
 	}
+	return NewSumDB(SumDBOptions{
+		RewriteConfig: opt.RewriteConfig, Fallback: proxy,
+	})
+}
+
+type destinationConfigSource struct {
+	source RewriteConfigSource
+}
+
+func (s destinationConfigSource) Snapshot(ctx context.Context) (*destination.RewriteSnapshot, error) {
+	snapshot, err := s.source.Snapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if snapshot == nil {
+		return nil, nil
+	}
+	out := &destination.RewriteSnapshot{
+		Upstreams: make(map[string]destination.RewriteUpstream, len(snapshot.Upstreams)),
+	}
+	for host, upstream := range snapshot.Upstreams {
+		host = strings.ToLower(strings.TrimSuffix(host, "."))
+		out.Upstreams[host] = destination.RewriteUpstream{
+			Profile:    upstream.Profile,
+			Transports: append(upstream_entity.ProtocolSet(nil), upstream.Transports...),
+		}
+	}
+	return out, nil
 }
 
 var defaultProxy = New(Options{})
@@ -159,7 +207,7 @@ func (p *proxySvc) Fetch(ctx context.Context, target *Target) (io.ReadCloser, *M
 	if upstream == nil {
 		return nil, nil, ErrUpstreamNotAllowed
 	}
-	if !protocolMatches(target, upstream) {
+	if !SupportsTarget(target, upstream) {
 		return nil, nil, ErrUpstreamNotAllowed
 	}
 	// 闸问在这里，而不是在白名单判定之前：表里没有的主机名必须先拿到那一个
@@ -225,7 +273,16 @@ func (p *proxySvc) Fetch(ctx context.Context, target *Target) (io.ReadCloser, *M
 		StatusCode:    resp.StatusCode,
 		Header:        resp.Header,
 		ContentLength: resp.ContentLength,
+		SourceURL:     cloneURL(resp.SourceURL),
 	}, nil
+}
+
+func cloneURL(source *url.URL) *url.URL {
+	if source == nil {
+		return nil
+	}
+	cloned := *source
+	return &cloned
 }
 
 // upstreamAccountHeaders 上游用来描述**katch 这个调用方**、而不是这次内容的响应头。
@@ -348,6 +405,7 @@ func (p *proxySvc) fetchWithRetry(ctx context.Context, target *Target,
 func (p *proxySvc) fetchUpstream(
 	ctx context.Context, target *Target, upstream *upstream_entity.Upstream,
 ) (*origin.Response, error) {
+	requirement := destinationRequirement(target, upstream)
 	if target.Kind == dispatch.KindRegistry {
 		return p.registry.Do(ctx, &registry.Request{
 			Host:              target.Host,
@@ -357,6 +415,7 @@ func (p *proxySvc) fetchUpstream(
 			Method:            target.Method,
 			Header:            target.Header,
 			LibraryCompletion: upstream.LibraryCompletion,
+			Requirement:       requirement,
 		})
 	}
 	return p.origin.Do(ctx, &origin.Request{
@@ -367,10 +426,37 @@ func (p *proxySvc) fetchUpstream(
 		Header:        target.Header,
 		Body:          target.Body,
 		ContentLength: target.ContentLength,
+		Requirement:   requirement,
 	})
 }
 
-// protocolMatches 校验请求形态所需的协议，这条上游开没开。
+func destinationRequirement(
+	target *Target, upstream *upstream_entity.Upstream,
+) destination.DestinationRequirement {
+	requirement := destination.DestinationRequirement{AddressPolicy: destination.AllowPrivateAddresses}
+	switch target.Kind {
+	case dispatch.KindRegistry:
+		requirement.Transport = upstream_entity.ProtocolRegistry
+	case dispatch.KindSumDB:
+		// 正常路径在 checksum 桥那里就已改写成 KindStatic；这条分支守的是桥的
+		// fallback 原样转发的情形——它同样只该走 static 与公开地址。
+		requirement.Transport = upstream_entity.ProtocolStatic
+		requirement.AddressPolicy = destination.PublicAddressesOnly
+	case dispatch.KindStatic:
+		if target.Git.IsGit() {
+			requirement.Transport = upstream_entity.ProtocolGit
+		} else {
+			requirement.Transport = upstream_entity.ProtocolStatic
+		}
+		requirement.Profile = upstream_entity.NormalizePackageProfile(upstream.PackageProfile)
+		if requirement.Profile != upstream_entity.PackageProfileNone {
+			requirement.AddressPolicy = destination.PublicAddressesOnly
+		}
+	}
+	return requirement
+}
+
+// SupportsTarget 校验请求形态所需的协议，这条上游当前开没开。
 //
 // 没开就当作没有这个上游：registry 客户端固定走 /v2 前缀，一个只开 static 的上游
 // 出现在 /v2/ 之下（或反过来）只可能是拼错或在试探，按白名单之外处理最省事。
@@ -378,11 +464,16 @@ func (p *proxySvc) fetchUpstream(
 // 查集合而不是比单值，于是一条同时开了 static 与 git 的记录照常服务 static 路径，
 // 而回填成 [registry] 的 docker.io 在 static 路径上仍然什么都不是。空集合对任何
 // 形态都答 false，见 ProtocolSet.Has。
-func protocolMatches(target *Target, upstream *upstream_entity.Upstream) bool {
+//
+// 缓存与回源共用这一个判定，配置变化后旧缓存不能继续从已移除的协议暴露。
+func SupportsTarget(target *Target, upstream *upstream_entity.Upstream) bool {
+	if target == nil || upstream == nil {
+		return false
+	}
 	switch target.Kind {
 	case dispatch.KindRegistry:
 		return upstream.Protocols.Has(upstream_entity.ProtocolRegistry)
-	case dispatch.KindStatic:
+	case dispatch.KindStatic, dispatch.KindSumDB:
 		// git 的端点寄生在 static 的路径空间里，但要的是 git 那一种协议：
 		// 一条只开了 static 的 github.com 服务 release 资产，不服务 clone。
 		if target.Git.IsGit() {

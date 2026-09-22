@@ -1,12 +1,14 @@
 // Package origin 是回源侧的 HTTP 客户端：拿一条上游记录的回源地址加一段上游路径，
 // 发一次请求，把响应流式交回来。
 //
-// 它只管「怎么向上游要」，不管「这个上游是否被允许」（那是白名单的事，见
-// proxy_svc），也不管缓存。
+// 初始上游由 proxy_svc 的白名单选择；这里对它及每次重定向做目标解析、地址固定与
+// 传输安全校验。缓存仍不属于这一层。
 package origin
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -14,6 +16,9 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
+	"github.com/CodFrm/katch/internal/proxy/destination"
 )
 
 // Request 一次回源请求。
@@ -38,6 +43,9 @@ type Request struct {
 	// 原样抄客户端那一侧的值：git 客户端自己会在小请求上给长度、大请求上分块，
 	// 由 katch 改写这件事没有任何好处。
 	ContentLength int64
+	// Requirement 描述初始目标的地址策略；跨主机重定向会自动收紧为注册且公网可达，
+	// registry 的跨主机字节下载还会改用 static / none 的目标要求。
+	Requirement destination.DestinationRequirement
 	// Authorization katch **自己**换来的上游凭据，空串表示匿名请求。
 	//
 	// 它和 Header 分开是刻意的：Header 是客户端那一侧的头，白名单里永远不会有
@@ -51,7 +59,10 @@ type Response struct {
 	StatusCode    int
 	Header        http.Header
 	ContentLength int64
-	Body          io.ReadCloser
+	// SourceURL is the final origin response URL after redirects. It is internal
+	// transform context and must never be copied into anonymous response headers.
+	SourceURL *url.URL
+	Body      io.ReadCloser
 }
 
 // forwardedRequestHeaders 唯一会被转发给上游的请求头。
@@ -73,6 +84,8 @@ var forwardedRequestHeaders = []string{
 	"Accept-Encoding",
 	"Range",
 	"If-Range",
+	"If-Match",
+	"If-Unmodified-Since",
 	"If-None-Match",
 	"If-Modified-Since",
 	"User-Agent",
@@ -97,9 +110,36 @@ var hopByHopHeaders = []string{
 	"Set-Cookie",
 }
 
+// Options 构造回源客户端。
+type Options struct {
+	Resolver        destination.DestinationResolver
+	TLSClientConfig *tls.Config
+}
+
 // Client 回源客户端。
 type Client struct {
 	http *http.Client
+}
+
+type resolvedTargetKey struct{}
+type requirementKey struct{}
+
+type resolvedTransport struct {
+	base     *http.Transport
+	resolver destination.DestinationResolver
+}
+
+func (t *resolvedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	requirement, _ := req.Context().Value(requirementKey{}).(destination.DestinationRequirement)
+	target, err := t.resolver.Resolve(req.Context(), req.URL, requirement)
+	if err != nil {
+		return nil, err
+	}
+	cloned := req.Clone(context.WithValue(req.Context(), resolvedTargetKey{}, target))
+	urlCopy := *target.URL
+	cloned.URL = &urlCopy
+	cloned.Host = target.Host
+	return t.base.RoundTrip(cloned)
 }
 
 // New 构造回源客户端。
@@ -112,22 +152,77 @@ type Client struct {
 // 为止的计时器。在这里再钉一个固定值，会让设置页上调大的超时被悄悄截断在这个数上——
 // 一个改了却不生效的设置比没有这个设置更糟。连接建立仍有自己的硬上限（下面两个），
 // 那是 TCP/TLS 这一步的事，和整次回源的时限不是一回事。
-func New() *Client {
-	return &Client{http: &http.Client{
-		Transport: &http.Transport{
-			Proxy:                 http.ProxyFromEnvironment,
-			DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-			ForceAttemptHTTP2:     true,
-			MaxIdleConns:          100,
-			MaxIdleConnsPerHost:   10,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: time.Second,
+func New(options ...Options) *Client {
+	var opt Options
+	if len(options) > 0 {
+		opt = options[0]
+	}
+	if opt.Resolver == nil {
+		opt.Resolver = destination.New(destination.Options{})
+	}
+	tlsConfig := opt.TLSClientConfig
+	if tlsConfig != nil {
+		tlsConfig = tlsConfig.Clone()
+		tlsConfig.ServerName = ""
+	}
+	transport := &http.Transport{
+		// A proxy would replace the validated destination with its own dial target.
+		Proxy: nil,
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			target, ok := ctx.Value(resolvedTargetKey{}).(*destination.ResolvedTarget)
+			if !ok {
+				return nil, destination.ErrDestinationNotAllowed
+			}
+			return (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).
+				DialContext(ctx, network, target.DialAddress)
 		},
-		// 不设 CheckRedirect，用标准库默认的「最多跟随 10 次」：GitHub 的 release
-		// 资产会 302 到另一台主机，katch 必须自己跟过去把最终内容拿回来，否则
-		// 客户端要去直连一个不在上游表里、受限网络下不通的地址。
-	}}
+		TLSClientConfig:       tlsConfig,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	}
+	client := &http.Client{Transport: &resolvedTransport{base: transport, resolver: opt.Resolver}}
+	client.CheckRedirect = checkRedirect
+	return &Client{http: client}
+}
+
+func checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	previous := via[len(via)-1]
+	if req.URL.User != nil || (req.URL.Scheme != "http" && req.URL.Scheme != "https") ||
+		(previous.URL.Scheme == "https" && req.URL.Scheme != "https") ||
+		(previous.Method != http.MethodGet && previous.Method != http.MethodHead) {
+		return destination.ErrDestinationNotAllowed
+	}
+	requirement, _ := previous.Context().Value(requirementKey{}).(destination.DestinationRequirement)
+	if !sameHostname(previous.URL, req.URL) {
+		requirement.RequireRegistered = true
+		requirement.AddressPolicy = destination.PublicAddressesOnly
+		if requirement.Transport == upstream_entity.ProtocolRegistry {
+			requirement.Transport = upstream_entity.ProtocolStatic
+			requirement.Profile = upstream_entity.PackageProfileNone
+		}
+	}
+	if !sameAuthority(previous.URL, req.URL) {
+		req.Header.Del("Authorization")
+		req.Header.Del("Proxy-Authorization")
+		req.Header.Del("Cookie")
+	}
+	*req = *req.WithContext(context.WithValue(req.Context(), requirementKey{}, requirement))
+	return nil
+}
+
+func sameHostname(a, b *url.URL) bool {
+	return strings.EqualFold(strings.TrimSuffix(a.Hostname(), "."), strings.TrimSuffix(b.Hostname(), "."))
+}
+
+func sameAuthority(a, b *url.URL) bool {
+	return strings.EqualFold(a.Host, b.Host)
 }
 
 // Do 发起一次回源请求。
@@ -158,15 +253,25 @@ func (c *Client) Do(ctx context.Context, req *Request) (*Response, error) {
 		// 放在白名单复制之后：这一项是 katch 的凭据，不受客户端请求头影响。
 		httpReq.Header.Set("Authorization", req.Authorization)
 	}
+	httpReq = httpReq.WithContext(context.WithValue(httpReq.Context(), requirementKey{}, req.Requirement))
 	// 响应体不在这里关：它就是要流式交给调用方的那个东西，调用方负责 Close。
 	resp, err := c.http.Do(httpReq)
 	if err != nil {
+		if errors.Is(err, destination.ErrDestinationNotAllowed) {
+			return nil, destination.ErrDestinationNotAllowed
+		}
 		return nil, fmt.Errorf("回源失败: %w", err)
+	}
+	var sourceURL *url.URL
+	if resp.Request != nil && resp.Request.URL != nil {
+		cloned := *resp.Request.URL
+		sourceURL = &cloned
 	}
 	return &Response{
 		StatusCode:    resp.StatusCode,
 		Header:        cleanResponseHeader(resp.Header),
 		ContentLength: resp.ContentLength,
+		SourceURL:     sourceURL,
 		Body:          resp.Body,
 	}, nil
 }

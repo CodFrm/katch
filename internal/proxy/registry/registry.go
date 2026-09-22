@@ -28,6 +28,8 @@ import (
 	"time"
 
 	"github.com/CodFrm/katch/internal/metrics"
+	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
+	"github.com/CodFrm/katch/internal/proxy/destination"
 	"github.com/CodFrm/katch/internal/proxy/origin"
 )
 
@@ -44,6 +46,8 @@ type Request struct {
 	// Header 客户端请求头，仍旧由 origin 按白名单过滤——客户端自己的
 	// Authorization 永远不会被带给上游（决策 11）。
 	Header http.Header
+	// Requirement 约束初始 registry origin 及其重定向。
+	Requirement destination.DestinationRequirement
 	// LibraryCompletion 把单段仓库名补成 library/<name>，只对 docker.io 开。
 	LibraryCompletion bool
 }
@@ -60,9 +64,8 @@ type Doer interface {
 type Options struct {
 	// Origin 回源客户端。为 nil 时自己建一个。
 	Origin Doer
-	// TokenClient 换 token 用的客户端。它和回源分开：换 token 是一次小 JSON 请求，
-	// 可以有一个整体超时，而回源不能（几百 MB 的镜像层会被整体超时掐断）。
-	TokenClient *http.Client
+	// Resolver 同时约束 registry 回源重定向与 token realm。
+	Resolver destination.DestinationResolver
 	// Now 取当前时间，测试里可以拨动它来验证 token 过期。
 	Now func() time.Time
 	// Metrics token 交换计数的去处，nil 表示进程级那一个。
@@ -72,7 +75,7 @@ type Options struct {
 // Adapter registry 上游适配器。
 type Adapter struct {
 	origin      Doer
-	tokenClient *http.Client
+	tokenOrigin Doer
 	now         func() time.Time
 
 	recorder *metrics.Recorder
@@ -111,18 +114,16 @@ var errNoChallenge = errors.New("上游没有给出可用的鉴权挑战")
 
 // New 构造 registry 适配器。
 func New(opt Options) *Adapter {
+	client := origin.New(origin.Options{Resolver: opt.Resolver})
 	if opt.Origin == nil {
-		opt.Origin = origin.New()
-	}
-	if opt.TokenClient == nil {
-		opt.TokenClient = &http.Client{Timeout: 15 * time.Second}
+		opt.Origin = client
 	}
 	if opt.Now == nil {
 		opt.Now = time.Now
 	}
 	return &Adapter{
 		origin:      opt.Origin,
-		tokenClient: opt.TokenClient,
+		tokenOrigin: client,
 		now:         opt.Now,
 		recorder:    opt.Metrics,
 		tokens:      make(map[string]cachedToken),
@@ -150,9 +151,12 @@ func (a *Adapter) Do(ctx context.Context, req *Request) (*origin.Response, error
 	challenge, cerr := parseChallenge(resp.Header.Get("WWW-Authenticate"))
 	drain(resp.Body)
 	if cerr != nil {
+		if errors.Is(cerr, destination.ErrDestinationNotAllowed) {
+			return nil, destination.ErrDestinationNotAllowed
+		}
 		return refuse(), nil
 	}
-	token, err := a.exchange(ctx, challenge, scope)
+	token, err := a.exchange(ctx, req.Origin, challenge, scope)
 	if err != nil {
 		// 计在这里而不是 exchange 里：那一层不知道自己在为哪个上游换 token，
 		// 而这一族的标签就是上游（可观测性一节）。
@@ -188,6 +192,7 @@ func (a *Adapter) send(ctx context.Context, req *Request, path, token string) (*
 		RawQuery:      req.RawQuery,
 		Header:        req.Header,
 		Authorization: authorization,
+		Requirement:   req.Requirement,
 	})
 }
 
@@ -235,9 +240,10 @@ func parseChallenge(value string) (challenge, error) {
 	c := challenge{Realm: fields["realm"], Service: fields["service"], Scope: fields["scope"]}
 	realm, err := url.Parse(c.Realm)
 	if err != nil || (realm.Scheme != "http" && realm.Scheme != "https") || realm.Host == "" {
-		// realm 是上游说了算的一个地址，katch 会照着它去发请求；不限成 http(s)
-		// 绝对地址，一个被攻陷的上游就能把 katch 指向别处。
 		return challenge{}, errNoChallenge
+	}
+	if realm.User != nil {
+		return challenge{}, destination.ErrDestinationNotAllowed
 	}
 	return c, nil
 }
@@ -295,10 +301,16 @@ type tokenResponse struct {
 }
 
 // exchange 按挑战换一个 token。
-func (a *Adapter) exchange(ctx context.Context, c challenge, fallbackScope string) (cachedToken, error) {
+func (a *Adapter) exchange(
+	ctx context.Context, registryOrigin string, c challenge, fallbackScope string,
+) (cachedToken, error) {
 	realm, err := url.Parse(c.Realm)
 	if err != nil {
-		return cachedToken{}, fmt.Errorf("鉴权地址无法解析: %w", err)
+		return cachedToken{}, destination.ErrDestinationNotAllowed
+	}
+	registryURL, err := url.Parse(registryOrigin)
+	if err != nil || (registryURL.Scheme == "https" && realm.Scheme != "https") {
+		return cachedToken{}, destination.ErrDestinationNotAllowed
 	}
 	query := realm.Query()
 	if c.Service != "" {
@@ -314,12 +326,27 @@ func (a *Adapter) exchange(ctx context.Context, c challenge, fallbackScope strin
 	}
 	realm.RawQuery = query.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, realm.String(), nil)
-	if err != nil {
-		return cachedToken{}, err
+	path := realm.EscapedPath()
+	if path == "" {
+		path = "/"
 	}
-	resp, err := a.tokenClient.Do(req)
+	exchangeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	resp, err := a.tokenOrigin.Do(exchangeCtx, &origin.Request{
+		Method:   http.MethodGet,
+		Origin:   realm.Scheme + "://" + realm.Host,
+		Path:     path,
+		RawQuery: realm.RawQuery,
+		Requirement: destination.DestinationRequirement{
+			RequireRegistered: !sameRealmHost(registryURL, realm),
+			Transport:         upstream_entity.ProtocolStatic,
+			AddressPolicy:     destination.PublicAddressesOnly,
+		},
+	})
 	if err != nil {
+		if errors.Is(err, destination.ErrDestinationNotAllowed) {
+			return cachedToken{}, destination.ErrDestinationNotAllowed
+		}
 		return cachedToken{}, fmt.Errorf("换取上游凭据失败: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -338,6 +365,10 @@ func (a *Adapter) exchange(ctx context.Context, c challenge, fallbackScope strin
 		return cachedToken{}, errors.New("上游凭据为空")
 	}
 	return cachedToken{value: value, expiresAt: a.now().Add(lifetime(body.ExpiresIn))}, nil
+}
+
+func sameRealmHost(a, b *url.URL) bool {
+	return strings.EqualFold(strings.TrimSuffix(a.Hostname(), "."), strings.TrimSuffix(b.Hostname(), "."))
 }
 
 // lifetime 一个 token 在 katch 这边按多久算有效。

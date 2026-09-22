@@ -4,7 +4,17 @@
 // 拉取路径本身是公开的——镜像站的价值就在于任何人可以直接用。
 package admin
 
-import "github.com/cago-frame/cago/server/mux"
+import (
+	"github.com/cago-frame/cago/server/mux"
+
+	"github.com/CodFrm/katch/internal/api/upstream"
+	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
+)
+
+// Package readiness DTOs are shared by the public and admin upstream surfaces.
+type PackageGuidance = upstream.PackageGuidance
+type PackageCompanion = upstream.PackageCompanion
+type PackageReadiness = upstream.PackageReadiness
 
 // UpstreamItem 一条上游在管理接口上的表示。
 //
@@ -14,21 +24,29 @@ type UpstreamItem struct {
 	ID   int64  `json:"id"`
 	Host string `json:"host"`
 	// Protocols 这条上游开着的协议，取值见 upstream_entity 的 Protocol* 常量。
-	Protocols         []string `json:"protocols"`
-	Origin            string   `json:"origin"`
-	Enabled           bool     `json:"enabled"`
-	ImmutablePatterns []string `json:"immutable_patterns"`
-	MutableTTLSeconds int      `json:"mutable_ttl_seconds"`
-	DefaultPolicy     string   `json:"default_policy"`
-	LibraryCompletion bool     `json:"library_completion"`
-	Note              string   `json:"note"`
-	Createtime        int64    `json:"createtime"`
-	Updatetime        int64    `json:"updatetime"`
+	Protocols         []string                       `json:"protocols"`
+	PackageProfile    upstream_entity.PackageProfile `json:"package_profile"`
+	PackageReadiness  *PackageReadiness              `json:"package_readiness,omitempty"`
+	Origin            string                         `json:"origin"`
+	Enabled           bool                           `json:"enabled"`
+	ImmutablePatterns []string                       `json:"immutable_patterns"`
+	MutableTTLSeconds int                            `json:"mutable_ttl_seconds"`
+	DefaultPolicy     string                         `json:"default_policy"`
+	LibraryCompletion bool                           `json:"library_completion"`
+	Note              string                         `json:"note"`
+	Createtime        int64                          `json:"createtime"`
+	Updatetime        int64                          `json:"updatetime"`
 }
 
 // ListUpstreamsRequest 列出全部上游。
 type ListUpstreamsRequest struct {
 	mux.Meta `path:"/admin/upstreams" method:"GET"`
+	// Preview* 让新建/编辑表单向后端询问草稿的 readiness；省略时就是普通列表。
+	PreviewID             int64                          `form:"preview_id" binding:"omitempty,gte=0"`
+	PreviewHost           string                         `form:"preview_host"`
+	PreviewProtocols      []string                       `form:"preview_protocol" binding:"omitempty,dive,oneof=registry static git"`
+	PreviewPackageProfile upstream_entity.PackageProfile `form:"preview_package_profile" binding:"omitempty,oneof=none npm pypi goproxy maven cargo nuget rubygems apt rpm apk composer homebrew"`
+	PreviewEnabled        bool                           `form:"preview_enabled"`
 }
 
 // ListUpstreamsResponse 上游列表。
@@ -36,7 +54,8 @@ type ListUpstreamsRequest struct {
 // 不分页：上游是人工维护的白名单，规模是几十条而不是几万条，分页只会让界面上
 // 「支持哪些上游」这个问题需要翻页才能答。
 type ListUpstreamsResponse struct {
-	List []*UpstreamItem `json:"list"`
+	List    []*UpstreamItem   `json:"list"`
+	Preview *PackageReadiness `json:"preview,omitempty"`
 }
 
 // UpstreamSpec 一条上游的可写字段，新增与整条替换共用的那一份。
@@ -49,6 +68,8 @@ type UpstreamSpec struct {
 	Host string
 	// Protocols 这条上游开着的协议，非空。一条记录可以同时开多个。
 	Protocols []string
+	// PackageProfile 是 static 传输之上的包管理器语义；省略时为 none。
+	PackageProfile upstream_entity.PackageProfile
 	// Origin 回源地址。
 	Origin string
 	// Enabled 为 false 等同于不在白名单里：既不回源，也不在拉取路径上回显，
@@ -73,8 +94,9 @@ type SaveUpstreamRequest struct {
 	// 表达，而不是给每类上游写一个适配器。
 	//
 	// 空集合被 required 挡住而不是当成「什么都开」：判定的默认值必须是拒绝。
-	Protocols []string `json:"protocols" binding:"required,min=1,dive,oneof=registry static git" label:"上游协议"`
-	Origin    string   `json:"origin" binding:"required,url" label:"回源地址"`
+	Protocols      []string                       `json:"protocols" binding:"required,min=1,dive,oneof=registry static git" label:"上游协议"`
+	PackageProfile upstream_entity.PackageProfile `json:"package_profile" binding:"omitempty,oneof=none npm pypi goproxy maven cargo nuget rubygems apt rpm apk composer homebrew" label:"包管理器配置"`
+	Origin         string                         `json:"origin" binding:"required,url" label:"回源地址"`
 	// Enabled 见 UpstreamSpec.Enabled。
 	Enabled           bool     `json:"enabled"`
 	ImmutablePatterns []string `json:"immutable_patterns"`
@@ -88,7 +110,8 @@ type SaveUpstreamRequest struct {
 // Spec 这次请求要落的字段。
 func (r *SaveUpstreamRequest) Spec() *UpstreamSpec {
 	return &UpstreamSpec{
-		Host: r.Host, Protocols: r.Protocols, Origin: r.Origin, Enabled: r.Enabled,
+		Host: r.Host, Protocols: r.Protocols, PackageProfile: r.PackageProfile,
+		Origin: r.Origin, Enabled: r.Enabled,
 		ImmutablePatterns: r.ImmutablePatterns, MutableTTLSeconds: r.MutableTTLSeconds,
 		DefaultPolicy: r.DefaultPolicy, LibraryCompletion: r.LibraryCompletion, Note: r.Note,
 	}
@@ -108,11 +131,12 @@ type SaveUpstreamResponse struct {
 //
 // 字段与 SaveUpstreamRequest 逐字相同，理由见 UpstreamSpec。
 type UpdateUpstreamRequest struct {
-	mux.Meta  `path:"/admin/upstreams/:id" method:"PUT"`
-	ID        int64    `uri:"id"`
-	Host      string   `json:"host" binding:"required" label:"上游主机名"`
-	Protocols []string `json:"protocols" binding:"required,min=1,dive,oneof=registry static git" label:"上游协议"`
-	Origin    string   `json:"origin" binding:"required,url" label:"回源地址"`
+	mux.Meta       `path:"/admin/upstreams/:id" method:"PUT"`
+	ID             int64                          `uri:"id"`
+	Host           string                         `json:"host" binding:"required" label:"上游主机名"`
+	Protocols      []string                       `json:"protocols" binding:"required,min=1,dive,oneof=registry static git" label:"上游协议"`
+	PackageProfile upstream_entity.PackageProfile `json:"package_profile" binding:"omitempty,oneof=none npm pypi goproxy maven cargo nuget rubygems apt rpm apk composer homebrew" label:"包管理器配置"`
+	Origin         string                         `json:"origin" binding:"required,url" label:"回源地址"`
 	// Enabled 见 UpstreamSpec.Enabled。
 	Enabled           bool     `json:"enabled"`
 	ImmutablePatterns []string `json:"immutable_patterns"`
@@ -125,7 +149,8 @@ type UpdateUpstreamRequest struct {
 // Spec 这次请求要落的字段。
 func (r *UpdateUpstreamRequest) Spec() *UpstreamSpec {
 	return &UpstreamSpec{
-		Host: r.Host, Protocols: r.Protocols, Origin: r.Origin, Enabled: r.Enabled,
+		Host: r.Host, Protocols: r.Protocols, PackageProfile: r.PackageProfile,
+		Origin: r.Origin, Enabled: r.Enabled,
 		ImmutablePatterns: r.ImmutablePatterns, MutableTTLSeconds: r.MutableTTLSeconds,
 		DefaultPolicy: r.DefaultPolicy, LibraryCompletion: r.LibraryCompletion, Note: r.Note,
 	}

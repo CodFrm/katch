@@ -7,11 +7,26 @@ import App from '@/App'
 import i18n from '@/i18n'
 import type { Overview, UpstreamList, VersionInfo } from '@/lib/api'
 
+const pendingAPTReadiness = {
+  ready: true,
+  missing: [],
+  companions: [],
+  guidance: {
+    clients: ['apt'],
+    configuration: [
+      'deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://mirror.example.com/deb.debian.org/debian <suite> <components>',
+    ],
+    constraints: ['trailing_slash'],
+    runtime_verified: false,
+  },
+}
+
 const upstreams: UpstreamList = {
   list: [
     {
       host: 'docker.io',
       protocols: ['registry'],
+      package_profile: 'none',
       library_completion: true,
       hit_rate: 0.942,
       cache_bytes: 871938031616,
@@ -20,6 +35,8 @@ const upstreams: UpstreamList = {
     {
       host: 'deb.debian.org',
       protocols: ['static'],
+      package_profile: 'apt',
+      package_readiness: pendingAPTReadiness,
       library_completion: false,
       hit_rate: 0.961,
       cache_bytes: 462754185216,
@@ -78,7 +95,17 @@ function renderPage() {
   )
 }
 
+const siteInfo = {
+  name: 'katch',
+  base_url: 'https://mirror.example.com',
+  package_profiles: [
+    { profile: 'none', name: 'None' },
+    { profile: 'apt', name: 'APT' },
+  ],
+}
+
 const allPublic = {
+  '/api/v1/site': envelope(siteInfo),
   '/api/v1/upstreams': envelope(upstreams),
   '/api/v1/stats/overview': envelope(overview),
   '/api/v1/system/version': envelope(version),
@@ -196,6 +223,37 @@ describe('支持的上游', () => {
 
     expect(screen.getByText('正常')).toBeInTheDocument()
     expect(screen.getByText('限流中')).toBeInTheDocument()
+  })
+  it('未完成 runtime matrix 时展示真实状态且不生成可复制配置', async () => {
+    stubFetch(allPublic)
+    renderPage()
+
+    const table = await screen.findByRole('table')
+    const aptRow = within(table).getByRole('row', { name: /deb\.debian\.org/ })
+    expect(aptRow).toHaveTextContent('APT')
+    expect(aptRow).toHaveTextContent('待真实客户端验证')
+    expect(screen.queryByText(/deb \[signed-by=/)).not.toBeInTheDocument()
+  })
+
+  it('后端标记已验证后才展示公开配置片段', async () => {
+    const verified = {
+      list: upstreams.list.map((item) =>
+        item.host === 'deb.debian.org'
+          ? {
+              ...item,
+              package_readiness: {
+                ...pendingAPTReadiness,
+                guidance: { ...pendingAPTReadiness.guidance, runtime_verified: true },
+              },
+            }
+          : item
+      ),
+    }
+    stubFetch({ ...allPublic, '/api/v1/upstreams': envelope(verified) })
+    renderPage()
+
+    expect(await screen.findByText(/deb \[signed-by=/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '复制' })).toBeInTheDocument()
   })
 })
 

@@ -1,0 +1,9 @@
+{
+  "name": "apk",
+  "image": "katch/package-client-alpine:3.22.1",
+  "allow_musl_route_probe": true,
+  "setup": "set -eu\nrepository=\"${KATCH_URL%/}/dl-cdn.alpinelinux.org/alpine/v3.22/main\"\nprintf '%s\\n' \"$repository\" > /etc/apk/repositories\nmkdir -p /work/packages",
+  "run": "set -eu\napk update\napk fetch --output /work/packages busybox\napk verify /work/packages/*.apk\napk add --no-cache jq\njq --version > /work/jq-version",
+  "assert": "set -eu\ntest -s /work/jq-version\ngrep -Eq '^jq-' /work/jq-version\ntest -n \"$(find /work/packages -name 'busybox-*.apk' -type f -print -quit)\"",
+  "required_upstreams": ["dl-cdn.alpinelinux.org"]
+}

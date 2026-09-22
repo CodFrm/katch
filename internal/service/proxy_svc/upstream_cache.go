@@ -10,11 +10,10 @@ import (
 
 // cachedUpstreamRepo 给上游表加一层进程内缓存。
 //
-// 为什么是包在 repository 外面的一层，而不是在 service 里各存一份：失效点只有
-// 「上游被写过」这一件事，而所有写入都要经过这个接口。装在这里，管理接口新增、
-// 改、停用、删除任何一条上游都会自动让缓存失效，将来多一个写入口也不会漏——
-// 靠每个写入方自己记得调一次 Invalidate 的方案，漏掉的那次表现为「界面上停用了
-// 但还在回源」，而且只在生产上才看得见。
+// 为什么是包在 repository 外面的一层，而不是在 service 里各存一份：非事务写直接
+// 经过这个接口，写成功立即失效；事务写使用 Uncached 取得底层仓储，并在外层提交成功
+// 后调用 Invalidate。这样新增、改、停用、删除都会失效，同时不会在提交前开放旧数据
+// 重新发布进缓存的窗口。
 //
 // 缓存的是**整张表的快照**而不是逐条问答：上游是人工维护的白名单，规模是几十条；
 // 一次装载之后，未知主机也能在内存里直接答「没有」，不给探测流量留一条打到库上
@@ -85,6 +84,16 @@ func (c *cachedUpstreamRepo) invalidate() {
 	c.byHost = nil
 	c.generation++
 	c.mu.Unlock()
+}
+
+// Uncached 返回事务回调使用的底层仓储。
+func (c *cachedUpstreamRepo) Uncached() upstream_repo.UpstreamRepo {
+	return c.inner
+}
+
+// Invalidate 在外层事务成功提交后失效快照。
+func (c *cachedUpstreamRepo) Invalidate() {
+	c.invalidate()
 }
 
 // table 取当前快照，没有就装载一份。

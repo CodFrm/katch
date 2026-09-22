@@ -10,6 +10,8 @@ import (
 	"github.com/smartystreets/goconvey/convey"
 
 	"github.com/CodFrm/katch/internal/metrics"
+	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
+	"github.com/CodFrm/katch/internal/proxy/packageprofile"
 	"github.com/CodFrm/katch/internal/service/proxy_svc"
 )
 
@@ -44,6 +46,148 @@ func pull(t *testing.T, svc CacheSvc, host, path string) *proxy_svc.Meta {
 		t.Fatalf("关闭 %s 的响应体失败：%v", path, err)
 	}
 	return meta
+}
+
+func transformedMissProfile(t *testing.T) testProfile {
+	t.Helper()
+	return testProfile{
+		description: packageprofile.Description{Profile: upstream_entity.PackageProfileNPM, Name: "test"},
+		representation: packageprofile.Representation{
+			Class: packageprofile.ClassMutable, Transform: true, MediaTypes: []string{"application/json"},
+		},
+		transform: func(_ context.Context, in packageprofile.TransformRequest) (*packageprofile.TransformResult, error) {
+			return &packageprofile.TransformResult{Body: in.Body, ContentType: "application/json"}, nil
+		},
+	}
+}
+
+func transformedMissUpstream(host string) *upstream_entity.Upstream {
+	upstream := staticUpstream(host)
+	upstream.PackageProfile = upstream_entity.PackageProfileNPM
+	return upstream
+}
+
+func TestGet_TransformedMetadataPreservesFirstAndTTLMissReasons(t *testing.T) {
+	o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"version":1}`)
+	})
+	upstream := transformedMissUpstream("metadata.example.com")
+	svc, repo, _ := setupSvc(t, o, upstream, transformingOptions(t, transformedMissProfile(t), 7))
+
+	_, first := pullWith(t, svc, target(upstream.Host, "/metadata"))
+	if got := missReasonOf(first); got != string(metrics.MissFirst) {
+		t.Fatalf("first transformed miss reason = %q, want %q", got, metrics.MissFirst)
+	}
+	rows := repo.all()
+	if len(rows) != 1 {
+		t.Fatalf("cache rows = %d, want 1", len(rows))
+	}
+	repo.expire(rows[0].Key)
+
+	_, refreshed := pullWith(t, svc, target(upstream.Host, "/metadata"))
+	if got := missReasonOf(refreshed); got != string(metrics.MissTTL) {
+		t.Fatalf("expired transformed miss reason = %q, want %q", got, metrics.MissTTL)
+	}
+	if got := o.hits.Load(); got != 2 {
+		t.Fatalf("origin hits = %d, want 2", got)
+	}
+}
+
+func TestGet_TransformedColdLocalResponsesRetainOriginMissReason(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		configure  func(http.Header)
+		wantStatus int
+	}{
+		{name: "conditional", configure: func(h http.Header) { h.Set("If-None-Match", "*") }, wantStatus: http.StatusNotModified},
+		{name: "range", configure: func(h http.Header) { h.Set("Range", "bytes=0-3") }, wantStatus: http.StatusPartialContent},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o := newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"version":1}`)
+			})
+			upstream := transformedMissUpstream("metadata.example.com")
+			svc, _, _ := setupSvc(t, o, upstream, transformingOptions(t, transformedMissProfile(t), 8))
+			target := target(upstream.Host, "/metadata")
+			tc.configure(target.Header)
+
+			_, meta := pullWith(t, svc, target)
+			if meta.StatusCode != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", meta.StatusCode, tc.wantStatus)
+			}
+			if got := meta.Header.Get(cacheStatusHeader); got != cacheStatusMiss {
+				t.Fatalf("cache status = %q, want %q", got, cacheStatusMiss)
+			}
+			if got := missReasonOf(meta); got != string(metrics.MissFirst) {
+				t.Fatalf("miss reason = %q, want %q", got, metrics.MissFirst)
+			}
+			if got := o.hits.Load(); got != 1 {
+				t.Fatalf("origin hits = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestGet_TransformedOriginErrorsOverrideSpoofedCacheHeaders(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		status     int
+		expireCopy bool
+		wantReason metrics.MissReason
+	}{
+		{name: "not found", status: http.StatusNotFound, wantReason: metrics.MissFirst},
+		{name: "gone after expiry", status: http.StatusGone, expireCopy: true, wantReason: metrics.MissTTL},
+		{name: "other origin error", status: http.StatusBadGateway, wantReason: metrics.MissFirst},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var o *originStub
+			o = newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+				if tc.expireCopy && o.hits.Load() == 1 {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"version":1}`)
+					return
+				}
+				w.Header().Set(cacheStatusHeader, cacheStatusHit)
+				w.Header().Set(metrics.MissHeader, string(metrics.MissChanged))
+				w.Header().Set("Retry-After", "120")
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, "origin error")
+			})
+			upstream := transformedMissUpstream("metadata.example.com")
+			svc, repo, _ := setupSvc(t, o, upstream, transformingOptions(t, transformedMissProfile(t), 9))
+			if tc.expireCopy {
+				pullWith(t, svc, target(upstream.Host, "/metadata"))
+				rows := repo.all()
+				if len(rows) != 1 {
+					t.Fatalf("cache rows before expiry = %d, want 1", len(rows))
+				}
+				repo.expire(rows[0].Key)
+			}
+
+			body, meta := pullWith(t, svc, target(upstream.Host, "/metadata"))
+			if meta.StatusCode != tc.status || body != "origin error" {
+				t.Fatalf("status/body = %d %q, want %d origin error", meta.StatusCode, body, tc.status)
+			}
+			if got := meta.Header.Get("Retry-After"); got != "120" {
+				t.Fatalf("Retry-After = %q, want 120", got)
+			}
+			if got := meta.Header.Get(cacheStatusHeader); got != cacheStatusMiss {
+				t.Fatalf("cache status = %q, want %q", got, cacheStatusMiss)
+			}
+			if got := missReasonOf(meta); got != string(tc.wantReason) {
+				t.Fatalf("miss reason = %q, want %q", got, tc.wantReason)
+			}
+			wantRows := 0
+			if tc.expireCopy {
+				wantRows = 1
+			}
+			if got := len(repo.all()); got != wantRows {
+				t.Fatalf("cache rows after origin error = %d, want %d", got, wantRows)
+			}
+		})
+	}
 }
 
 // TestGet_MissReasonFirstPull 第一次拉一个从没缓存过的对象，归因是「首次拉取」；

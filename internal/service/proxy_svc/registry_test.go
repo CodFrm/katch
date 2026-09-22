@@ -4,10 +4,12 @@
 package proxy_svc_test
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -16,6 +18,7 @@ import (
 	"go.uber.org/mock/gomock"
 
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
+	"github.com/CodFrm/katch/internal/proxy/destination"
 	"github.com/CodFrm/katch/internal/proxy/dispatch"
 	"github.com/CodFrm/katch/internal/repository/upstream_repo"
 	mock_upstream_repo "github.com/CodFrm/katch/internal/repository/upstream_repo/mock"
@@ -72,6 +75,16 @@ func newFakeRegistry(t *testing.T) *fakeRegistry {
 	return f
 }
 
+type localDestinationResolver struct{}
+
+func (localDestinationResolver) Resolve(
+	_ context.Context, target *url.URL, _ destination.DestinationRequirement,
+) (*destination.ResolvedTarget, error) {
+	cloned := *target
+	return &destination.ResolvedTarget{URL: &cloned, Authority: target.Host, Host: target.Host,
+		ServerName: target.Hostname(), DialAddress: target.Host}, nil
+}
+
 // useRegistryUpstream 把一条 docker.io 形态的 registry 上游装成进程内那一份。
 //
 // LibraryCompletion 是记录上的一个标志（决策 12：协议类别只有两种，其余差异
@@ -87,7 +100,9 @@ func useRegistryUpstream(t *testing.T, origin string, libraryCompletion bool) {
 	upstream_repo.RegisterUpstream(proxy_svc.NewCachedUpstreamRepo(repo))
 
 	prevProxy := proxy_svc.Proxy()
-	proxy_svc.Register(proxy_svc.New(proxy_svc.Options{}))
+	proxy_svc.Register(proxy_svc.New(proxy_svc.Options{
+		DestinationResolver: localDestinationResolver{},
+	}))
 	t.Cleanup(func() { proxy_svc.Register(prevProxy) })
 	// 缓存层用出厂的纯透传形态：这一组用例问的是鉴权，不是缓存。
 	prevCache := cache_svc.Cache()
@@ -101,7 +116,7 @@ func useRegistryUpstream(t *testing.T, origin string, libraryCompletion bool) {
 func pullHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		kind, host, rest := dispatch.Classify(r.URL.EscapedPath())
-		if kind != dispatch.KindRegistry && kind != dispatch.KindStatic {
+		if kind != dispatch.KindRegistry && kind != dispatch.KindStatic && kind != dispatch.KindSumDB {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}

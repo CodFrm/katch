@@ -1,28 +1,49 @@
-import { useState, type FormEvent, type ReactNode } from 'react'
+import { useEffect, useState, type FormEvent, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useNavigate, useParams } from 'react-router-dom'
 
 import { ScreenHeader } from '@/components/admin/admin-shell'
+import { PackageReadinessPanel } from '@/components/pull-assistant'
 import { Input } from '@/components/ui/input'
 import { useAdminAction } from '@/hooks/use-admin-action'
 import {
+  fetchPackageReadiness,
+  fetchSiteInfo,
   saveUpstream,
   toUpstreamDraft,
   type AdminUpstreamItem,
   type DefaultPolicy,
+  type PackageProfileOption,
+  type PackageReadiness,
   type UpstreamDraft,
   type UpstreamProtocol,
 } from '@/lib/api'
 import { cn } from '@/lib/utils'
+import {
+  CUSTOM_PRESET,
+  UPSTREAM_PRESETS,
+  matchPreset,
+  normalizePatterns,
+  parseMutableTTL,
+  presetPatterns,
+  type UpstreamPresetId,
+} from '@/lib/upstream-presets'
 
 const PROTOCOLS: UpstreamProtocol[] = ['registry', 'static', 'git']
 const POLICIES: DefaultPolicy[] = ['allow_all', 'deny_unless_matched']
+const FALLBACK_PROFILES: PackageProfileOption[] = [{ profile: 'none', name: '' }]
+
+type ReadinessPreview = {
+  key: string
+  value: PackageReadiness | null
+}
 
 /** 新登记一条上游时的出厂值，和后端 SaveUpstreamRequest 的默认行为对齐。 */
 const BLANK: UpstreamDraft = {
   id: 0,
   host: '',
   protocols: ['registry'],
+  package_profile: 'none',
   origin: '',
   enabled: true,
   immutable_patterns: [],
@@ -56,10 +77,88 @@ export function UpstreamFormScreen({
   const { id } = useParams()
   const editing = upstreams.find((item) => item.id === Number(id))
   const [draft, setDraft] = useState<UpstreamDraft | null>(null)
+  // TTL 单独留一份文本草稿：受控数字框在清空重打时会把中间态（空串、负号）
+  // 立刻变成 0 或 NaN，使用者根本没法把值改掉。
+  const [ttlText, setTtlText] = useState<string | null>(null)
+  const [ttlInvalid, setTtlInvalid] = useState(false)
+  const [profileInvalid, setProfileInvalid] = useState(false)
+  const [profiles, setProfiles] = useState<PackageProfileOption[]>([])
+  const [readinessPreview, setReadinessPreview] = useState<ReadinessPreview | null>(null)
   const action = useAdminAction(onUnauthorized)
 
   // 编辑时以库里那条为底：表单是这条上游此刻的样子，不是一张空表。
   const current: UpstreamDraft = draft ?? (editing ? toUpstreamDraft(editing) : { ...BLANK })
+  // 菜单显示的是当前模式对应的预设；模式被改过就落回自定义。
+  const preset = matchPreset(current.immutable_patterns)
+  const ttlValue = ttlText ?? String(current.mutable_ttl_seconds)
+  const previewID = current.id
+  const previewHost = current.host
+  const previewEnabled = current.enabled
+  const previewProfile = current.package_profile
+  const previewProtocols = current.protocols
+  const previewKey = JSON.stringify([
+    previewID,
+    previewHost,
+    previewEnabled,
+    previewProfile,
+    previewProtocols,
+  ])
+  const readiness = readinessPreview?.key === previewKey ? readinessPreview.value : null
+
+  useEffect(() => {
+    const controller = new AbortController()
+    void fetchSiteInfo(controller.signal).then((site) => {
+      if (!controller.signal.aborted && site) {
+        setProfiles(site.package_profiles)
+      }
+    })
+    return () => controller.abort()
+  }, [])
+
+  useEffect(() => {
+    if (previewProfile === 'none') {
+      return
+    }
+    const controller = new AbortController()
+    const timer = window.setTimeout(() => {
+      void fetchPackageReadiness(
+        adminKey,
+        {
+          id: previewID,
+          host: previewHost,
+          enabled: previewEnabled,
+          package_profile: previewProfile,
+          protocols: previewProtocols,
+        },
+        controller.signal
+      ).then((result) => {
+        if (controller.signal.aborted) {
+          return
+        }
+        if (!result.ok) {
+          if (result.reason === 'unauthorized') {
+            onUnauthorized()
+          }
+          return
+        }
+        setReadinessPreview({ key: previewKey, value: result.data.preview ?? null })
+      })
+    }, 100)
+    return () => {
+      controller.abort()
+      window.clearTimeout(timer)
+    }
+  }, [
+    adminKey,
+    previewEnabled,
+    previewHost,
+    previewID,
+    previewKey,
+    previewProfile,
+    previewProtocols,
+    onUnauthorized,
+  ])
+
   if (id && !editing && upstreams.length > 0) {
     return (
       <div className="px-8 py-7">
@@ -69,7 +168,16 @@ export function UpstreamFormScreen({
   }
 
   function change(patch: Partial<UpstreamDraft>) {
+    setProfileInvalid(false)
     setDraft({ ...current, ...patch })
+  }
+
+  // 选预设只替换模式列表；选「自定义」是回到手动编辑，既不清空也不改动。
+  function choosePreset(id: UpstreamPresetId) {
+    if (id === CUSTOM_PRESET) {
+      return
+    }
+    change({ immutable_patterns: [...presetPatterns(id)] })
   }
 
   // 勾选顺序不进请求体：协议集合按 PROTOCOLS 的固定顺序写回去，否则同一条上游
@@ -93,12 +201,25 @@ export function UpstreamFormScreen({
     ) {
       return
     }
+    if (current.package_profile !== 'none' && !current.protocols.includes('static')) {
+      setProfileInvalid(true)
+      return
+    }
+    const ttl = parseMutableTTL(ttlValue)
+    if (ttl === null) {
+      setTtlInvalid(true)
+      return
+    }
+    setTtlInvalid(false)
     void action.run(
       () =>
         saveUpstream(adminKey, {
           ...current,
           host: current.host.trim(),
           origin: current.origin.trim(),
+          // 请求体里只有最终那份普通模式：修剪、去空、稳定去重。
+          immutable_patterns: normalizePatterns(current.immutable_patterns),
+          mutable_ttl_seconds: ttl,
         }),
       (saved) => {
         onSaved()
@@ -142,6 +263,23 @@ export function UpstreamFormScreen({
             onToggle={(value) => toggleProtocol(value as UpstreamProtocol)}
           />
         </Field>
+        <Field label={t('admin.upstream.form.packageProfile')} htmlFor="upstream-package-profile">
+          <select
+            id="upstream-package-profile"
+            value={current.package_profile}
+            onChange={(event) => change({ package_profile: event.target.value })}
+            className="border-line-strong bg-background text-foreground h-9 min-w-[240px] border px-2.5 text-[13px]"
+          >
+            {(profiles.length > 0 ? profiles : FALLBACK_PROFILES).map((profile) => (
+              <option key={profile.profile} value={profile.profile}>
+                {t(`package.profile.${profile.profile}`, { defaultValue: profile.name })}
+              </option>
+            ))}
+          </select>
+        </Field>
+        {readiness && (
+          <PackageReadinessPanel profile={current.package_profile} readiness={readiness} />
+        )}
         <Field label={t('admin.upstream.form.defaultPolicy')}>
           <Segmented
             label={t('admin.upstream.form.defaultPolicy')}
@@ -160,6 +298,52 @@ export function UpstreamFormScreen({
             onChange={(event) => change({ note: event.target.value })}
             className="w-[360px] rounded-none text-[13px] md:text-[13px]"
           />
+        </Field>
+        <Field label={t('admin.upstream.form.cachePolicy')}>
+          <div className="flex flex-col gap-2">
+            <Segmented
+              label={t('admin.upstream.form.cachePolicy')}
+              options={UPSTREAM_PRESETS.map((item) => ({
+                value: item.id,
+                label: t(`admin.upstream.preset.${item.id}`),
+              }))}
+              value={preset}
+              onChange={(value) => choosePreset(value as UpstreamPresetId)}
+            />
+            <p className="text-muted-foreground text-[12px]">
+              {t('admin.upstream.form.cachePolicyHint')}
+            </p>
+          </div>
+        </Field>
+        <Field
+          label={t('admin.upstream.form.immutablePatterns')}
+          htmlFor="upstream-immutable-patterns"
+        >
+          <textarea
+            id="upstream-immutable-patterns"
+            value={current.immutable_patterns.join('\n')}
+            rows={4}
+            spellCheck={false}
+            onChange={(event) => change({ immutable_patterns: event.target.value.split('\n') })}
+            className="border-line-strong w-[420px] resize-y rounded-none border bg-transparent px-2.5 py-1.5 font-mono text-[13px] leading-6 outline-none"
+          />
+        </Field>
+        <Field label={t('admin.upstream.form.mutableTTL')} htmlFor="upstream-mutable-ttl">
+          <div className="flex flex-col gap-2">
+            <Input
+              id="upstream-mutable-ttl"
+              inputMode="numeric"
+              value={ttlValue}
+              onChange={(event) => {
+                setTtlText(event.target.value)
+                setTtlInvalid(false)
+              }}
+              className="w-[120px] rounded-none font-mono text-[13px] md:text-[13px]"
+            />
+            <p className="text-muted-foreground text-[12px]">
+              {t('admin.upstream.form.mutableTTLHint')}
+            </p>
+          </div>
         </Field>
 
         <div className="mt-6 flex items-center gap-3">
@@ -180,6 +364,16 @@ export function UpstreamFormScreen({
           {action.errorKey && (
             <span role="alert" className="text-destructive text-[12.5px]">
               {t(action.errorKey)}
+            </span>
+          )}
+          {profileInvalid && (
+            <span role="alert" className="text-destructive text-[12.5px]">
+              {t('admin.upstream.form.profileNeedsStatic')}
+            </span>
+          )}
+          {ttlInvalid && (
+            <span role="alert" className="text-destructive text-[12.5px]">
+              {t('admin.upstream.form.ttlInvalid')}
             </span>
           )}
         </div>

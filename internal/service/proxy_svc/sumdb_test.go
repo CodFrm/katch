@@ -1,0 +1,326 @@
+package proxy_svc
+
+import (
+	"context"
+	"errors"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"sync"
+	"testing"
+
+	"go.uber.org/mock/gomock"
+
+	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
+	"github.com/CodFrm/katch/internal/proxy/destination"
+	"github.com/CodFrm/katch/internal/proxy/dispatch"
+)
+
+type sumDBRewriteSource struct {
+	snapshot *RewriteSnapshot
+	err      error
+}
+
+func (s sumDBRewriteSource) Snapshot(context.Context) (*RewriteSnapshot, error) {
+	return s.snapshot, s.err
+}
+
+type resolverFunc func(context.Context, *url.URL, destination.DestinationRequirement) (*destination.ResolvedTarget, error)
+
+func (f resolverFunc) Resolve(ctx context.Context, target *url.URL, requirement destination.DestinationRequirement) (*destination.ResolvedTarget, error) {
+	return f(ctx, target, requirement)
+}
+
+type proxyFunc func(context.Context, *Target) (io.ReadCloser, *Meta, error)
+
+func (f proxyFunc) Fetch(ctx context.Context, target *Target) (io.ReadCloser, *Meta, error) {
+	return f(ctx, target)
+}
+
+func TestNewComposesSumDBBeforeStaticFallback(t *testing.T) {
+	repo := setupRepo(t)
+	repo.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{}, nil).AnyTimes()
+	resolverCalls := 0
+	svc := New(Options{
+		RewriteConfig: configuredSumDBSource(upstream_entity.PackageProfileGoProxy, upstream_entity.ProtocolStatic),
+		DestinationResolver: resolverFunc(func(context.Context, *url.URL, destination.DestinationRequirement) (*destination.ResolvedTarget, error) {
+			resolverCalls++
+			return nil, errors.New("supported must not resolve")
+		}),
+	})
+	body, meta, err := svc.Fetch(context.Background(), &Target{
+		Kind: dispatch.KindSumDB, Host: "sum.golang.org", Path: "/supported", Method: http.MethodGet,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer body.Close()
+	if meta.StatusCode != http.StatusOK || resolverCalls != 0 {
+		t.Fatalf("status = %d, resolver calls = %d; want 200, 0", meta.StatusCode, resolverCalls)
+	}
+}
+
+func TestSumDBNonSyntheticRoutesDelegateCanonicalTarget(t *testing.T) {
+	header := http.Header{
+		"Accept":         []string{"text/plain"},
+		"If-None-Match":  []string{`"lookup-v1"`},
+		"X-Test-Forward": []string{"preserved"},
+	}
+	var calls int
+	svc := NewSumDB(SumDBOptions{
+		RewriteConfig: configuredSumDBSource(upstream_entity.PackageProfileGoProxy, upstream_entity.ProtocolStatic),
+		Fallback: proxyFunc(func(_ context.Context, target *Target) (io.ReadCloser, *Meta, error) {
+			calls++
+			if target.Kind != dispatch.KindStatic || target.Host != "sum.golang.org" ||
+				target.Path != "/lookup/example.com/mod@v1.0.0" || target.RawQuery != "x=1" ||
+				target.Method != http.MethodHead || target.Header.Get("Accept") != "text/plain" ||
+				target.Header.Get("If-None-Match") != `"lookup-v1"` ||
+				target.Header.Get("X-Test-Forward") != "preserved" {
+				t.Fatalf("fallback target = %+v, headers = %v", target, target.Header)
+			}
+			return http.NoBody, &Meta{StatusCode: http.StatusNotModified, Header: make(http.Header)}, nil
+		}),
+	})
+
+	body, meta, err := svc.Fetch(context.Background(), &Target{
+		Kind: dispatch.KindSumDB, Host: "sum.golang.org", Path: "/lookup/example.com/mod@v1.0.0",
+		RawQuery: "x=1", Method: http.MethodHead, Header: header,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer body.Close()
+	if calls != 1 || meta.StatusCode != http.StatusNotModified {
+		t.Fatalf("fallback calls = %d, status = %d; want 1, 304", calls, meta.StatusCode)
+	}
+}
+
+func TestSumDBNonSyntheticRoutesRequireCurrentProfile(t *testing.T) {
+	fallbackCalls := 0
+	svc := NewSumDB(SumDBOptions{
+		RewriteConfig: configuredSumDBSource(upstream_entity.PackageProfileNone, upstream_entity.ProtocolStatic),
+		Fallback: proxyFunc(func(context.Context, *Target) (io.ReadCloser, *Meta, error) {
+			fallbackCalls++
+			return nil, nil, errors.New("revoked profile reached fallback")
+		}),
+	})
+
+	body, meta, err := svc.Fetch(context.Background(), &Target{
+		Kind: dispatch.KindSumDB, Host: sumDBHost, Path: "/lookup/example.com/mod@v1.0.0",
+		Method: http.MethodGet, Header: make(http.Header),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer body.Close()
+	if meta.StatusCode != http.StatusServiceUnavailable || fallbackCalls != 0 {
+		t.Fatalf("status = %d, fallback calls = %d; want 503, 0", meta.StatusCode, fallbackCalls)
+	}
+}
+
+func TestSumDBDoesNotInterceptDirectStaticHost(t *testing.T) {
+	fallbackCalls := 0
+	svc := NewSumDB(SumDBOptions{
+		RewriteConfig: configuredSumDBSource(upstream_entity.PackageProfileNone, upstream_entity.ProtocolStatic),
+		Fallback: proxyFunc(func(_ context.Context, target *Target) (io.ReadCloser, *Meta, error) {
+			fallbackCalls++
+			if target.Kind != dispatch.KindStatic || target.Host != sumDBHost || target.Path != "/supported" {
+				t.Fatalf("fallback target = %+v", target)
+			}
+			return io.NopCloser(strings.NewReader("generic-static")), &Meta{
+				StatusCode: http.StatusOK, Header: make(http.Header), ContentLength: 14,
+			}, nil
+		}),
+	})
+
+	body, meta, err := svc.Fetch(context.Background(), &Target{
+		Kind: dispatch.KindStatic, Host: sumDBHost, Path: "/supported",
+		Method: http.MethodGet, Header: make(http.Header),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer body.Close()
+	got, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.StatusCode != http.StatusOK || string(got) != "generic-static" || fallbackCalls != 1 {
+		t.Fatalf("status = %d, body = %q, fallback calls = %d", meta.StatusCode, got, fallbackCalls)
+	}
+}
+
+func TestSumDBSupportedRequiresConfiguredUpstream(t *testing.T) {
+	valid := &RewriteSnapshot{Upstreams: map[string]RewriteUpstream{
+		"sum.golang.org": {
+			Profile:    upstream_entity.PackageProfileGoProxy,
+			Transports: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+		},
+	}}
+
+	tests := []struct {
+		name   string
+		path   string
+		source RewriteConfigSource
+		want   int
+	}{
+		{name: "configured", path: "/supported", source: sumDBRewriteSource{snapshot: valid}, want: http.StatusOK},
+		{name: "snapshot error", path: "/supported", source: sumDBRewriteSource{err: errors.New("database unavailable")}, want: http.StatusServiceUnavailable},
+		{name: "nil snapshot", path: "/supported", source: sumDBRewriteSource{}, want: http.StatusServiceUnavailable},
+		{name: "missing upstream", path: "/supported", source: sumDBRewriteSource{snapshot: &RewriteSnapshot{Upstreams: map[string]RewriteUpstream{}}}, want: http.StatusServiceUnavailable},
+		{name: "wrong profile", path: "/supported", source: configuredSumDBSource(upstream_entity.PackageProfileNPM, upstream_entity.ProtocolStatic), want: http.StatusServiceUnavailable},
+		{name: "wrong transport", path: "/supported", source: configuredSumDBSource(upstream_entity.PackageProfileGoProxy, upstream_entity.ProtocolRegistry), want: http.StatusServiceUnavailable},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := NewSumDB(SumDBOptions{RewriteConfig: tc.source})
+			body, meta, err := svc.Fetch(context.Background(), &Target{
+				Kind: dispatch.KindSumDB, Host: sumDBHost, Method: http.MethodGet, Path: tc.path,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer body.Close()
+			got, err := io.ReadAll(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if meta.StatusCode != tc.want || len(got) != 0 {
+				t.Fatalf("status = %d, body = %q; want %d, empty", meta.StatusCode, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSumDBRoutesApprovedPathsAndPassesResponseThrough(t *testing.T) {
+	var mu sync.Mutex
+	var requests []string
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests = append(requests, r.URL.RequestURI())
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
+		w.WriteHeader(http.StatusTeapot)
+		_, _ = io.WriteString(w, "sumdb-bytes\x00\xff")
+	}))
+	defer origin.Close()
+
+	originURL, err := url.Parse(origin.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, port, err := net.SplitHostPort(originURL.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver := resolverFunc(func(_ context.Context, target *url.URL, requirement destination.DestinationRequirement) (*destination.ResolvedTarget, error) {
+		if target.Host != "sum.golang.org" || target.Scheme != "https" {
+			t.Fatalf("resolver target = %s", target)
+		}
+		if requirement.RequireRegistered || requirement.Transport != upstream_entity.ProtocolStatic ||
+			requirement.Profile != upstream_entity.PackageProfileGoProxy || requirement.AddressPolicy != destination.PublicAddressesOnly {
+			t.Fatalf("resolver requirement = %+v", requirement)
+		}
+		mapped := *target
+		mapped.Scheme = "http"
+		return &destination.ResolvedTarget{
+			URL: &mapped, Authority: "sum.golang.org", Host: "sum.golang.org",
+			ServerName: "sum.golang.org", DialAddress: net.JoinHostPort("127.0.0.1", port),
+		}, nil
+	})
+	repo := setupRepo(t)
+	repo.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{{
+		ID: 9, Host: sumDBHost, Origin: "https://" + sumDBHost, Enabled: true,
+		Protocols:      upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+		PackageProfile: upstream_entity.PackageProfileGoProxy,
+	}}, nil).AnyTimes()
+	svc := New(Options{
+		RewriteConfig:       configuredSumDBSource(upstream_entity.PackageProfileGoProxy, upstream_entity.ProtocolStatic),
+		DestinationResolver: resolver,
+	})
+
+	tests := []struct {
+		name string
+		path string
+		want string
+	}{
+		{name: "lookup", path: "/lookup/github.com/!burnt!sushi/toml@v1.4.0?x=1", want: "/lookup/github.com/!burnt!sushi/toml@v1.4.0?x=1"},
+		{name: "complete tile", path: "/tile/8/1/000", want: "/tile/8/1/000"},
+		{name: "partial tile", path: "/tile/8/1/000.p/16", want: "/tile/8/1/000.p/16"},
+		{name: "latest", path: "/latest", want: "/latest"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			parsed, err := url.Parse(tc.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, meta, err := svc.Fetch(context.Background(), &Target{
+				Kind: dispatch.KindSumDB, Host: sumDBHost, Method: http.MethodGet,
+				Path: parsed.EscapedPath(), RawQuery: parsed.RawQuery,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer body.Close()
+			got, err := io.ReadAll(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if meta.StatusCode != http.StatusTeapot || string(got) != "sumdb-bytes\x00\xff" || meta.Header.Get("Content-Type") != "text/plain; charset=UTF-8" {
+				t.Fatalf("status = %d, headers = %v, body = %q", meta.StatusCode, meta.Header, got)
+			}
+			mu.Lock()
+			last := requests[len(requests)-1]
+			mu.Unlock()
+			if last != tc.want {
+				t.Fatalf("origin URI = %q, want %q", last, tc.want)
+			}
+		})
+	}
+}
+
+func TestSumDBRejectsUnknownPathsWithoutOriginAccess(t *testing.T) {
+	fallbackCalls := 0
+	svc := NewSumDB(SumDBOptions{
+		RewriteConfig: configuredSumDBSource(upstream_entity.PackageProfileGoProxy, upstream_entity.ProtocolStatic),
+		Fallback: proxyFunc(func(context.Context, *Target) (io.ReadCloser, *Meta, error) {
+			fallbackCalls++
+			return nil, nil, errors.New("unexpected fallback access")
+		}),
+	})
+
+	paths := []string{
+		"/",
+		"/lookup",
+		"/lookups/example.com/mod@v1.0.0",
+		"/tile",
+		"/latest/extra",
+	}
+	for _, path := range paths {
+		t.Run(strings.ReplaceAll(path, "/", "_"), func(t *testing.T) {
+			body, meta, err := svc.Fetch(context.Background(), &Target{
+				Kind: dispatch.KindSumDB, Host: sumDBHost, Path: path, Method: http.MethodGet,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer body.Close()
+			if meta.StatusCode != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404", meta.StatusCode)
+			}
+		})
+	}
+	if fallbackCalls != 0 {
+		t.Fatalf("fallback calls = %d, want 0", fallbackCalls)
+	}
+}
+
+func configuredSumDBSource(profile upstream_entity.PackageProfile, transport string) RewriteConfigSource {
+	return sumDBRewriteSource{snapshot: &RewriteSnapshot{Upstreams: map[string]RewriteUpstream{
+		"sum.golang.org": {Profile: profile, Transports: upstream_entity.ProtocolSet{transport}},
+	}}}
+}

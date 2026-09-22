@@ -2,14 +2,20 @@ package proxy_svc
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 
 	"github.com/smartystreets/goconvey/convey"
 	"go.uber.org/mock/gomock"
 
+	"github.com/CodFrm/katch/internal/api/admin"
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
+	"github.com/CodFrm/katch/internal/repository/rule_repo"
+	mock_rule_repo "github.com/CodFrm/katch/internal/repository/rule_repo/mock"
+	"github.com/CodFrm/katch/internal/repository/upstream_repo"
 	mock_upstream_repo "github.com/CodFrm/katch/internal/repository/upstream_repo/mock"
+	"github.com/CodFrm/katch/internal/service/upstream_svc"
 )
 
 func table() []*upstream_entity.Upstream {
@@ -233,4 +239,203 @@ func TestCachedUpstreamRepo_WriteDuringColdLoadIsNotLost(t *testing.T) {
 		convey.So(err, convey.ShouldBeNil)
 		convey.So(got, convey.ShouldBeNil)
 	})
+}
+
+type upstreamTxContextKey struct{}
+
+type commitAwareUpstreamRepo struct {
+	mu        sync.Mutex
+	committed *upstream_entity.Upstream
+	staged    *upstream_entity.Upstream
+	listCalls int
+}
+
+func cloneUpstreamRow(src *upstream_entity.Upstream) *upstream_entity.Upstream {
+	if src == nil {
+		return nil
+	}
+	return clone(src)
+}
+
+func (r *commitAwareUpstreamRepo) begin() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.staged = cloneUpstreamRow(r.committed)
+}
+
+func (r *commitAwareUpstreamRepo) finish(commit bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if commit {
+		r.committed = cloneUpstreamRow(r.staged)
+	}
+	r.staged = nil
+}
+
+func (r *commitAwareUpstreamRepo) current(ctx context.Context) *upstream_entity.Upstream {
+	if inTx, _ := ctx.Value(upstreamTxContextKey{}).(bool); inTx {
+		return r.staged
+	}
+	return r.committed
+}
+
+func (r *commitAwareUpstreamRepo) Find(ctx context.Context, id int64) (*upstream_entity.Upstream, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	row := r.current(ctx)
+	if row == nil || row.ID != id {
+		return nil, nil
+	}
+	return cloneUpstreamRow(row), nil
+}
+
+func (r *commitAwareUpstreamRepo) FindByHost(ctx context.Context, host string) (*upstream_entity.Upstream, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	row := r.current(ctx)
+	if row == nil || row.Host != host {
+		return nil, nil
+	}
+	return cloneUpstreamRow(row), nil
+}
+
+func (r *commitAwareUpstreamRepo) List(ctx context.Context) ([]*upstream_entity.Upstream, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.listCalls++
+	row := r.current(ctx)
+	if row == nil {
+		return []*upstream_entity.Upstream{}, nil
+	}
+	return []*upstream_entity.Upstream{cloneUpstreamRow(row)}, nil
+}
+
+func (r *commitAwareUpstreamRepo) Save(ctx context.Context, row *upstream_entity.Upstream) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if inTx, _ := ctx.Value(upstreamTxContextKey{}).(bool); !inTx {
+		return errors.New("test write escaped transaction")
+	}
+	r.staged = cloneUpstreamRow(row)
+	return nil
+}
+
+func (r *commitAwareUpstreamRepo) Delete(ctx context.Context, _ int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if inTx, _ := ctx.Value(upstreamTxContextKey{}).(bool); !inTx {
+		return errors.New("test delete escaped transaction")
+	}
+	r.staged = nil
+	return nil
+}
+
+type barrierRewriteConfigRepo struct {
+	upstreams    *commitAwareUpstreamRepo
+	callbackDone chan struct{}
+	finish       chan struct{}
+	rollback     bool
+}
+
+func (r *barrierRewriteConfigRepo) Transaction(ctx context.Context, fn func(context.Context) error) error {
+	r.upstreams.begin()
+	err := fn(context.WithValue(ctx, upstreamTxContextKey{}, true))
+	close(r.callbackDone)
+	<-r.finish
+	if err != nil || r.rollback {
+		r.upstreams.finish(false)
+		if err != nil {
+			return err
+		}
+		return errors.New("forced rollback")
+	}
+	r.upstreams.finish(true)
+	return nil
+}
+
+func (r *barrierRewriteConfigRepo) AdvanceGeneration(context.Context) error { return nil }
+
+func (r *barrierRewriteConfigRepo) Snapshot(context.Context) (*upstream_repo.RewriteConfigSnapshot, error) {
+	return &upstream_repo.RewriteConfigSnapshot{}, nil
+}
+
+// TestUpstreamWrite_InvalidatesOnlyAfterCommit reproduces the pre-commit cache
+// invalidation race without timing assumptions.
+func TestUpstreamWrite_InvalidatesOnlyAfterCommit(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		delete   bool
+		rollback bool
+	}{
+		{name: "disable commit"},
+		{name: "delete commit", delete: true},
+		{name: "disable rollback", rollback: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inner := &commitAwareUpstreamRepo{committed: &upstream_entity.Upstream{
+				ID: 1, Host: "deb.debian.org", Enabled: true,
+				Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+			}}
+			rewrite := &barrierRewriteConfigRepo{
+				upstreams: inner, callbackDone: make(chan struct{}), finish: make(chan struct{}), rollback: tc.rollback,
+			}
+			previousUpstream := upstream_repo.Upstream()
+			previousRewrite := upstream_repo.RewriteConfig()
+			previousRules := rule_repo.AccessRule()
+			upstream_repo.RegisterUpstream(NewCachedUpstreamRepo(inner))
+			upstream_repo.RegisterRewriteConfig(rewrite)
+			if tc.delete {
+				rules := mock_rule_repo.NewMockAccessRuleRepo(gomock.NewController(t))
+				rules.EXPECT().DeleteByUpstream(gomock.Any(), int64(1)).Return(nil)
+				rule_repo.RegisterAccessRule(rules)
+			}
+			t.Cleanup(func() {
+				upstream_repo.RegisterUpstream(previousUpstream)
+				upstream_repo.RegisterRewriteConfig(previousRewrite)
+				rule_repo.RegisterAccessRule(previousRules)
+			})
+
+			ctx := context.Background()
+			primed, err := upstream_svc.Upstream().FindByHost(ctx, "deb.debian.org")
+			if err != nil || primed == nil {
+				t.Fatalf("prime enabled upstream: got %#v, err %v", primed, err)
+			}
+
+			writeDone := make(chan error, 1)
+			go func() {
+				if tc.delete {
+					_, err := upstream_svc.Upstream().Delete(ctx, &admin.DeleteUpstreamRequest{ID: 1})
+					writeDone <- err
+					return
+				}
+				_, err := upstream_svc.Upstream().Update(ctx, &admin.UpdateUpstreamRequest{
+					ID: 1, Host: "deb.debian.org", Enabled: false,
+					Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+				})
+				writeDone <- err
+			}()
+			<-rewrite.callbackDone
+
+			during, err := upstream_svc.Upstream().FindByHost(ctx, "deb.debian.org")
+			if err != nil || during == nil {
+				t.Fatalf("uncommitted disable became visible: got %#v, err %v", during, err)
+			}
+			close(rewrite.finish)
+			err = <-writeDone
+
+			after, readErr := upstream_svc.Upstream().FindByHost(ctx, "deb.debian.org")
+			if tc.rollback {
+				if err == nil || readErr != nil || after == nil {
+					t.Fatalf("rollback changed visible state: write err %v, got %#v, read err %v", err, after, readErr)
+				}
+				if inner.listCalls != 1 {
+					t.Fatalf("rollback invalidated valid cache: List called %d times, want 1", inner.listCalls)
+				}
+				return
+			}
+			if err != nil || readErr != nil || after != nil {
+				t.Fatalf("committed disable not visible: write err %v, got %#v, read err %v", err, after, readErr)
+			}
+		})
+	}
 }

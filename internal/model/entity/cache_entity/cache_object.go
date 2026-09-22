@@ -23,6 +23,41 @@ type CacheObject struct {
 	// ContentType 回源时的内容类型。缓存命中要和回源给出同样的响应，
 	// 少了它客户端会按别的类型解析同一份字节。
 	ContentType string `gorm:"column:content_type" json:"content_type"`
+	// ETag 上游成功响应里的 ETag，原样保存、命中时原样回放；上游没给时为空。
+	//
+	// 不为历史行推导：上游的 ETag 与缓存摘要未必是同一个标识，拿摘要冒充会让
+	// 客户端拿着另一串 validator 去做条件请求，得到错误的结果（决策 5）。
+	ETag string `gorm:"column:etag" json:"etag"`
+	// LastModified 上游成功响应里的 Last-Modified，原样保存、命中时原样回放。
+	LastModified string `gorm:"column:last_modified" json:"last_modified"`
+	// OriginETag 与 OriginLastModified 上游自己的 validator，只用来在过期后发条件回源，
+	// 从不回放给客户端。
+	//
+	// 和上面两列分开存：转换过的元数据回放的是 katch 对转换结果算的 ETag，不带
+	// Last-Modified，上游那两串在那两列里已经不在了；拿 katch 的 ETag 去问上游，上游
+	// 永远答不出 304。原样透传的对象这两组值相同。
+	OriginETag         string `gorm:"column:origin_etag" json:"origin_etag"`
+	OriginLastModified string `gorm:"column:origin_last_modified" json:"origin_last_modified"`
+	// Safe response metadata is persisted explicitly; arbitrary origin headers never reach disk.
+	CacheControl        string `gorm:"column:cache_control" json:"cache_control"`
+	OriginDate          string `gorm:"column:origin_date" json:"origin_date"`
+	OriginAge           int64  `gorm:"column:origin_age" json:"origin_age"`
+	OriginExpires       string `gorm:"column:origin_expires" json:"origin_expires"`
+	Vary                string `gorm:"column:vary" json:"vary"`
+	AcceptRanges        string `gorm:"column:accept_ranges" json:"accept_ranges"`
+	ContentDisposition  string `gorm:"column:content_disposition" json:"content_disposition"`
+	DockerContentDigest string `gorm:"column:docker_content_digest" json:"docker_content_digest"`
+	// DockerDistributionAPIVersion 上游响应里的 Docker-Distribution-Api-Version，命中时原样
+	// 回放；上游没给时为空，命中也不带。
+	DockerDistributionAPIVersion string `gorm:"column:docker_distribution_api_version" json:"docker_distribution_api_version"`
+	// Maven-compatible checksum headers are opaque origin metadata. They are replayed as-is
+	// on hits, never derived from or used to validate the cached body.
+	XChecksumMD5         string `gorm:"column:x_checksum_md5" json:"x_checksum_md5"`
+	XChecksumSHA1        string `gorm:"column:x_checksum_sha1" json:"x_checksum_sha1"`
+	XChecksumSHA256      string `gorm:"column:x_checksum_sha256" json:"x_checksum_sha256"`
+	XChecksumSHA512      string `gorm:"column:x_checksum_sha512" json:"x_checksum_sha512"`
+	StoredAt             int64  `gorm:"column:stored_at" json:"stored_at"`
+	RequiresRevalidation bool   `gorm:"column:requires_revalidation" json:"requires_revalidation"`
 	// Immutable 内容寻址的对象：内容永不改写，长期缓存，只由 LRU 淘汰（决策 7）。
 	Immutable bool `gorm:"column:immutable" json:"immutable"`
 	// Pinned 人工要求常驻，不参与淘汰。
@@ -38,7 +73,8 @@ type CacheObject struct {
 // Expired 判断这条记录在 now（秒）是否已经过期。
 //
 // 不可变对象永不过期（决策 7）：它的内容按摘要寻址，改不了，也就没有「过期」
-// 这回事；可变对象到点即失效，宁可多回一次源，也不能发出过期的 tag 或 InRelease。
+// 这回事——包括历史行里 ExpiresAt 还带着非零值的那些，读取时一律当不过期；
+// 可变对象到点即失效，宁可多回一次源，也不能发出过期的 tag 或 InRelease。
 func (c *CacheObject) Expired(now int64) bool {
 	if c.Immutable || c.ExpiresAt == 0 {
 		return false

@@ -1,0 +1,26 @@
+{
+  "@context": {
+    "@vocab": "http://schema.nuget.org/schema#"
+  },
+  "totalHits": 1,
+  "data": [
+    {
+      "@id": "https://api.nuget.org/v3/registration5-gz-semver2/example.package/index.json",
+      "@type": "Package",
+      "registration": "https://api.nuget.org/v3/registration5-gz-semver2/example.package/index.json",
+      "packageContent": "https://api.nuget.org/v3-flatcontainer/example.package/1.0.0/example.package.1.0.0.nupkg",
+      "id": "Example.Package",
+      "version": "1.0.0",
+      "projectUrl": "https://project.example/package",
+      "licenseUrl": "https://licenses.example/license",
+      "iconUrl": "https://images.example/icon.png",
+      "documentation": "https://docs.example/package",
+      "versions": [
+        {
+          "version": "1.0.0",
+          "@id": "https://api.nuget.org/v3/registration5-gz-semver2/example.package/1.0.0.json"
+        }
+      ]
+    }
+  ]
+}

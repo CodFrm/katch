@@ -102,6 +102,55 @@ func TestRecorder_RequestsTotal(t *testing.T) {
 	})
 }
 
+// TestRecorder_SumDBAliasPullsAreCounted
+//
+// checksum database 的两条公开别名也是拉取：它们照常打上游、照常占缓存，
+// 只是路径上多了一段保留命名空间。漏掉它们，命中率会被冲淡成另一个数，
+// 最近请求页上也再看不到 go 的校验流量。
+func TestRecorder_SumDBAliasPullsAreCounted(t *testing.T) {
+	convey.Convey("sumdb 别名路径按 static 记在 sum.golang.org 名下", t, func() {
+		reg := prometheus.NewRegistry()
+		rec := New(Options{Registerer: reg})
+		hooks := Hooks{Lookup: knownUpstreams("sum.golang.org")}
+		miss := &upstreamResponse{status: http.StatusOK, cache: "MISS",
+			miss: string(MissFirst), body: "checksum"}
+
+		get(newTestEngine(rec, hooks, miss), "/sumdb/sum.golang.org/lookup/example.com/mod@v1.0.0")
+		get(newTestEngine(rec, hooks, miss),
+			"/proxy.golang.org/sumdb/sum.golang.org/tile/8/1/000.p/16")
+
+		body := scrape(reg)
+		convey.So(body, convey.ShouldContainSubstring,
+			`katch_requests_total{kind="static",result="miss",upstream="sum.golang.org"} 2`)
+		convey.So(body, convey.ShouldContainSubstring,
+			`katch_bytes_served_total{source="origin",upstream="sum.golang.org"} 16`)
+		convey.So(rec.DrainRecent(), convey.ShouldHaveLength, 2)
+	})
+}
+
+// TestRecorder_SumDBAliasIsNeverGit
+//
+// git 端点寄生在 static 的路径空间里，所以只有 static 会按路径形态认 git
+// （web/embed.go 里的同一条判据）。sumdb 的保留命名空间下不存在 git 端点：
+// 拿它当 git 记，等于任何人都能拼一个 /sumdb/... 的路径往 git 那一维里灌数。
+func TestRecorder_SumDBAliasIsNeverGit(t *testing.T) {
+	convey.Convey("sumdb 别名下形如 git 的路径仍记成 static", t, func() {
+		reg := prometheus.NewRegistry()
+		rec := New(Options{Registerer: reg})
+		hooks := Hooks{Lookup: knownUpstreams("sum.golang.org")}
+		miss := &upstreamResponse{status: http.StatusOK, cache: "MISS",
+			miss: string(MissFirst), body: "checksum"}
+
+		get(newTestEngine(rec, hooks, miss),
+			"/sumdb/sum.golang.org/lookup/example.com/info/refs?service=git-upload-pack")
+
+		body := scrape(reg)
+		convey.So(body, convey.ShouldContainSubstring,
+			`katch_requests_total{kind="static",result="miss",upstream="sum.golang.org"} 1`)
+		convey.So(body, convey.ShouldNotContainSubstring, `kind="git"`)
+	})
+}
+
 func TestRecorder_DeniedAndUnknownHost(t *testing.T) {
 	convey.Convey("白名单之外的主机计成 denied，且不把主机名变成新的标签值", t, func() {
 		reg := prometheus.NewRegistry()
@@ -659,5 +708,25 @@ func TestRecorder_RejectedGitRequestsAreStillGit(t *testing.T) {
 
 		convey.So(scrape(reg), convey.ShouldContainSubstring,
 			`katch_requests_total{kind="git",result="denied",upstream="git.example.com"} 1`)
+	})
+}
+
+func TestRecorder_RevalidatedCountsAsTTLMissWithoutOriginBytes(t *testing.T) {
+	convey.Convey("304 续期记一次 TTL 未命中，但没有一个正文字节来自上游", t, func() {
+		reg := prometheus.NewRegistry()
+		rec := New(Options{Registerer: reg, Now: func() time.Time { return time.Unix(1700000045, 0) }})
+		hooks := Hooks{Lookup: knownUpstreams("deb.debian.org")}
+
+		get(newTestEngine(rec, hooks, &upstreamResponse{status: http.StatusOK, cache: "REVALIDATED",
+			miss: string(MissTTL), body: "abcdef"}), "/deb.debian.org/dists/stable/InRelease")
+
+		got := rec.Drain()
+		convey.So(len(got), convey.ShouldEqual, 1)
+		convey.So(got[0].Requests, convey.ShouldEqual, 1)
+		convey.So(got[0].Hits, convey.ShouldEqual, 0)
+		convey.So(got[0].MissTTL, convey.ShouldEqual, 1)
+		convey.So(got[0].BytesServed, convey.ShouldEqual, 6)
+		convey.So(got[0].BytesOrigin, convey.ShouldEqual, 0)
+		convey.So(scrape(reg), convey.ShouldContainSubstring, `result="miss"`)
 	})
 }

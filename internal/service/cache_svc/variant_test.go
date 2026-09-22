@@ -2,6 +2,7 @@ package cache_svc
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
 	"github.com/CodFrm/katch/internal/proxy/dispatch"
+	"github.com/CodFrm/katch/internal/proxy/packageprofile"
 	"github.com/CodFrm/katch/internal/service/proxy_svc"
 )
 
@@ -56,6 +58,39 @@ func manifestOrigin(t *testing.T) *originStub {
 		w.Header().Set("Content-Type", mediaType)
 		_, _ = io.WriteString(w, body)
 	})
+}
+
+func TestCacheKey_TransformedProfileIncludesGenerationAndDeclaredVariants(t *testing.T) {
+	convey.Convey("transformed metadata identity is generation-aware and normalized", t, func() {
+		tg := target("registry.example.com", "/pkg")
+		tg.RawQuery = "view=full"
+		tg.Header.Add("Accept", " Application/JSON ; q=1.0, text/html;q=0.50")
+		tg.Header.Set("User-Agent", "ignored")
+		representation := packageprofile.Representation{
+			Class: packageprofile.ClassMutable, Transform: true, Variants: []string{"Accept"},
+		}
+
+		first := cacheKeyForRepresentation(tg, representation, 41)
+		equivalent := target("registry.example.com", "/pkg")
+		equivalent.RawQuery = "view=full"
+		equivalent.Header.Add("Accept", "text/html;q=0.5,application/json")
+		convey.So(cacheKeyForRepresentation(equivalent, representation, 41), convey.ShouldEqual, first)
+		convey.So(cacheKeyForRepresentation(equivalent, representation, 42), convey.ShouldNotEqual, first)
+		convey.So(first, convey.ShouldContainSubstring, variantMarker+"generation=41")
+
+		undeclared := target("registry.example.com", "/pkg")
+		undeclared.RawQuery = "view=full"
+		undeclared.Header.Set("User-Agent", "different")
+		convey.So(cacheKeyForRepresentation(undeclared, representation, 41), convey.ShouldNotEqual, first)
+	})
+}
+
+func TestCacheKey_TransparentRepresentationKeepsLegacyIdentity(t *testing.T) {
+	tg := target("files.example.com", "/artifact.tgz")
+	representation := packageprofile.Representation{Class: packageprofile.ClassImmutable}
+	if got := cacheKeyForRepresentation(tg, representation, 99); got != "/artifact.tgz" {
+		t.Fatalf("transparent cache key = %q", got)
+	}
 }
 
 // TestGet_RegistryDigestObjectsAreImmutableWithoutPatterns 回归线上集群的真实配置：
@@ -148,6 +183,35 @@ func TestGet_RegistryLegacyImmutableTagIsRefetched(t *testing.T) {
 	})
 }
 
+func TestGet_GenericImmutablePatternRemovalRefetchesAsMutable(t *testing.T) {
+	convey.Convey("不再命中 immutable_patterns 的旧永久对象会回源并改用 TTL", t, func() {
+		var o *originStub
+		o = newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = io.WriteString(w, fmt.Sprintf("current-%d", o.hits.Load()))
+		})
+		up := staticUpstream("packages.example.com")
+		up.ImmutablePatterns = upstream_entity.PatternList{"/pool/"}
+		up.MutableTTLSeconds = 300
+		svc, repo, _ := setupSvc(t, o, up, Options{})
+		const path = "/pool/main/p/package.deb"
+
+		convey.So(svc.Put(context.Background(), &PutRequest{
+			UpstreamID: up.ID, Key: path, Content: strings.NewReader("stale immutable"),
+			ContentType: "application/octet-stream", Immutable: true,
+		}), convey.ShouldBeNil)
+		up.ImmutablePatterns = nil
+
+		got, meta := pullWith(t, svc, target(up.Host, path))
+		convey.So(got, convey.ShouldEqual, "current-1")
+		convey.So(meta.Header.Get(cacheStatusHeader), convey.ShouldEqual, cacheStatusMiss)
+		convey.So(o.hits.Load(), convey.ShouldEqual, int64(1))
+		row := repo.byKey(path)
+		convey.So(row.Immutable, convey.ShouldBeFalse)
+		convey.So(row.ExpiresAt, convey.ShouldBeGreaterThan, time.Now().Unix())
+	})
+}
+
 // TestGet_RegistryLegacyMutableDigestIsPromoted 升级前已经写下的错误记录也要自愈。
 // 命中时若只发出字节、不修正元数据，后台 Sweep 仍会在旧 TTL 到点后删掉它。
 func TestGet_RegistryLegacyMutableDigestIsPromoted(t *testing.T) {
@@ -225,6 +289,120 @@ func pullWith(t *testing.T, svc CacheSvc, target *proxy_svc.Target) (string, *pr
 		t.Fatalf("关响应体失败：%v", err)
 	}
 	return string(got), meta
+}
+
+func TestGet_APKOriginVariantsCacheAndDoNotCross(t *testing.T) {
+	profile, ok := packageprofile.Lookup(upstream_entity.PackageProfileAPK)
+	if !ok {
+		t.Fatal("APK profile is not registered")
+	}
+	profiles := packageprofile.NewRegistry()
+	if err := profiles.Register(profile); err != nil {
+		t.Fatal(err)
+	}
+
+	var o *originStub
+	o = newOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.alpine.apk")
+		w.Header().Set("Vary", "Origin")
+		_, _ = io.WriteString(w, fmt.Sprintf("signed-apk-%d", o.hits.Load()))
+	})
+	up := staticUpstream("dl-cdn.alpinelinux.org")
+	up.PackageProfile = upstream_entity.PackageProfileAPK
+	svc, repo, _ := setupSvc(t, o, up, Options{Profiles: profiles})
+	const path = "/alpine/v3.22/main/x86_64/busybox-1.37.0-r18.apk"
+
+	pull := func(origin string) (string, *proxy_svc.Meta) {
+		t.Helper()
+		tg := target(up.Host, path)
+		if origin != "" {
+			tg.Header.Set("Origin", origin)
+		}
+		return pullWith(t, svc, tg)
+	}
+	assertColdWarm := func(origin, wantBody string, wantHits int64) {
+		t.Helper()
+		coldBody, coldMeta := pull(origin)
+		warmBody, warmMeta := pull(origin)
+		if coldBody != wantBody || warmBody != wantBody {
+			t.Fatalf("Origin %q bodies = %q, %q, want %q", origin, coldBody, warmBody, wantBody)
+		}
+		if coldMeta.Header.Get(cacheStatusHeader) != cacheStatusMiss ||
+			warmMeta.Header.Get(cacheStatusHeader) != cacheStatusHit {
+			t.Fatalf("Origin %q cache statuses = %q, %q", origin,
+				coldMeta.Header.Get(cacheStatusHeader), warmMeta.Header.Get(cacheStatusHeader))
+		}
+		if coldMeta.Header.Get("Vary") != "Origin" || warmMeta.Header.Get("Vary") != "Origin" {
+			t.Fatalf("Origin %q Vary headers = %q, %q", origin,
+				coldMeta.Header.Get("Vary"), warmMeta.Header.Get("Vary"))
+		}
+		if got := o.hits.Load(); got != wantHits {
+			t.Fatalf("Origin %q origin hits = %d, want %d", origin, got, wantHits)
+		}
+	}
+
+	assertColdWarm("", "signed-apk-1", 1)
+	assertColdWarm("https://a.example", "signed-apk-2", 2)
+	assertColdWarm("https://b.example", "signed-apk-3", 3)
+	if got := len(repo.all()); got != 3 {
+		t.Fatalf("cache rows = %d, want 3 isolated Origin variants", got)
+	}
+}
+
+func TestGet_ComposerGitHubFullSHAAuthorizationVariantsCacheAndDoNotCross(t *testing.T) {
+	profile, ok := packageprofile.Lookup(upstream_entity.PackageProfileComposer)
+	if !ok {
+		t.Fatal("Composer profile is not registered")
+	}
+	profiles := packageprofile.NewRegistry()
+	if err := profiles.Register(profile); err != nil {
+		t.Fatal(err)
+	}
+
+	var o *originStub
+	o = newOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/zip")
+		w.Header().Set("Vary", "Authorization, Accept-Encoding")
+		_, _ = io.WriteString(w, fmt.Sprintf("dist-%s-%d", r.Header.Get("Authorization"), o.hits.Load()))
+	})
+	up := staticUpstream("api.github.com")
+	up.PackageProfile = upstream_entity.PackageProfileComposer
+	svc, repo, _ := setupSvc(t, o, up, Options{Profiles: profiles})
+	const path = "/repos/acme/widget/zipball/0123456789abcdef0123456789abcdef01234567"
+
+	pull := func(authorization string) (string, *proxy_svc.Meta) {
+		t.Helper()
+		tg := target(up.Host, path)
+		tg.Header.Set("Authorization", authorization)
+		return pullWith(t, svc, tg)
+	}
+	assertColdWarm := func(authorization, wantBody string, wantHits int64) {
+		t.Helper()
+		coldBody, coldMeta := pull(authorization)
+		warmBody, warmMeta := pull(authorization)
+		if coldBody != wantBody || warmBody != wantBody {
+			t.Fatalf("Authorization %q bodies = %q, %q, want %q", authorization, coldBody, warmBody, wantBody)
+		}
+		if coldMeta.Header.Get(cacheStatusHeader) != cacheStatusMiss ||
+			warmMeta.Header.Get(cacheStatusHeader) != cacheStatusHit {
+			t.Fatalf("Authorization %q cache statuses = %q, %q", authorization,
+				coldMeta.Header.Get(cacheStatusHeader), warmMeta.Header.Get(cacheStatusHeader))
+		}
+		if coldMeta.Header.Get("Vary") != "Authorization" || warmMeta.Header.Get("Vary") != "Authorization" {
+			t.Fatalf("Authorization %q Vary headers = %q, %q", authorization,
+				coldMeta.Header.Get("Vary"), warmMeta.Header.Get("Vary"))
+		}
+		if got := o.hits.Load(); got != wantHits {
+			t.Fatalf("Authorization %q origin hits = %d, want %d", authorization, got, wantHits)
+		}
+	}
+
+	assertColdWarm("Bearer first", "dist-Bearer first-1", 1)
+	assertColdWarm("Bearer second", "dist-Bearer second-2", 2)
+	rows := repo.all()
+	if len(rows) != 2 || !rows[0].Immutable || !rows[1].Immutable || rows[0].Key == rows[1].Key {
+		t.Fatalf("Composer cache rows = %+v, want two immutable Authorization variants", rows)
+	}
 }
 
 // TestGet_ManifestAcceptVariantsDoNotShareOneCopy 同一个 tag，两种客户端两份副本。
@@ -319,7 +497,7 @@ func TestGet_KeyIsUnchangedWithoutAcceptVariance(t *testing.T) {
 	})
 }
 
-// dockerAcceptSet / ociAcceptSet 两种客户端各自那一串 Accept 的等价写法。
+// dockerAcceptSet 是 docker 客户端那一串 Accept 的等价写法。
 var dockerAcceptSet = []string{dockerManifestType, dockerIndexType}
 
 // TestNormalizeAccept_SameMeaningLandsOnOneKey 归一化：意思相同的 Accept 归到一个键。

@@ -30,6 +30,10 @@ func TestProtocolMatches(t *testing.T) {
 			set(upstream_entity.ProtocolStatic), false},
 		{"registry 形态遇上只开 git 的记录", dispatch.KindRegistry,
 			set(upstream_entity.ProtocolGit), false},
+		{"sumdb 内部形态遇上 static 记录", dispatch.KindSumDB,
+			set(upstream_entity.ProtocolStatic), true},
+		{"sumdb 内部形态遇上 registry 记录", dispatch.KindSumDB,
+			set(upstream_entity.ProtocolRegistry), false},
 		{"static 形态遇上只开 static 的记录", dispatch.KindStatic,
 			set(upstream_entity.ProtocolStatic), true},
 		{"static 形态遇上只开 registry 的记录", dispatch.KindStatic,
@@ -62,7 +66,7 @@ func TestProtocolMatches(t *testing.T) {
 	convey.Convey("协议集合决定一条上游服务哪些请求形态", t, func() {
 		for _, c := range cases {
 			convey.Convey(c.name, func() {
-				got := protocolMatches(
+				got := SupportsTarget(
 					&Target{Kind: c.kind, Host: "example.invalid", Path: "/x"},
 					&upstream_entity.Upstream{Host: "example.invalid", Protocols: c.protocols},
 				)

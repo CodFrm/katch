@@ -10,6 +10,21 @@ import (
 	"strings"
 )
 
+const (
+	// registryBaseNamespace is an explicit base for clients such as Homebrew that
+	// append their own /v2/<repository> path to a configured artifact domain.
+	// Keeping the boundary in the route avoids guessing whether a repository's
+	// legitimate first segment named v2 is a protocol prefix.
+	registryBaseNamespace = "/registry"
+	sumDBNamespace        = "/sumdb"
+	// SumDBHost 是 sumdb 别名固定指向的那一个 checksum database。路由在这里认它，
+	// proxy_svc 的 checksum 桥也按它改写目标：两边各写一遍字符串，改一处就会让
+	// 另一边把请求送去一个 nobody 认识的主机。
+	SumDBHost        = "sum.golang.org"
+	sumDBRoutePrefix = sumDBNamespace + "/" + SumDBHost
+	goProxyHost      = "proxy.golang.org"
+)
+
 // Kind 一个路径的归属。
 type Kind int
 
@@ -24,10 +39,26 @@ const (
 	KindRegistry
 	// KindStatic 其余上游，第一段就是主机名。
 	KindStatic
+	// KindSumDB 仅用于两个公开 checksum database 别名，保留到策略与缓存边界。
+	KindSumDB
 	// KindInvalid 形如上游请求、却拿不出可用主机名或路径含 .. 回溯段。
 	// 它和「主机不在白名单里」一样返回 404，不给出任何区别。
 	KindInvalid
 )
+
+// IsPull 这一类请求是不是一次上游拉取。
+//
+// 三处要按同一条判据分流：访问规则只约束拉取、拉取指标只数拉取、web 只把拉取交给
+// 缓存与代理。各写各的条件，加一个新的 Kind 时必定漏掉其中一处——sumdb 别名就是
+// 这么从 /metrics 和最近请求里消失过一次的。
+func IsPull(kind Kind) bool {
+	switch kind {
+	case KindRegistry, KindStatic, KindSumDB:
+		return true
+	default:
+		return false
+	}
+}
 
 // String 让表驱动用例的失败信息可读。
 func (k Kind) String() string {
@@ -42,6 +73,8 @@ func (k Kind) String() string {
 		return "Registry"
 	case KindStatic:
 		return "Static"
+	case KindSumDB:
+		return "SumDB"
 	case KindInvalid:
 		return "Invalid"
 	}
@@ -57,12 +90,13 @@ func (k Kind) String() string {
 // 判定顺序即决策顺序，第一条命中即止：
 //
 //  1. /api/...、/metrics 是 katch 自身的端点；
-//  2. /v2 与 /v2/ 是 registry 的探测请求；
-//  3. /v2/<host>/... 是 registry 协议，主机名在 /v2/ 之后；
-//  4. 第一段含 . 的，该段即主机名（决策 2：公网主机名必然含点）；
-//  5. 其余交给 SPA。
+//  2. /registry/<host>/v2/... 是供会自行追加 /v2 的客户端使用的 registry base；
+//  3. /v2 与 /v2/ 是 registry 的探测请求；
+//  4. /v2/<host>/... 是 registry 协议，主机名在 /v2/ 之后；
+//  5. 第一段含 . 的，该段即主机名（决策 2：公网主机名必然含点）；
+//  6. 其余交给 SPA。
 //
-// 只有 KindRegistry 与 KindStatic 会带回 host/rest，其余两项都是空串。
+// 只有 KindRegistry、KindStatic 与 KindSumDB 会带回 host/rest，其余都是空串。
 // KindRegistry 的 rest **不含** /v2 前缀——那是 registry 的协议前缀，由回源侧
 // 按上游类别补回，不属于「上游路径」。
 //
@@ -78,6 +112,12 @@ func Classify(path string) (Kind, string, string) {
 		strings.HasPrefix(path, "/api/") || strings.HasPrefix(path, "/metrics/") {
 		return KindSelf, "", ""
 	}
+	if path == registryBaseNamespace || strings.HasPrefix(path, registryBaseNamespace+"/") {
+		return classifyRegistryBase(path)
+	}
+	if sumDBNamespacePath(path) {
+		return classifySumDB(path)
+	}
 	if path == "/v2" || path == "/v2/" {
 		return KindRegistryPing, "", ""
 	}
@@ -86,7 +126,61 @@ func Classify(path string) (Kind, string, string) {
 		// 它不含点就是个拿不出上游的请求，和未知主机一样 404。
 		return upstream(KindRegistry, rest)
 	}
-	return upstream(KindStatic, strings.TrimPrefix(path, "/"))
+	kind, host, rest := upstream(KindStatic, strings.TrimPrefix(path, "/"))
+	if kind == KindStatic && strings.EqualFold(host, goProxyHost) && sumDBNamespacePath(rest) {
+		return classifySumDB(rest)
+	}
+	return kind, host, rest
+}
+
+func sumDBNamespacePath(path string) bool {
+	return path == sumDBNamespace || strings.HasPrefix(path, sumDBNamespace+"/")
+}
+
+func classifySumDB(path string) (Kind, string, string) {
+	if path != sumDBRoutePrefix && !strings.HasPrefix(path, sumDBRoutePrefix+"/") {
+		return KindInvalid, "", ""
+	}
+	rest := strings.TrimPrefix(path, sumDBRoutePrefix)
+	if rest == "" {
+		rest = "/"
+	}
+	if !safeTail(strings.TrimPrefix(rest, "/")) || !ValidSumDBRoute(rest) {
+		return KindInvalid, "", ""
+	}
+	return KindSumDB, SumDBHost, rest
+}
+
+// ValidSumDBRoute checksum database 协议认得的那几条路由。
+//
+// 导出给桥那一侧复用：路由表写两份，加一条路由时就会有一处留在旧表上——分发层
+// 放行而桥 404，或者反过来。
+func ValidSumDBRoute(path string) bool {
+	return path == "/supported" || path == "/latest" ||
+		strings.HasPrefix(path, "/lookup/") && len(path) > len("/lookup/") ||
+		strings.HasPrefix(path, "/tile/") && len(path) > len("/tile/")
+}
+
+// classifyRegistryBase parses the one route whose /v2 segment is a delimiter
+// supplied by katch rather than part of the repository path. The host and tail
+// still go through upstream so escaping and traversal rules stay identical to
+// the legacy /v2/<host>/... registry route.
+func classifyRegistryBase(path string) (Kind, string, string) {
+	rest := strings.TrimPrefix(path, registryBaseNamespace)
+	if rest == "" || rest[0] != '/' {
+		return KindInvalid, "", ""
+	}
+	kind, host, tail := upstream(KindRegistry, strings.TrimPrefix(rest, "/"))
+	if kind != KindRegistry {
+		return KindInvalid, "", ""
+	}
+	if tail == "/v2" {
+		return KindRegistry, host, "/"
+	}
+	if registryPath, ok := strings.CutPrefix(tail, "/v2/"); ok {
+		return KindRegistry, host, "/" + registryPath
+	}
+	return KindInvalid, "", ""
 }
 
 // upstream 把「主机名/剩余路径」这段形状解出来，拿不出主机名时降级。

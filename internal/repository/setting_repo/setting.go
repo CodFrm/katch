@@ -19,9 +19,30 @@ type SettingRepo interface {
 
 var defaultSetting SettingRepo
 
+type cacheManagedSettingRepo interface {
+	SettingRepo
+	Uncached() SettingRepo
+	Invalidate()
+}
+
 // Setting 返回已注册的实现。
 func Setting() SettingRepo {
 	return defaultSetting
+}
+
+// UncachedSetting 返回事务回调使用的底层仓储，避免在提交前失效进程缓存。
+func UncachedSetting() SettingRepo {
+	if managed, ok := defaultSetting.(cacheManagedSettingRepo); ok {
+		return managed.Uncached()
+	}
+	return defaultSetting
+}
+
+// InvalidateSettingCache 在事务成功提交后失效进程缓存。
+func InvalidateSettingCache() {
+	if managed, ok := defaultSetting.(cacheManagedSettingRepo); ok {
+		managed.Invalidate()
+	}
 }
 
 // RegisterSetting 注册实现，由 main 装配、由测试注入 mock。

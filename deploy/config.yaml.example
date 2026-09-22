@@ -1,8 +1,9 @@
 # katch 容器部署的配置模板。
 #
-# 和 configs/config.yaml.example 是**两份**：那份是本地开发的出厂值（env: DEV、
-# debug: true、日志落 ./runtime/logs），这份是跑在容器里的那一套。加新配置项时
-# 两边都要加——只加一边的后果是「本地好好的，部署上去起不来」。
+# 和 configs/config.yaml.example 是**两份**：那份是本地开发与 smoke 的出厂值
+# （env: DEV、日志落 ./runtime/logs），这份是跑在容器里的那一套。两份的 debug 都关着，
+# 理由写在那份里。加新配置项时两边都要加——只加一边的后果是「本地好好的，部署上去
+# 起不来」。
 #
 # 用法：
 #   cp deploy/config.yaml.example deploy/config.yaml
@@ -47,12 +48,16 @@ db:
   #   dsn: "user:pass@tcp(mysql:3306)/katch?charset=utf8mb4&parseTime=True&loc=Local"
   # 注意切了 mysql 也**不能**多开副本，理由见 docs/deploy.md 的「为什么只能一个副本」。
   driver: "sqlite"
-  # 两个 pragma 都不能省：
-  #   journal_mode(WAL)  —— 默认的 DELETE 模式下读会阻塞写，缓存元数据是读多写少，
-  #                         不开 WAL 一上并发就互相卡。
-  #   busy_timeout(5000) —— sqlite 遇到锁默认**立刻**返回 SQLITE_BUSY 而不是等待，
-  #                         不设这个值，并发写会直接报 "database is locked"。
-  dsn: "file:./data/katch.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+  # 三个 pragma 都不能省：
+  #   journal_mode(WAL)     —— 默认的 DELETE 模式下读会阻塞写，缓存元数据是读多写少，
+  #                            不开 WAL 一上并发就互相卡。
+  #   busy_timeout(5000)    —— sqlite 遇到锁默认**立刻**返回 SQLITE_BUSY 而不是等待，
+  #                            不设这个值，并发写会直接报 "database is locked"。
+  #   synchronous(NORMAL)   —— 默认的 FULL 在 WAL 下每次提交都 fsync，而缓存正往同一块盘
+  #                            写大文件，一次提交能卡几百毫秒到几秒，等锁的写还会超过上面
+  #                            的 5 秒直接失败。NORMAL 只在断电或系统崩溃时可能丢最后几个
+  #                            事务（进程崩溃不丢），对缓存元数据的代价是下次重新回源。
+  dsn: "file:./data/katch.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)"
   prefix: "katch_"
   debug: false
   # sqlite 是单文件，写入本来就串行，连接数开大只会增加锁竞争。

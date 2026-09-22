@@ -1,0 +1,26 @@
+{
+  "_id": "@scope/pkg",
+  "name": "@scope/pkg",
+  "dist-tags": {"latest": "2.0.0", "next": "3.0.0-beta.1"},
+  "readme": "full representation marker",
+  "versions": {
+    "1.0.0": {
+      "name": "@scope/pkg",
+      "version": "1.0.0",
+      "dist": {
+        "integrity": "sha512-full-one",
+        "shasum": "1111111111111111111111111111111111111111",
+        "tarball": "https://registry.npmjs.org/@scope%2fpkg/-/pkg-1.0.0.tgz"
+      }
+    },
+    "2.0.0": {
+      "name": "@scope/pkg",
+      "version": "2.0.0",
+      "dist": {
+        "integrity": "sha512-full-two",
+        "shasum": "2222222222222222222222222222222222222222",
+        "tarball": "https://registry.npmjs.org/@scope%2fpkg/-/pkg-2.0.0.tgz?download=1"
+      }
+    }
+  }
+}

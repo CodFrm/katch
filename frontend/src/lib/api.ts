@@ -8,6 +8,42 @@
 /** 上游能服务的协议，取值与后端 upstream_entity 的 Protocol* 常量一致。 */
 export type UpstreamProtocol = 'registry' | 'static' | 'git'
 
+/** profile 名称由后端注册表提供；string 保持前后端版本可独立演进。 */
+export type PackageProfile = string
+
+export interface PackageProfileOption {
+  profile: PackageProfile
+  name: string
+}
+
+export interface PackageGuidance {
+  clients: string[]
+  configuration: string[]
+  constraints: string[]
+  runtime_verified: boolean
+}
+
+export interface PackageCompanion {
+  host: string
+  transport: UpstreamProtocol
+  package_profile: PackageProfile
+  ready: boolean
+  reason?: string
+}
+
+export interface PackageReadiness {
+  ready: boolean
+  missing: string[]
+  companions: PackageCompanion[]
+  guidance: PackageGuidance
+}
+
+export interface SiteInfo {
+  name: string
+  base_url: string
+  package_profiles: PackageProfileOption[]
+}
+
 /** 上游此刻的可服务状态，只有这两种，取值与后端 api/upstream 的常量一致。 */
 export type UpstreamStatus = 'normal' | 'degraded'
 
@@ -16,6 +52,8 @@ export interface UpstreamItem {
   host: string
   /** 这条上游开着的协议，非空。一条记录可以同时开多个。 */
   protocols: UpstreamProtocol[]
+  package_profile: PackageProfile
+  package_readiness?: PackageReadiness
   library_completion: boolean
   hit_rate: number
   cache_bytes: number
@@ -98,6 +136,10 @@ export function fetchVersion(signal?: AbortSignal) {
   return getPublic<VersionInfo>('/api/v1/system/version', signal)
 }
 
+export function fetchSiteInfo(signal?: AbortSignal) {
+  return getPublic<SiteInfo>('/api/v1/site', signal)
+}
+
 // ── 管理接口 ──────────────────────────────────────────────────────────
 //
 // 后台那一面全部要密钥。密钥握在浏览器里（这一轮没有账号体系，只有一把密钥），
@@ -153,6 +195,8 @@ export interface AdminUpstreamItem {
   id: number
   host: string
   protocols: UpstreamProtocol[]
+  package_profile: PackageProfile
+  package_readiness?: PackageReadiness
   origin: string
   enabled: boolean
   immutable_patterns: string[]
@@ -220,8 +264,30 @@ export interface EventItem {
   createtime: number
 }
 
+export interface AdminUpstreamList {
+  list: AdminUpstreamItem[]
+  preview?: PackageReadiness
+}
+
 export function fetchAdminUpstreams(key: string, signal?: AbortSignal) {
-  return adminGet<{ list: AdminUpstreamItem[] }>('/api/v1/admin/upstreams', key, signal)
+  return adminGet<AdminUpstreamList>('/api/v1/admin/upstreams', key, signal)
+}
+
+export function fetchPackageReadiness(
+  key: string,
+  draft: Pick<UpstreamDraft, 'id' | 'host' | 'protocols' | 'package_profile' | 'enabled'>,
+  signal?: AbortSignal
+) {
+  const params = new URLSearchParams({
+    preview_id: String(draft.id),
+    preview_host: draft.host,
+    preview_package_profile: draft.package_profile,
+    preview_enabled: String(draft.enabled),
+  })
+  for (const protocol of draft.protocols) {
+    params.append('preview_protocol', protocol)
+  }
+  return adminGet<AdminUpstreamList>(`/api/v1/admin/upstreams?${params}`, key, signal)
 }
 
 export function fetchUpstreamStats(key: string, range: StatRange, signal?: AbortSignal) {
@@ -544,6 +610,7 @@ export interface UpstreamDraft {
   id: number
   host: string
   protocols: UpstreamProtocol[]
+  package_profile: PackageProfile
   origin: string
   enabled: boolean
   immutable_patterns: string[]
@@ -733,6 +800,7 @@ export function toUpstreamDraft(upstream: AdminUpstreamItem): UpstreamDraft {
     id: upstream.id,
     host: upstream.host,
     protocols: upstream.protocols,
+    package_profile: upstream.package_profile ?? 'none',
     origin: upstream.origin,
     enabled: upstream.enabled,
     immutable_patterns: upstream.immutable_patterns,

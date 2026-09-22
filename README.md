@@ -3,7 +3,9 @@
 多上游镜像代理站。把 container registry、APT 源、Go module proxy、GitHub 静态资源
 统一收到一个域名下，**路径的第一段就是上游主机名**。
 
-使用者只需要记一条规则：把 `https://` 换成 `https://<katch>/`，其余照抄。
+对于已经支持的协议，或者满足 static 条件的上游，使用者只需要记一条规则：把
+`https://` 换成 `https://<katch>/`，其余照抄。元数据包含绝对外链的包仓库需要额外的
+客户端配置或协议适配器，具体见[公开包镜像加速兼容性](docs/package-manager-mirrors.md)。
 
 ```bash
 docker pull katch.example.com/docker.io/library/redis:7
@@ -18,7 +20,8 @@ deb https://katch.example.com/deb.debian.org/debian bookworm main
 export GOPROXY=https://katch.example.com/proxy.golang.org
 ```
 
-加一个新上游是**在界面上加一条记录**，不是加一条路径前缀约定，也不需要重启进程。
+符合上述条件时，加一个新上游只需**在界面上加一条记录**，不是加一条路径前缀约定，
+也不需要重启进程。需要解释或改写元数据的上游还需要对应的协议适配器。
 
 ## 它解决什么
 
@@ -119,6 +122,7 @@ curl -X POST http://localhost:8080/api/v1/admin/upstreams \
         "protocols": ["static"],
         "origin": "https://deb.debian.org",
         "enabled": true,
+        "package_profile": "apt",
         "immutable_patterns": ["/pool/"],
         "mutable_ttl_seconds": 300
       }'
@@ -126,16 +130,98 @@ curl -X POST http://localhost:8080/api/v1/admin/upstreams \
 
 `protocols` 是这条上游开着的协议集合，取值为 `registry`、`static`、`git`
 的任意非空子集——一条记录可以同时开几种，比如 `github.com` 既服务 `git clone`
-也服务 release 资产下载。registry 的 blob 与按 digest 请求的 manifest 会按协议语义
-自动长期缓存，tag manifest 走 `mutable_ttl_seconds`；`immutable_patterns` 用来声明
-static 或非标准路径中哪些对象是内容寻址的（可长期缓存 + LRU 淘汰），其余路径按
-`mutable_ttl_seconds` 走短 TTL。
+也服务 release 资产下载。
 
-拉取时响应上的 `X-Katch-Cache: HIT|MISS` 能直接看出这一次有没有回源：
+`package_profile` 是包管理器协议语义，取值由后端已注册的适配器提供；`none` 表示只用
+通用传输。非 `none` profile 必须同时开启 `static`。后台会用当前草稿、`site_domain`
+和适配器声明的 companion 上游计算就绪状态，并逐项指出缺少、停用、transport 不匹配或
+profile 不匹配的主机。npm/PyPI/Cargo/NuGet 等元数据会跳到附属域名，只给主上游选
+profile 不算配置完成。
+
+客户端配置只从已保存的 `site_domain` 生成，不能从请求 Host 或转发头猜。12 个内建
+package profile 已在 `coding.local` 的阻断公网矩阵中通过，API 返回
+`runtime_verified=true`；公开页和后台仅在 profile 已验证且当前 `site_domain`、主上游及
+companion 全部就绪时提供可复制配置。Docker、Podman 与 Git 的共享链路回归也使用真实客户端
+完成。实现边界、companion 清单、精确客户端版本与验收方法见
+[公开包镜像加速兼容性](docs/package-manager-mirrors.md)。
+
+### 缓存策略
+
+不可变判定分两类，边界不重叠：
+
+- **registry 按协议自动判定**，不需要也不看 `immutable_patterns`：blob 与按 digest
+  寻址的 manifest（`.../blobs/sha256:...`、`.../manifests/sha256:...`）是内容寻址
+  对象，自动长期缓存、只由 LRU 淘汰；tag manifest、`referrers` 与 `tags/list` 会变，
+  按 `mutable_ttl_seconds` 过期。
+- **static 与 git 路径只认显式模式**，不存在按 URL 里像不像 hash 的外观推断：
+  `immutable_patterns` 为空则全部按 TTL；非空时命中的对象长期缓存，其余仍按
+  `mutable_ttl_seconds`。模式对整条上游侧路径做**子串**匹配（不锚定首尾）：不含
+  通配符时直接找子串，`*` 匹配任意多个字符（含 `/`），`?` 匹配任意一个字符。
+
+管理界面「缓存策略」里的预设只是把下表的模式填进 `immutable_patterns`，保存的是
+模式本身而不是预设名称——已登记的上游不会因为预设调整而静默改变；「自定义」可以
+逐行编辑任意模式。
+
+| 预设                | 写入的模式                             | 判为不可变                   | 仍按 TTL 的可变例外                                      |
+| ------------------- | -------------------------------------- | ---------------------------- | -------------------------------------------------------- |
+| APT 软件包          | `/pool/`                               | `pool/` 下的 deb 包与源码包  | `dists/` 下的 `InRelease`、`Release`、`Packages*` 等索引 |
+| Go Module Proxy     | `/@v/*.info`、`/@v/*.mod`、`/@v/*.zip` | 具体版本文件                 | `@v/list`、`@latest`                                     |
+| Git commit 静态文件 | 一整段 40 个 `?`（commit SHA）         | 路径中含 40 位 commit 的对象 | 分支名、tag、`HEAD`、`info/refs` 这类会移动的引用        |
+| PyPI 文件           | `/packages/??/??/` + 64 个 `?`         | hash 目录下的包文件          | `/simple/` 索引与 JSON API                               |
+
+### 命中验证
+
+`X-Katch-Cache: HIT|MISS|REVALIDATED` 说明这一次有没有回源：`HIT` 没问上游，`MISS`
+整份取自上游，`REVALIDATED` 问过上游、上游答 `304`，正文出自本地副本（见下文过期续期）。要看到完整的 MISS → HIT，必须用
+**GET 读完整响应体**再比对：普通 HEAD 和可本地求值的条件请求在命中时同样报 `HIT`，
+但 HEAD 没有响应体、条件请求可能只拿到 `304`，单看一次命中说明不了本地那份副本
+完整；`MISS → HIT` 加上两次内容逐字节相同才是完整证据。
+
+请求的对象没有副本（或可变对象已过 TTL，此时上游若答 `304` 则是 `REVALIDATED`）时第一次才是 `MISS`；已在 TTL 内或不可变
+对象一上手就是 `HIT`，换一个没缓存过的路径再验。
 
 ```bash
-curl -sI http://localhost:8080/deb.debian.org/debian/dists/bookworm/InRelease | grep -i x-katch-cache
+URL=http://localhost:8080/deb.debian.org/debian/dists/bookworm/InRelease
+
+curl -s -D /tmp/first.h -o /tmp/first.b "$URL"
+grep -i '^x-katch-cache' /tmp/first.h            # MISS：这一次回源
+
+curl -s -D /tmp/second.h -o /tmp/second.b "$URL"
+grep -i '^x-katch-cache' /tmp/second.h           # HIT：这一次由本地副本应答
+cmp /tmp/first.b /tmp/second.b                   # 命中内容与回源逐字节相同
+
+# 新鲜副本上的 HEAD：本地 200、无响应体、命中
+curl -sI "$URL" | grep -i '^x-katch-cache'                              # HIT
+# 条件请求命中：星号问的是「还有没有这份表示」，本地 304
+curl -s -o /dev/null -w '%{http_code}\n' -H 'If-None-Match: *' "$URL"   # 304
 ```
+
+TTL 内的副本由本地应答，命中响应原样回放上游保存下来的 `ETag`/`Last-Modified`
+（registry 对象没有上游 ETag 时退回内容摘要推导）。由此：
+
+- 普通 `HEAD`：本地 `200`，状态与响应头同一套，只是不带响应体，`X-Katch-Cache: HIT`；
+- 条件请求：`If-None-Match` 按弱比较、逗号列表与 `*` 求值，命中返回本地 `304`
+  （也是 `HIT`），明确不匹配则本地 `200`；只有没有 `If-None-Match` 时才看
+  `If-Modified-Since`，日期不晚于请求时间即 `304`；
+- 副本缺少求值所需的 validator（上游从未给过 `ETag`/`Last-Modified`，或副本是加
+  该字段之前写下的历史记录）：本地不猜，这一次透传上游（`MISS`）；
+- `Range` 支持单段、多段和后缀范围；完整新鲜副本可以本地返回 `206`，非法或不可满足
+  范围返回 `416`。`If-Range` 匹配才返回范围，不匹配则返回完整 `200`。
+
+手上没有副本（冷请求）时，条件与 Range 请求透传且不写缓存——它们可能拿到 `206`、`304`、
+`412` 或 `416`，不能当成一份完整副本存下来。普通 static HEAD 和 registry blob HEAD
+同样透传；仅无条件、无范围的 registry manifest HEAD 会以同一 `Accept` 变体的 identity
+GET 填充缓存，再返回无正文的 GET 等价元数据。
+
+**过期续期。** 可变对象过期（或上游标了 `Cache-Control: no-cache`）后，如果记录里存有
+上游自己给过的 `ETag`/`Last-Modified`，回源那一次带上 `If-None-Match`/`If-Modified-Since`：
+上游答 `304` 就按它更新新鲜期、复用盘上的字节，响应标 `X-Katch-Cache: REVALIDATED`；
+上游答 `200` 就整份替换（`MISS`）；上游出错则照常透传，过期副本不会被当成新鲜的发出去。
+这一跳总是 canonical identity GET：客户端发的是 `HEAD`、`Range` 或自己的条件请求时，这些
+不转发给上游，刷新之后按本地副本求值，与命中时一样。
+转换过的元数据（npm packument、PyPI Simple 等）回放的是 katch 自己算的 ETag，续期时发给
+上游的仍是上游那一串。过期但带着上游 validator 的对象不被定时清理删除，留着等下一次
+续期，由配额回收按 LRU 收走；没有 validator 的过期对象照旧由定时清理删除。
 
 ### git clone
 
@@ -163,14 +249,14 @@ refs 的新鲜度按上游记录上的 `mutable_ttl_seconds` 算：TTL 内直接
 
 ## 管理界面
 
-| 页面 | 内容 |
-| --- | --- |
-| 首页 | 拉取助手：写下 `redis:7` 直接给出可执行的命令；站点命中率、已缓存体积、支持的上游 |
-| 概览 | 请求量与命中率曲线、回源原因分布、上游健康矩阵、事件流、最近请求 |
-| 上游 | 增删改、启停，改完下一个请求就生效 |
-| 缓存对象 | 搜索、清理、锁定单个对象 |
-| git 镜像 | 已建成的仓库镜像：状态、体积、最后同步与最后访问时间，可删除单个镜像 |
-| 设置 | 站点名片、首页是否公开、缓存配额与回收水位、回源并发/超时/重试、git 镜像配额与单仓上限、管理密钥轮换 |
+| 页面     | 内容                                                                                                                             |
+| -------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| 首页     | 拉取助手：写下 `redis:7` 直接给出可执行的命令；站点命中率、已缓存体积、支持的上游                                                |
+| 概览     | 请求量与命中率曲线、回源原因分布、上游健康矩阵、事件流、最近请求                                                                 |
+| 上游     | 增删改、启停、选择包管理器 profile，实时查看 `site_domain`、transport、profile 与 companion 主机的就绪状态；改完下一个请求就生效 |
+| 缓存对象 | 搜索、清理、锁定单个对象                                                                                                         |
+| git 镜像 | 已建成的仓库镜像：状态、体积、最后同步与最后访问时间，可删除单个镜像                                                             |
+| 设置     | 站点名片、首页是否公开、缓存配额与回收水位、回源并发/超时/重试、git 镜像配额与单仓上限、管理密钥轮换                             |
 
 访问规则分全局与上游内两层，同层内按**具体度**排序、首个匹配者决定结果；
 保存前可以用规则测试器验证某个具体地址会被哪条规则决定。
@@ -209,6 +295,7 @@ make mock       # go generate ./...（mockgen）
 
 - [AGENTS.md](AGENTS.md) — 工程约定（硬约束，包括测试先行、产物不引入 cgo、分层单向）
 - [docs/deploy.md](docs/deploy.md) — 部署（compose / helm / 裸 manifests）、反代要调什么、排障对照表
+- [docs/package-manager-mirrors.md](docs/package-manager-mirrors.md) — 公开包管理器的兼容边界、完整支持所需处理与验收方法
 - [docs/architecture.md](docs/architecture.md) — 分层、路由命名空间、拉取路径、数据库
 - [docs/frontend.md](docs/frontend.md) — 前端目录、i18n、静态资源缓存
 - [docs/observability.md](docs/observability.md) — 日志与指标

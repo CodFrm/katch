@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/CodFrm/katch/internal/metrics"
+	"github.com/CodFrm/katch/internal/model/entity/cache_entity"
 	"github.com/CodFrm/katch/internal/service/proxy_svc"
 )
 
@@ -31,6 +32,8 @@ type miss struct {
 	// 空表示手上没有一份可信的副本可比——从没缓存过是这样，副本已经校验失败
 	// 被丢掉了也是这样：那时「我们手上有什么」本身就不可信。
 	heldDigest string
+	// held 过期但带着上游 validator 的那份副本；有它，回源才能发条件请求并按 304 续期。
+	held *cache_entity.CacheObject
 }
 
 // stamp 把归因写进响应头，返回同一个 meta 供调用方接着用。

@@ -46,13 +46,20 @@ type CacheObjectRepo interface {
 	// katch_cache_objects 与 katch_cache_bytes 是两族，而这两个数的口径必须
 	// 各自说得清——合在一个结构里迟早有人只更新其中一半。
 	CountByUpstream(ctx context.Context) (map[int64]int64, error)
-	// EvictCandidates 按最久未访问给出淘汰候选，只含不可变且未被 pin 的对象。
-	EvictCandidates(ctx context.Context, limit int) ([]*cache_entity.CacheObject, error)
-	// ExpiredBefore 给出已经过期的可变对象，供 TTL 清理用。
+	// EvictCandidates 按最久未访问给出淘汰候选：未被 pin 的不可变对象，以及在 now（秒）
+	// 已经过期、但带着上游 validator 的可变对象——Sweep 不收后者，留给条件回源续期。
+	EvictCandidates(ctx context.Context, now int64, limit int) ([]*cache_entity.CacheObject, error)
+	// DeleteEvictable 只在记录仍指向 digest、且仍满足淘汰候选条件时删除。
 	//
-	// 可变对象不进 EvictCandidates（那条只挑不可变的），所以过期之后没有任何
-	// 一条路径会把它们清掉：记录和盘上的字节都留着，还一直算进配额，于是
-	// 「缓存总容量有上限」这条会被一批再也没人来取的对象慢慢顶穿。
+	// 过期可续期的可变对象会在列为候选之后被一次回源换成新内容、新的过期时刻；
+	// 无条件删掉，删的就是刚写进去的那份，新内容的文件也再没有记录引用。
+	DeleteEvictable(ctx context.Context, id int64, digest string, now int64) (bool, error)
+	// ExpiredBefore 给出已经过期、且没有上游 validator 的可变对象，供 TTL 清理用。
+	//
+	// 这批对象不进 EvictCandidates，没有这趟清理就没有任何一条路径会把它们清掉：
+	// 记录和盘上的字节都留着，还一直算进配额，于是「缓存总容量有上限」这条会被
+	// 一批再也没人来取的对象慢慢顶穿。带 validator 的过期对象不在这里：它们留着
+	// 给条件回源续期，由 EvictCandidates 按 LRU 回收。
 	ExpiredBefore(ctx context.Context, before int64, limit int) ([]*cache_entity.CacheObject, error)
 	// CountByDigest 还有多少条记录引用同一份内容，删文件之前要问一次。
 	CountByDigest(ctx context.Context, digest string) (int64, error)
@@ -142,9 +149,11 @@ func (c *cacheObjectRepo) DeleteUnchanged(ctx context.Context, id int64, digest 
 }
 
 func (c *cacheObjectRepo) DeleteExpired(ctx context.Context, id, before int64) (bool, error) {
+	// 复核条件与 ExpiredBefore 同一套：候选查询之后，这一行可能已经被重新写成带
+	// validator 的记录，那时它归 LRU 管，这里不能删。
 	result := db.Ctx(ctx).
-		Where("id=? AND immutable=? AND expires_at>0 AND expires_at<=? AND pinned=?",
-			id, false, before, false).
+		Where("id=? AND immutable=? AND expires_at>0 AND expires_at<=? AND pinned=? "+
+			"AND origin_etag='' AND origin_last_modified=''", id, false, before, false).
 		Delete(&cache_entity.CacheObject{})
 	return result.RowsAffected > 0, result.Error
 }
@@ -226,19 +235,36 @@ func (c *cacheObjectRepo) ExpiredBefore(ctx context.Context, before int64, limit
 	// expires_at=0 是「不过期」而不是「1970 年就过期了」；同时显式限定可变对象，
 	// 避免升级遗留或人工修复留下 immutable=true + 旧 expires_at 的不一致行反复入选。
 	// pin 的对象留下：人明确要求常驻的东西不该被一次例行清理带走。
+	// 带上游 validator 的也留下：过期之后还能用一次条件回源续期，304 就不必整份重下；
+	// 它们改由 EvictCandidates 在配额压力下按 LRU 收走。
 	if err := db.Ctx(ctx).
-		Where("expires_at>0 AND expires_at<=? AND immutable=? AND pinned=?", before, false, false).
+		Where("expires_at>0 AND expires_at<=? AND immutable=? AND pinned=? "+
+			"AND origin_etag='' AND origin_last_modified=''", before, false, false).
 		Order("expires_at asc").Limit(limit).Find(&list).Error; err != nil {
 		return nil, err
 	}
 	return list, nil
 }
 
-func (c *cacheObjectRepo) EvictCandidates(ctx context.Context, limit int) ([]*cache_entity.CacheObject, error) {
+// evictablePredicate 淘汰候选的判据，参数依次是 pinned=false、immutable=true、now。
+//
+// 候选查询与删除前的复核共用这一串：两边一旦分叉，复核就会放过或拦下不该的行。
+// pin 的是人明确要求留下的，把它们卷进 LRU 就成了「刚 pin 的东西过两天又没了」。
+// 还新鲜的可变对象由 TTL 管；过期了还带 validator 的那些 Sweep 不收，只能在这里
+// 按访问先后回收，否则它们会一直占着配额。
+const evictablePredicate = "pinned=? AND (immutable=? OR (expires_at>0 AND expires_at<=? AND " +
+	"(origin_etag<>'' OR origin_last_modified<>'')))"
+
+func (c *cacheObjectRepo) DeleteEvictable(ctx context.Context, id int64, digest string, now int64) (bool, error) {
+	result := db.Ctx(ctx).
+		Where("id=? AND digest=? AND "+evictablePredicate, id, digest, false, true, now).
+		Delete(&cache_entity.CacheObject{})
+	return result.RowsAffected > 0, result.Error
+}
+
+func (c *cacheObjectRepo) EvictCandidates(ctx context.Context, now int64, limit int) ([]*cache_entity.CacheObject, error) {
 	list := make([]*cache_entity.CacheObject, 0, limit)
-	// 只淘汰不可变且未被 pin 的对象：可变对象由 TTL 自己过期，pin 的是人明确
-	// 要求留下的，把它们卷进 LRU 就成了「刚 pin 的东西过两天又没了」。
-	if err := db.Ctx(ctx).Where("immutable=? AND pinned=?", true, false).
+	if err := db.Ctx(ctx).Where(evictablePredicate, false, true, now).
 		Order("last_access_at asc").Limit(limit).Find(&list).Error; err != nil {
 		return nil, err
 	}

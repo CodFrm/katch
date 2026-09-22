@@ -5,9 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -21,6 +24,7 @@ import (
 	"github.com/CodFrm/katch/internal/model/entity/cache_entity"
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
 	"github.com/CodFrm/katch/internal/proxy/dispatch"
+	"github.com/CodFrm/katch/internal/proxy/packageprofile"
 	"github.com/CodFrm/katch/internal/repository/cache_repo"
 	mock_cache_repo "github.com/CodFrm/katch/internal/repository/cache_repo/mock"
 	"github.com/CodFrm/katch/internal/repository/upstream_repo"
@@ -30,6 +34,46 @@ import (
 )
 
 var errPromote = errors.New("promote failed")
+
+type testProfile struct {
+	description    packageprofile.Description
+	representation packageprofile.Representation
+	transform      func(context.Context, packageprofile.TransformRequest) (*packageprofile.TransformResult, error)
+}
+
+func (p testProfile) Describe() packageprofile.Description { return p.description }
+func (p testProfile) Classify(packageprofile.Request) packageprofile.Representation {
+	return p.representation
+}
+func (p testProfile) Transform(ctx context.Context, in packageprofile.TransformRequest) (*packageprofile.TransformResult, error) {
+	return p.transform(ctx, in)
+}
+func (testProfile) Companions() []packageprofile.Companion { return nil }
+func (testProfile) Guidance() packageprofile.Guidance      { return packageprofile.Guidance{} }
+
+type fixedRewriteSource struct {
+	snapshot *proxy_svc.RewriteSnapshot
+}
+
+func (s fixedRewriteSource) Snapshot(context.Context) (*proxy_svc.RewriteSnapshot, error) {
+	return s.snapshot, nil
+}
+
+func transformingOptions(t *testing.T, profile testProfile, generation int64) Options {
+	t.Helper()
+	profiles := packageprofile.NewRegistry()
+	if err := profiles.Register(profile); err != nil {
+		t.Fatal(err)
+	}
+	return Options{
+		Profiles: profiles,
+		RewriteConfig: fixedRewriteSource{snapshot: &proxy_svc.RewriteSnapshot{
+			SiteBaseURL: "https://katch.example.com",
+			Generation:  generation,
+			Upstreams:   map[string]proxy_svc.RewriteUpstream{},
+		}},
+	}
+}
 
 // fakeRuntime 用例侧的运行时设置。
 //
@@ -77,6 +121,13 @@ type fakeRepo struct {
 	promoteErr    error
 	deleteStarted chan struct{}
 	deleteGate    chan struct{}
+	// saveGate 非 nil 时，Save 会先等它。
+	//
+	// pump 里 Save 排在 finish 之前，所以按住它就把「字节全发完了、done 还没置」
+	// 那个窗口停住了——客户端正是在这个窗口里挂断，才会把一次成功的转发记成中断。
+	saveGate chan struct{}
+	// saveErr 非 nil 时 Save 返回它、不落库：模拟库写失败，记录停在上一份。
+	saveErr error
 	// totalSizeGate 非 nil 时，TotalSize 会先等它。
 	//
 	// TotalSize 只有 enforceQuota 一个调用方，而 enforceQuota 只跑在 pump 那个
@@ -108,7 +159,16 @@ func newFakeRepo(t *testing.T, stampAccess bool) *fakeRepo {
 	m.EXPECT().Save(gomock.Any(), gomock.Any()).AnyTimes().
 		DoAndReturn(func(_ any, obj *cache_entity.CacheObject) error {
 			f.mu.Lock()
+			gate := f.saveGate
+			f.mu.Unlock()
+			if gate != nil {
+				<-gate
+			}
+			f.mu.Lock()
 			defer f.mu.Unlock()
+			if f.saveErr != nil {
+				return f.saveErr
+			}
 			if obj.ID == 0 {
 				obj.ID = f.nextID
 				f.nextID++
@@ -146,7 +206,20 @@ func newFakeRepo(t *testing.T, stampAccess bool) *fakeRepo {
 			f.mu.Lock()
 			defer f.mu.Unlock()
 			row, ok := f.rows[id]
-			if !ok || row.Immutable || row.ExpiresAt <= 0 || row.ExpiresAt > before || row.Pinned {
+			if !ok || row.Immutable || row.ExpiresAt <= 0 || row.ExpiresAt > before || row.Pinned ||
+				revalidatable(row) {
+				return false, nil
+			}
+			delete(f.rows, id)
+			return true, nil
+		})
+	m.EXPECT().DeleteEvictable(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().
+		DoAndReturn(func(_ any, id int64, digest string, now int64) (bool, error) {
+			f.waitDelete()
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			row, ok := f.rows[id]
+			if !ok || row.Digest != digest || !evictable(row, now) {
 				return false, nil
 			}
 			delete(f.rows, id)
@@ -205,13 +278,13 @@ func newFakeRepo(t *testing.T, stampAccess bool) *fakeRepo {
 		}
 		return total, nil
 	})
-	m.EXPECT().EvictCandidates(gomock.Any(), gomock.Any()).AnyTimes().
-		DoAndReturn(func(_ any, limit int) ([]*cache_entity.CacheObject, error) {
+	m.EXPECT().EvictCandidates(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().
+		DoAndReturn(func(_ any, now int64, limit int) ([]*cache_entity.CacheObject, error) {
 			f.mu.Lock()
 			defer f.mu.Unlock()
 			list := make([]*cache_entity.CacheObject, 0, limit)
 			for _, row := range f.rows {
-				if row.Immutable && !row.Pinned {
+				if evictable(row, now) {
 					list = append(list, clone(row))
 				}
 			}
@@ -227,8 +300,9 @@ func newFakeRepo(t *testing.T, stampAccess bool) *fakeRepo {
 			defer f.mu.Unlock()
 			list := make([]*cache_entity.CacheObject, 0, limit)
 			for _, row := range f.rows {
-				// 和 SQL 一样：只收已过期、可变且未 pin 的记录。
-				if row.ExpiresAt > 0 && row.ExpiresAt <= before && !row.Immutable && !row.Pinned {
+				// 和 SQL 一样：只收已过期、可变、未 pin 且没有上游 validator 的记录。
+				if row.ExpiresAt > 0 && row.ExpiresAt <= before && !row.Immutable && !row.Pinned &&
+					!revalidatable(row) {
 					list = append(list, clone(row))
 				}
 			}
@@ -400,6 +474,32 @@ type originStub struct {
 	hits atomic.Int64
 }
 
+type localOriginProxy struct {
+	baseURL string
+}
+
+func (p localOriginProxy) Fetch(ctx context.Context, target *proxy_svc.Target) (io.ReadCloser, *proxy_svc.Meta, error) {
+	request, err := http.NewRequestWithContext(ctx, target.Method, p.baseURL+target.Path, target.Body)
+	if err != nil {
+		return nil, nil, err
+	}
+	request.URL.RawQuery = target.RawQuery
+	request.Header = target.Header.Clone()
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return nil, nil, err
+	}
+	var sourceURL *url.URL
+	if response.Request != nil && response.Request.URL != nil {
+		cloned := *response.Request.URL
+		sourceURL = &cloned
+	}
+	return response.Body, &proxy_svc.Meta{
+		StatusCode: response.StatusCode, Header: response.Header.Clone(), ContentLength: response.ContentLength,
+		SourceURL: sourceURL,
+	}, nil
+}
+
 func newOrigin(t *testing.T, handler http.HandlerFunc) *originStub {
 	t.Helper()
 	o := &originStub{}
@@ -414,6 +514,14 @@ func newOrigin(t *testing.T, handler http.HandlerFunc) *originStub {
 // setupSvc 装一套完整的缓存层：假源站 + 一条上游 + 内存缓存表 + 真磁盘目录。
 func setupSvc(t *testing.T, o *originStub, up *upstream_entity.Upstream, opt Options) (CacheSvc, *fakeRepo, *cache.Store) {
 	t.Helper()
+	// 换掉进程全局之前，先把上一套夹具的后台下载等回来。
+	//
+	// goconvey 的每个内层叶子都会把外层闭包整个重跑一遍，所以一个表驱动用例会跑很多
+	// 次 setupSvc。下面那条 Cleanup 只在整个用例结束时才等，中间这些换手没人等：上一
+	// 个叶子的 pump 还停在 enforceQuota 里读它那份仓储时就被换掉，race detector 会在
+	// 下一个叶子的装配处报竞争。守这条的是 harness_test.go 里的
+	// TestHarness_WaitsForPreviousBackgroundWorkBeforeReassembling。
+	quiescePendingFixtures(t)
 	repo := newFakeRepo(t, true)
 	upRepo := mock_upstream_repo.NewMockUpstreamRepo(gomock.NewController(t))
 	up.Origin = o.srv.URL
@@ -424,6 +532,11 @@ func setupSvc(t *testing.T, o *originStub, up *upstream_entity.Upstream, opt Opt
 	upstream_repo.RegisterUpstream(proxy_svc.NewCachedUpstreamRepo(upRepo))
 	t.Cleanup(func() { upstream_repo.RegisterUpstream(prevUpstream) })
 	upRepo.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{up}, nil).AnyTimes()
+	if opt.Profiles != nil {
+		previousProxy := proxy_svc.Proxy()
+		proxy_svc.Register(localOriginProxy{baseURL: o.srv.URL})
+		t.Cleanup(func() { proxy_svc.Register(previousProxy) })
+	}
 
 	store, err := cache.NewStore(t.TempDir())
 	if err != nil {
@@ -440,6 +553,7 @@ func setupSvc(t *testing.T, o *originStub, up *upstream_entity.Upstream, opt Opt
 	// 这条 Cleanup 注册在两条还原之后，于是 LIFO 下它**先**跑：先把人等回来，
 	// 再把全局换回去，顺序反了等于没等。
 	t.Cleanup(func() {
+		forgetFixture(svc)
 		ctx, cancel := context.WithTimeout(context.Background(), quiesceTimeout)
 		defer cancel()
 		if err := svc.Quiesce(ctx); err != nil {
@@ -448,7 +562,47 @@ func setupSvc(t *testing.T, o *originStub, up *upstream_entity.Upstream, opt Opt
 			t.Errorf("后台缓存写入没能在 %s 内收尾：%v", quiesceTimeout, err)
 		}
 	})
+	rememberFixture(svc)
 	return svc, repo, store
+}
+
+// pendingFixtures 本进程里已经装出来、还没被等过的 svc。
+//
+// 这个包的用例不跑 t.Parallel，装配是串行的，所以一张表加一把锁就够；锁只是因为
+// Cleanup 与 setupSvc 可能来自不同协程（见 harness_test.go 里的两条元测试）。
+var (
+	pendingFixturesMu sync.Mutex
+	pendingFixtures   []CacheSvc
+)
+
+func rememberFixture(svc CacheSvc) {
+	pendingFixturesMu.Lock()
+	defer pendingFixturesMu.Unlock()
+	pendingFixtures = append(pendingFixtures, svc)
+}
+
+func forgetFixture(svc CacheSvc) {
+	pendingFixturesMu.Lock()
+	defer pendingFixturesMu.Unlock()
+	pendingFixtures = slices.DeleteFunc(pendingFixtures, func(pending CacheSvc) bool {
+		return pending == svc
+	})
+}
+
+// quiescePendingFixtures 把之前装出来、还没收尾的后台下载全部等回来。
+func quiescePendingFixtures(t *testing.T) {
+	t.Helper()
+	pendingFixturesMu.Lock()
+	pending := pendingFixtures
+	pendingFixtures = nil
+	pendingFixturesMu.Unlock()
+	for _, svc := range pending {
+		ctx, cancel := context.WithTimeout(context.Background(), quiesceTimeout)
+		if err := svc.Quiesce(ctx); err != nil {
+			t.Errorf("上一套夹具的后台缓存写入没能在 %s 内收尾：%v", quiesceTimeout, err)
+		}
+		cancel()
+	}
 }
 
 // quiesceTimeout 用例结束时留给后台缓存写入的收尾窗口。
@@ -521,4 +675,15 @@ func quotaOf(quota int64, percent int) func(rt *setting_svc.RuntimeSettings) {
 		rt.CacheQuotaBytes = quota
 		rt.CacheReclaimPercent = percent
 	}
+}
+
+// evictable 和仓储的淘汰判据一致：未 pin 的不可变对象，加上已过期但可续期的可变对象。
+func evictable(row *cache_entity.CacheObject, now int64) bool {
+	expiredRevalidatable := row.ExpiresAt > 0 && row.ExpiresAt <= now && revalidatable(row)
+	return !row.Pinned && (row.Immutable || expiredRevalidatable)
+}
+
+// revalidatable 记录有没有上游 validator 可供条件回源，和仓储 SQL 里的判据一致。
+func revalidatable(row *cache_entity.CacheObject) bool {
+	return row.OriginETag != "" || row.OriginLastModified != ""
 }

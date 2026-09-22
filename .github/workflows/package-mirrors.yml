@@ -1,0 +1,64 @@
+name: Package mirror harness
+
+on:
+  pull_request:
+    paths:
+      - "internal/proxy/packageprofile/builtin/**"
+      - "e2e/package-mirrors/**"
+      - ".github/workflows/package-mirrors.yml"
+      - "Makefile"
+  push:
+    branches: [main]
+    paths:
+      - "internal/proxy/packageprofile/builtin/**"
+      - "e2e/package-mirrors/**"
+      - ".github/workflows/package-mirrors.yml"
+      - "Makefile"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NODE_CLIENT_IMAGE: katch/package-client-node:22.20.0
+
+jobs:
+  adapter-and-harness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Adapter tests
+        run: go test ./internal/proxy/packageprofile/builtin
+      - name: Deterministic harness tests
+        run: make test-package-mirror-harness
+      - name: Build and offline-smoke pinned client matrix
+        run: make package-mirror-image
+      - name: Verify rejected connects are recorded in a real namespace
+        shell: bash
+        run: |
+          set -euo pipefail
+          workdir=$(mktemp -d)
+          trap 'rm -rf "$workdir"' EXIT
+          mkdir -p "$workdir/case" "$workdir/artifacts"
+          chmod 0777 "$workdir/artifacts"
+          printf '%s\n' 'true' > "$workdir/case/setup"
+          printf '%s\n' "node -e 'require(\"net\").connect(443, \"1.1.1.1\")'" > "$workdir/case/run"
+          printf '%s\n' 'true' > "$workdir/case/assert"
+          chmod 0555 "$workdir/case/"*
+          if docker run --rm --cap-add NET_ADMIN --cap-add NET_RAW \
+            --add-host katch.invalid:host-gateway \
+            --mount "type=bind,src=$workdir/case,dst=/case,readonly" \
+            --mount "type=bind,src=$workdir/artifacts,dst=/artifacts" \
+            -e KATCH_URL=http://katch.invalid:8080 \
+            -e KATCH_BASE_URL=http://katch.invalid:8080 \
+            -e KATCH_HOST=katch.invalid -e KATCH_PORT=8080 -e KATCH_ARTIFACTS=/artifacts \
+            "$NODE_CLIENT_IMAGE"; then
+            echo "external connect unexpectedly passed" >&2
+            exit 1
+          fi
+          grep -F '1.1.1.1' "$workdir/artifacts/connect.log"

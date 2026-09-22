@@ -5,7 +5,11 @@
 // 什么命令都说不出来，而这两样并不描述这台镜像站代理了什么。
 package site
 
-import "github.com/cago-frame/cago/server/mux"
+import (
+	"github.com/cago-frame/cago/server/mux"
+
+	api_upstream "github.com/CodFrm/katch/internal/api/upstream"
+)
 
 // InfoRequest 查站点名片。
 type InfoRequest struct {
@@ -25,4 +29,6 @@ type InfoResponse struct {
 	// 另一个域名后面，进程自己看见的监听地址不是使用者敲得通的那个。空串时由调用方
 	// 用它自己访问到的地址兜底——那个地址至少是确实通的。
 	BaseURL string `json:"base_url"`
+	// PackageProfiles 是本构建实际注册的 profile；界面据此提供选择，不另抄一份枚举。
+	PackageProfiles []api_upstream.PackageProfile `json:"package_profiles"`
 }

@@ -1,6 +1,7 @@
 package proxy_svc_test
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -22,21 +23,39 @@ const fakeSumdbLookup = "github.com/foo/bar v1.0.0 h1:abc=\n" +
 	"github.com/foo/bar v1.0.0/go.mod h1:def=\n\n" +
 	"go.sum database tree\n42\n"
 
-// useGoProxyUpstream 把一条 proxy.golang.org 形态的 static 上游装成进程内那一份。
-//
-// Go module proxy 在决策 12 里没有自己的协议类别：它就是一条 static 上游，
-// 路径尾巴原样转发——`/sumdb/` 能被代理靠的正是这一点，而不是哪段专门的代码。
+type goProxyRewriteSource struct{}
+
+func (goProxyRewriteSource) Snapshot(context.Context) (*proxy_svc.RewriteSnapshot, error) {
+	return &proxy_svc.RewriteSnapshot{Upstreams: map[string]proxy_svc.RewriteUpstream{
+		"sum.golang.org": {
+			Profile:    upstream_entity.PackageProfileGoProxy,
+			Transports: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+		},
+	}}, nil
+}
+
+// useGoProxyUpstream 把 Go module proxy 与固定 checksum database 都装成进程内上游。
+// 两条公开路径会在 dispatch 收敛到各自真正的目标主机。
 func useGoProxyUpstream(t *testing.T, origin string) {
 	t.Helper()
 	repo := mock_upstream_repo.NewMockUpstreamRepo(gomock.NewController(t))
-	repo.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{{
-		ID: 4, Host: "proxy.golang.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic}, Origin: origin,
-		Enabled: true, DefaultPolicy: upstream_entity.PolicyAllowAll,
-	}}, nil).AnyTimes()
+	repo.EXPECT().List(gomock.Any()).Return([]*upstream_entity.Upstream{
+		{
+			ID: 4, Host: "proxy.golang.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic}, Origin: origin,
+			Enabled: true, DefaultPolicy: upstream_entity.PolicyAllowAll,
+		},
+		{
+			ID: 5, Host: "sum.golang.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic}, Origin: origin,
+			Enabled: true, DefaultPolicy: upstream_entity.PolicyAllowAll,
+			PackageProfile: upstream_entity.PackageProfileGoProxy,
+		},
+	}, nil).AnyTimes()
 	upstream_repo.RegisterUpstream(proxy_svc.NewCachedUpstreamRepo(repo))
 
 	prevProxy := proxy_svc.Proxy()
-	proxy_svc.Register(proxy_svc.New(proxy_svc.Options{}))
+	proxy_svc.Register(proxy_svc.New(proxy_svc.Options{
+		RewriteConfig: goProxyRewriteSource{}, DestinationResolver: localDestinationResolver{},
+	}))
 	t.Cleanup(func() { proxy_svc.Register(prevProxy) })
 	// 缓存层用出厂的纯透传形态：这一组用例问的是路径有没有被改写，不是缓存。
 	prevCache := cache_svc.Cache()
@@ -46,12 +65,10 @@ func useGoProxyUpstream(t *testing.T, origin string) {
 
 // TestPull_GoProxySumdbIsProxied
 //
-// `/sumdb/` 是 GOPROXY 协议的一部分，缺了它 go 命令验不了 go.sum，整条上游等于废掉。
-// 它没有任何专门的代码，靠的是 static 上游把路径尾巴原样往上游送——所以这里钉住的是
-// 「尾巴一个字节都没被改」：不补 /v2 协议前缀（那是 registry 的事）、不重新编码、
-// 不因为第一段之后还有一个含点的主机名（sum.golang.org）就再分一次段。
+// Go 客户端把 checksum 请求放在 GOPROXY 的 /sumdb/ 子路径下；dispatch 必须把它
+// 收敛为 sum.golang.org 的 canonical target，模块本体仍归 proxy.golang.org。
 func TestPull_GoProxySumdbIsProxied(t *testing.T) {
-	convey.Convey("/sumdb/ 子路径原样代理给 proxy.golang.org", t, func() {
+	convey.Convey("/sumdb/ 子路径按 canonical 路径代理给 sum.golang.org", t, func() {
 		// 断言不写在假源站的 handler 里：它跑在另一个 goroutine 上，
 		// convey.So 脱离 Convey 栈会 panic，表现成一次假的「回源失败」。
 		var gotURIs []string
@@ -68,9 +85,9 @@ func TestPull_GoProxySumdbIsProxied(t *testing.T) {
 		handler(w, httptest.NewRequest(http.MethodGet,
 			"/proxy.golang.org/sumdb/sum.golang.org/lookup/github.com/foo/bar@v1.0.0", nil))
 
-		convey.Convey("上游收到的就是摘掉主机名之后那一段，原封不动", func() {
+		convey.Convey("checksum 上游收到去掉公开别名后的 canonical 路径", func() {
 			convey.So(gotURIs, convey.ShouldResemble, []string{
-				"/sumdb/sum.golang.org/lookup/github.com/foo/bar@v1.0.0",
+				"/lookup/github.com/foo/bar@v1.0.0",
 			})
 		})
 		convey.Convey("响应体逐字节回给客户端：go 命令要拿它去校验", func() {
@@ -88,7 +105,7 @@ func TestPull_GoProxySumdbIsProxied(t *testing.T) {
 
 			convey.So(second.Code, convey.ShouldEqual, http.StatusOK)
 			convey.So(gotURIs, convey.ShouldResemble, []string{
-				"/sumdb/sum.golang.org/lookup/github.com/foo/bar@v1.0.0",
+				"/lookup/github.com/foo/bar@v1.0.0",
 				"/github.com/!burnt!sushi/toml/@v/list",
 			})
 		})
