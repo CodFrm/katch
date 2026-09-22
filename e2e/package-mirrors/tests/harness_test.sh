@@ -587,11 +587,17 @@ printf '%s\n' "$apt_setup" |
   grep -Fx "if dpkg-query -W -f='\${Status}\\n' hello 2>/dev/null | grep -qx 'install ok installed'; then" >/dev/null ||
   fail "APT setup does not require each phase to start without the package installed"
 # set -e does not apply to a pipeline that begins with !, so a negated check that is not the
-# script's last command can never fail. The APT scripts write those checks as if/exit.
-for apt_script in "$apt_setup" "$apt_run" "$apt_assert"; do
-  if printf '%s\n' "$apt_script" | grep -E '^[[:space:]]*! '; then
-    fail "APT case negates a pipeline with !, which set -e ignores"
-  fi
+# script's last command can never fail. The APT scripts write those checks as if/exit; the
+# same rule holds for every case, so the ban is enforced across the whole matrix rather
+# than per case — a trailing ! works today only because nothing was appended after it.
+for case_yaml in "$CASES"/*.yaml; do
+  case_name=$(jq -r '.name' "$case_yaml")
+  for case_script_field in setup run assert; do
+    case_script=$(jq -r ".$case_script_field" "$case_yaml")
+    if printf '%s\n' "$case_script" | grep -E '^[[:space:]]*! '; then
+      fail "$case_name negates a pipeline with ! in $case_script_field, which set -e ignores"
+    fi
+  done
 done
 # The index the warm phase verified and installed from must be the one the cold phase
 # published after verifying it. Whether the warm phase refreshes indexes at all is a

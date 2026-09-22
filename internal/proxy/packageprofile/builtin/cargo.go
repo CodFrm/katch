@@ -61,7 +61,7 @@ func (cargoProfile) Classify(request packageprofile.Request) packageprofile.Repr
 }
 
 func (cargoProfile) Transform(ctx context.Context, request packageprofile.TransformRequest) (*packageprofile.TransformResult, error) {
-	if !cargoAbsoluteHTTPURL(request.SiteBaseURL) || request.RewriteURL == nil {
+	if _, err := absoluteHTTPURL(request.SiteBaseURL); err != nil || request.RewriteURL == nil {
 		return nil, packageprofile.ErrUnavailable
 	}
 
@@ -127,11 +127,6 @@ func validCargoDownloadBase(target *url.URL) bool {
 		return false
 	}
 	return target.EscapedPath() == "/crates" || target.EscapedPath() == "/crates/"
-}
-
-func cargoAbsoluteHTTPURL(raw string) bool {
-	parsed, err := url.Parse(raw)
-	return err == nil && parsed.IsAbs() && parsed.Host != "" && parsed.User == nil && (parsed.Scheme == "https" || parsed.Scheme == "http")
 }
 
 func cargoSparseMetadataPath(path string) bool {

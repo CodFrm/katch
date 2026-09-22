@@ -102,9 +102,7 @@
       "no_dynamic_mirrors": "Leave mirrorlist and metalink empty.",
       "dist_only": "Composer support is limited to Composer 2 dist installs.",
       "bottles_only": "Homebrew support is limited to standard Bottle installs, not source builds.",
-      "insecure_localhost": "Plain HTTP is only for localhost development; configure the client's explicit insecure-localhost exception.",
-      "placeholder": "Replace angle-bracket placeholders with repository, suite, architecture or package values.",
-      "verified_only": "Copyable configuration appears only after blocked-egress runtime verification."
+      "insecure_localhost": "Plain HTTP is only for localhost development; configure the client's explicit insecure-localhost exception."
     }
   },
   "status": {

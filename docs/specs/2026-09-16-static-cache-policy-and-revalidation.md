@@ -100,7 +100,7 @@ README 的命中示例改为真正读取 GET 响应而不是 `curl -I`。文档�
 
 | Seam | What it verifies | Prior art |
 |---|---|---|
-| 缓存策略表单 | 预设填充、可继续编辑、TTL 写回、自定义模式归一化、已有配置不被自动覆盖 | `frontend/tests/routes/admin-manage.test.tsx` |
+| 缓存策略表单 | 预设填充、可继续编辑、TTL 写回、自定义模式归一化、已有配置不被自动覆盖 | 模式语义由 `internal/cache/pattern_test.go` 覆盖；表单交互（预设填充与归一化）暂无前端自动化用例 |
 | 模式判定 | Go 版本文件命中而 `@v/list`、`@latest` 不命中；各预设的代表路径与反例 | `internal/cache/pattern_test.go` |
 | 缓存记录迁移 | 新旧数据库均得到 validator 字段，已有缓存行内容和状态不变；sqlite 与 MySQL 兼容的 DDL 形状 | `migrations/migrations_test.go`、缓存迁移测试 |
 | 缓存写入与命中 | 上游 validator 随内容保存、覆盖并在本地响应回放 | `internal/service/cache_svc/cache_test.go` |

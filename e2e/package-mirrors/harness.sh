@@ -98,6 +98,7 @@ if [ -z "$RUNTIME" ]; then
 fi
 need "$RUNTIME"
 need curl
+need timeout
 
 run_id=$(date -u '+%Y%m%dT%H%M%SZ').$$
 run_root=$ARTIFACT_ROOT/$run_id
@@ -180,7 +181,10 @@ run_phase() {
     --env KATCH_ARTIFACTS=/artifacts \
     --env KATCH_SHARED=/shared \
     "$image"
-  "$@" > "$phase_root/client.log" 2>&1
+  # 一个卡在重试循环里的包管理器不该把整趟 harness 无限期挂住：每个阶段有自己的
+  # 硬时限，超时按失败收场（容器由 run --rm 收拾）。KATCH_CASE_TIMEOUT 可覆盖，
+  # registry 那两条嵌套 daemon 的用例需要更长的可以自己调大。
+  timeout "${KATCH_CASE_TIMEOUT:-1800}" "$@" > "$phase_root/client.log" 2>&1
 }
 
 files=$(mktemp "${TMPDIR:-/tmp}/katch-case-list.XXXXXX")

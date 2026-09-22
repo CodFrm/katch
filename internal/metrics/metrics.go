@@ -72,12 +72,16 @@ const (
 )
 
 const (
-	// cacheStatusHeader 缓存层在响应上留下的命中标记。
-	cacheStatusHeader = "X-Katch-Cache"
-	cacheStatusHit    = "HIT"
-	// cacheStatusRevalidated 过期副本经上游 304 续期：问过上游，所以记未命中；正文出自
+	// CacheStatusHeader 缓存层在响应上留下的命中标记。值是对外契约（用例与
+	// make smoke 逐字比对），cache_svc 与这里的中间件共用这一份——两边各写一遍
+	// 字符串，改一处就会让指标悄悄把命中记成回源（同 GitSourceHeader 的理由）。
+	CacheStatusHeader = "X-Katch-Cache"
+	CacheStatusHit    = "HIT"
+	// CacheStatusRevalidated 过期副本经上游 304 续期：问过上游，所以记未命中；正文出自
 	// 盘上那份，所以没有一个字节算作来自上游。
-	cacheStatusRevalidated = "REVALIDATED"
+	CacheStatusRevalidated = "REVALIDATED"
+	// CacheStatusMiss 本跳回源后交给客户端的应答。
+	CacheStatusMiss = "MISS"
 	// MissHeader 缓存层在未命中的响应上留下的归因。
 	//
 	// 和命中标记分成两个头而不是把原因拼进 X-Katch-Cache 的值里：那个值是已经
@@ -551,7 +555,7 @@ func (r *Recorder) Middleware(hooks Hooks) gin.HandlerFunc {
 			return
 		}
 		ev.Upstream = host
-		ev.Result = classify(c.Writer.Status(), c.Writer.Header().Get(cacheStatusHeader))
+		ev.Result = classify(c.Writer.Status(), c.Writer.Header().Get(CacheStatusHeader))
 		// git 的应答自己说它是谁答的，不必从状态码上猜：本地应答与穿透的状态码
 		// 一模一样，差别只在这个头上。
 		ev.Result = gitResult(c.Writer.Header().Get(GitSourceHeader), ev.Result)
@@ -560,7 +564,7 @@ func (r *Recorder) Middleware(hooks Hooks) gin.HandlerFunc {
 		}
 		if size := int64(c.Writer.Size()); size > 0 {
 			ev.BytesServed = size
-			revalidated := c.Writer.Header().Get(cacheStatusHeader) == cacheStatusRevalidated
+			revalidated := c.Writer.Header().Get(CacheStatusHeader) == CacheStatusRevalidated
 			if (ev.Result == ResultMiss && !revalidated) || ev.Result == ResultPassthrough {
 				ev.BytesOrigin = size
 			}
@@ -632,7 +636,7 @@ func classify(status int, cacheStatus string) Result {
 		return ResultOriginError
 	case status == http.StatusForbidden:
 		return ResultDenied
-	case cacheStatus == cacheStatusHit:
+	case cacheStatus == CacheStatusHit:
 		return ResultHit
 	default:
 		return ResultMiss

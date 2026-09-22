@@ -17,9 +17,12 @@ const (
 	// legitimate first segment named v2 is a protocol prefix.
 	registryBaseNamespace = "/registry"
 	sumDBNamespace        = "/sumdb"
-	sumDBHost             = "sum.golang.org"
-	sumDBRoutePrefix      = sumDBNamespace + "/" + sumDBHost
-	goProxyHost           = "proxy.golang.org"
+	// SumDBHost 是 sumdb 别名固定指向的那一个 checksum database。路由在这里认它，
+	// proxy_svc 的 checksum 桥也按它改写目标：两边各写一遍字符串，改一处就会让
+	// 另一边把请求送去一个 nobody 认识的主机。
+	SumDBHost        = "sum.golang.org"
+	sumDBRoutePrefix = sumDBNamespace + "/" + SumDBHost
+	goProxyHost      = "proxy.golang.org"
 )
 
 // Kind 一个路径的归属。
@@ -145,7 +148,7 @@ func classifySumDB(path string) (Kind, string, string) {
 	if !safeTail(strings.TrimPrefix(rest, "/")) || !ValidSumDBRoute(rest) {
 		return KindInvalid, "", ""
 	}
-	return KindSumDB, sumDBHost, rest
+	return KindSumDB, SumDBHost, rest
 }
 
 // ValidSumDBRoute checksum database 协议认得的那几条路由。

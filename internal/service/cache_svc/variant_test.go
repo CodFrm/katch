@@ -497,7 +497,7 @@ func TestGet_KeyIsUnchangedWithoutAcceptVariance(t *testing.T) {
 	})
 }
 
-// dockerAcceptSet / ociAcceptSet 两种客户端各自那一串 Accept 的等价写法。
+// dockerAcceptSet 是 docker 客户端那一串 Accept 的等价写法。
 var dockerAcceptSet = []string{dockerManifestType, dockerIndexType}
 
 // TestNormalizeAccept_SameMeaningLandsOnOneKey 归一化：意思相同的 Accept 归到一个键。

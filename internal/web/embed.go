@@ -151,7 +151,8 @@ func serveUpstream(c *gin.Context, kind dispatch.Kind, host, rest string) bool {
 	case dispatch.IsPull(kind):
 		serveProxy(c, kind, host, rest)
 		return true
-	case kind == dispatch.KindSPA, kind == dispatch.KindSelf:
+	case kind == dispatch.KindSPA:
+		// KindSelf 到不了这里：调用方在分发之前就已按自身端点的 404 处理。
 		return false
 	}
 	return false

@@ -437,6 +437,11 @@ func destinationRequirement(
 	switch target.Kind {
 	case dispatch.KindRegistry:
 		requirement.Transport = upstream_entity.ProtocolRegistry
+	case dispatch.KindSumDB:
+		// 正常路径在 checksum 桥那里就已改写成 KindStatic；这条分支守的是桥的
+		// fallback 原样转发的情形——它同样只该走 static 与公开地址。
+		requirement.Transport = upstream_entity.ProtocolStatic
+		requirement.AddressPolicy = destination.PublicAddressesOnly
 	case dispatch.KindStatic:
 		if target.Git.IsGit() {
 			requirement.Transport = upstream_entity.ProtocolGit

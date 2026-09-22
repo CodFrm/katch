@@ -10,7 +10,7 @@ import (
 	"github.com/CodFrm/katch/internal/proxy/dispatch"
 )
 
-const sumDBHost = "sum.golang.org"
+const sumDBHost = dispatch.SumDBHost
 
 // SumDBOptions supplies the coherent configuration and normal proxy fallback used by the checksum bridge.
 type SumDBOptions struct {

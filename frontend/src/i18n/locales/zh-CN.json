@@ -102,9 +102,7 @@
       "no_dynamic_mirrors": "mirrorlist 与 metalink 必须留空。",
       "dist_only": "Composer 只支持 Composer 2 dist 安装。",
       "bottles_only": "Homebrew 只支持标准 Bottle 安装，不支持源码构建。",
-      "insecure_localhost": "明文 HTTP 只用于 localhost 开发，需要显式配置客户端的不安全本机例外。",
-      "placeholder": "把尖括号占位符替换成实际仓库、suite、架构或包名。",
-      "verified_only": "只有阻断公网运行时验证通过后才显示可复制配置。"
+      "insecure_localhost": "明文 HTTP 只用于 localhost 开发，需要显式配置客户端的不安全本机例外。"
     }
   },
   "status": {
