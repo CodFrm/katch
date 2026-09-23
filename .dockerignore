@@ -1,11 +1,10 @@
-# 这两个目录必须排除：宿主机上的构建产物会盖掉 web stage 干净构建的结果，
-# 让镜像里混进本地残留的旧 chunk。
+# 前端源码和构建产物不进运行镜像上下文；二进制 bin/katch 必须保留，
+# 由 CI 宿主环境构建后交给 Dockerfile 拷入最终镜像。
 frontend/node_modules
 frontend/dist
 internal/web/dist
 
 .git
-bin
 data
 runtime
 

@@ -84,10 +84,9 @@ mock:
 # 而你以为它跑的是刚编的那个。
 IMAGE ?= ghcr.io/codfrm/katch
 
-docker:
+docker: build
 	docker build -f deploy/Dockerfile -t $(IMAGE):$(VERSION) \
-	  --build-arg VERSION=$(VERSION) \
-	  --build-arg COMMIT=$(COMMIT) .
+	  .
 
 package-mirror-image:
 	./e2e/package-mirrors/images/build.sh

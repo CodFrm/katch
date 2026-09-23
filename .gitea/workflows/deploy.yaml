@@ -58,6 +58,19 @@ jobs:
       - name: Test
         run: make test
 
+      - name: Resolve the version
+        id: vars
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse --short=7 HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag=main.$sha" >> "$GITHUB_OUTPUT"
+
+      # 在 runner 宿主环境构建：这里能继承 GOPROXY，避免 Docker build 容器
+      # 退回 proxy.golang.org 后访问 Google Storage 失败。
+      - name: Build binary
+        run: make build VERSION="${{ steps.vars.outputs.tag }}" COMMIT="${{ steps.vars.outputs.sha }}"
+
       - name: Set up Docker Buildx
         uses: actions/setup-buildx-action@v3
 
@@ -68,16 +81,8 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_TOKEN }}
 
-      - name: Resolve the version
-        id: vars
-        run: |
-          set -euo pipefail
-          sha=$(git rev-parse --short=7 HEAD)
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "tag=main.$sha" >> "$GITHUB_OUTPUT"
-
-      # 复用 deploy/Dockerfile：三段式，前端与后端都在容器里构建，CGO_ENABLED=0
-      # 那道闸也就跟着跑了一遍。两个 tag：
+      # 前端与后端已经在 runner 上构建，Dockerfile 只安装运行时依赖并拷入二进制。
+      # CGO_ENABLED=0 闸门已由 make build 执行。两个 tag：
       #   main.<短 sha>  这次发布的确切版本，回滚时指着它
       #   main           跟分支走，只用来一眼看出「线上这条线到哪了」
       - name: Build and push image
@@ -92,9 +97,7 @@ jobs:
             ${{ env.DOCKER_REGISTRY }}/${{ github.repository }}:main
           cache-from: type=gha,scope=katch-image
           cache-to: type=gha,scope=katch-image,mode=max,ignore-error=true
-          build-args: |
-            VERSION=${{ steps.vars.outputs.tag }}
-            COMMIT=${{ steps.vars.outputs.sha }}
+
 
       - name: Set up Helm
         uses: actions/setup-helm@v4
