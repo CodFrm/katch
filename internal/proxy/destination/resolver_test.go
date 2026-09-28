@@ -196,3 +196,32 @@ func TestResolveExplicitGenericOriginAllowsPrivateAddress(t *testing.T) {
 		t.Fatalf("DialAddress = %q", got.DialAddress)
 	}
 }
+
+// TestResolveDNSFailureIsNotPolicyDenial
+//
+// 解析不了是「此刻连不上」，不是 katch 的配置拒了它：拉取路径只把
+// ErrDestinationNotAllowed 记成 denied 并绕开退避，DNS 失败混进去的话，
+// 一个域名解析挂掉的上游就永远不会被标成降级。
+func TestResolveDNSFailureIsNotPolicyDenial(t *testing.T) {
+	cases := map[string]LookupNetIP{
+		"lookup error": func(context.Context, string) ([]netip.Addr, error) {
+			return nil, errors.New("no such host")
+		},
+		"empty answer": func(context.Context, string) ([]netip.Addr, error) {
+			return nil, nil
+		},
+	}
+	for name, lookupNetIP := range cases {
+		t.Run(name, func(t *testing.T) {
+			resolver := New(Options{LookupNetIP: lookupNetIP})
+			_, err := resolver.Resolve(context.Background(), parseTarget(t, "https://deb.debian.org/debian"),
+				DestinationRequirement{AddressPolicy: AllowPrivateAddresses})
+			if err == nil {
+				t.Fatal("Resolve() error = nil, want a resolution failure")
+			}
+			if errors.Is(err, ErrDestinationNotAllowed) {
+				t.Fatalf("Resolve() error = %v, must not be ErrDestinationNotAllowed", err)
+			}
+		})
+	}
+}

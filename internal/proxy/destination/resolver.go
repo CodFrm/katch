@@ -19,6 +19,12 @@ import (
 // ErrDestinationNotAllowed deliberately hides the failed safety check.
 var ErrDestinationNotAllowed = errors.New("目标不可用")
 
+// ErrDestinationUnresolvable 目标主机名解析不出地址。
+//
+// 刻意不是 ErrDestinationNotAllowed：那一个是 katch 的配置拒了它，拉取路径据此记成
+// denied 并绕开退避；解析不了则是此刻连不上，和连接超时一样该让上游进退避。
+var ErrDestinationUnresolvable = errors.New("目标无法解析")
+
 // AddressPolicy controls whether resolved private addresses are permitted.
 type AddressPolicy uint8
 
@@ -115,7 +121,12 @@ func (r *resolver) Resolve(
 
 	addresses, err := r.resolveAddresses(ctx, host)
 	if err != nil || len(addresses) == 0 {
-		return nil, deny(ctx, target, "DNS resolution failed", err)
+		fields := []zap.Field{zap.String("host", host)}
+		if err != nil {
+			fields = append(fields, zap.Error(err))
+		}
+		logger.Ctx(ctx).Warn("回源目标解析失败", fields...)
+		return nil, ErrDestinationUnresolvable
 	}
 	for _, address := range addresses {
 		if requirement.AddressPolicy == PublicAddressesOnly && unsafeAddress(address) {

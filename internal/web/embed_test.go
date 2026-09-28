@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"strings"
 	"testing"
@@ -246,6 +247,29 @@ func TestProxy_DestinationDenialDoesNotFeedBackoff(t *testing.T) {
 		gate := &countingGate{}
 
 		w := requestCounted(t, gate, "/deb.debian.org/pool/y.deb")
+		convey.So(w.Code, convey.ShouldEqual, http.StatusBadGateway)
+		convey.So(gate.failures, convey.ShouldEqual, 1)
+	})
+
+	convey.Convey("上游域名解析不了也是连不上，仍然记一次失败", t, func() {
+		// 解析器在 DNS 失败时若也答「目标不可用」，这一次就会被当成策略拒绝记成
+		// denied：域名挂掉的上游永远进不了退避，面板上还显示成「规则拒绝」。
+		upstreamTable(t, &upstream_entity.Upstream{
+			ID: 1, Host: "deb.debian.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+			Origin: "https://deb.debian.org", Enabled: true,
+		})
+		previous := proxy_svc.Proxy()
+		proxy_svc.Register(proxy_svc.New(proxy_svc.Options{
+			DestinationResolver: destination.New(destination.Options{
+				LookupNetIP: func(context.Context, string) ([]netip.Addr, error) {
+					return nil, errors.New("no such host")
+				},
+			}),
+		}))
+		defer proxy_svc.Register(previous)
+		gate := &countingGate{}
+
+		w := requestCounted(t, gate, "/deb.debian.org/pool/z.deb")
 		convey.So(w.Code, convey.ShouldEqual, http.StatusBadGateway)
 		convey.So(gate.failures, convey.ShouldEqual, 1)
 	})
