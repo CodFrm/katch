@@ -31,6 +31,8 @@ type upstreamResponse struct {
 	// miss 缓存层留下的回源原因，空表示这次响应上没有归因。
 	miss string
 	body string
+	// destinationDenied 处理器在 gin 上下文里标一笔「回源目标被策略拒了」。
+	destinationDenied bool
 }
 
 // newTestEngine 拼出和生产一样的形状：中间件在前，拉取处理器挂在 NoRoute 上。
@@ -39,6 +41,9 @@ func newTestEngine(r *Recorder, hooks Hooks, resp *upstreamResponse) *gin.Engine
 	engine := gin.New()
 	engine.Use(r.Middleware(hooks))
 	engine.NoRoute(func(c *gin.Context) {
+		if resp.destinationDenied {
+			MarkDestinationDenied(c)
+		}
 		if resp.cache != "" {
 			c.Header("X-Katch-Cache", resp.cache)
 		}
@@ -289,6 +294,21 @@ func TestRecorder_BackoffFeedback(t *testing.T) {
 
 			convey.So(gate.successes, convey.ShouldEqual, 0)
 			convey.So(gate.failures, convey.ShouldEqual, 0)
+		})
+
+		convey.Convey("回源目标被策略拒绝不算上游失败，计成 denied", func() {
+			// token realm、blob 重定向落到一台没登记的主机上时，拒掉它的是 katch 的
+			// 配置，而不是上游挂了：把它算进退避，一台 CDN 没登记就会把整个 registry
+			// 连同本来拉得到的 manifest 一起挡在窗口外。
+			gate := &fakeGate{degraded: true}
+			hooks := Hooks{Lookup: knownUpstreams("ghcr.io"), Gate: gate}
+			get(newTestEngine(rec, hooks, &upstreamResponse{status: http.StatusBadGateway, destinationDenied: true}),
+				"/v2/ghcr.io/foo/bar/blobs/sha256:aa")
+
+			convey.So(gate.failures, convey.ShouldEqual, 0)
+			convey.So(gate.successes, convey.ShouldEqual, 0)
+			convey.So(scrape(reg), convey.ShouldContainSubstring,
+				`katch_requests_total{kind="registry",result="denied",upstream="ghcr.io"} 1`)
 		})
 
 		convey.Convey("被白名单挡住的请求不影响退避", func() {

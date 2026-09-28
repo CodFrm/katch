@@ -45,7 +45,7 @@ const (
 	ResultHit Result = "hit"
 	// ResultMiss 回源取回（含上游的 4xx/5xx 透传）。
 	ResultMiss Result = "miss"
-	// ResultDenied 被白名单或访问规则挡住。
+	// ResultDenied 被白名单、访问规则或回源目标策略挡住。
 	ResultDenied Result = "denied"
 	// ResultOriginError 上游不可达或超时。
 	ResultOriginError Result = "origin_error"
@@ -529,6 +529,22 @@ func (r *Recorder) DrainRecent() []RecentRequest {
 // 这一行是 debug 级别（决策 1）：默认配置下不写，排障时把级别调到 debug 才恢复。
 const PullLogMessage = "拉取"
 
+// destinationDeniedKey gin 上下文里「这次回源目标被策略拒了」的标记。
+const destinationDeniedKey = "katch.destination_denied"
+
+// MarkDestinationDenied 由拉取处理器在回源目标被策略拒绝时调用。
+//
+// 客户端看到的仍是 502，只凭状态码分不出它和上游不可达；可这一次没有任何上游
+// 不可用——token realm 或 blob 重定向落到了一台没登记的主机上，是 katch 的配置
+// 拒了它。按回源失败喂给退避，一台 CDN 没登记就会把整个上游连同本来拉得到的
+// 请求一起挡在窗口外。
+//
+// 走 gin 上下文而不是 X-Katch-* 响应头：拒绝的原因刻意不对外（destination 包的
+// 约定），挂在响应头上等于把它告诉了每一个客户端。
+func MarkDestinationDenied(c *gin.Context) {
+	c.Set(destinationDeniedKey, true)
+}
+
 // Middleware 构造拉取路径的计数中间件。
 func (r *Recorder) Middleware(hooks Hooks) gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -556,6 +572,9 @@ func (r *Recorder) Middleware(hooks Hooks) gin.HandlerFunc {
 		}
 		ev.Upstream = host
 		ev.Result = classify(c.Writer.Status(), c.Writer.Header().Get(CacheStatusHeader))
+		if c.GetBool(destinationDeniedKey) {
+			ev.Result = ResultDenied
+		}
 		// git 的应答自己说它是谁答的，不必从状态码上猜：本地应答与穿透的状态码
 		// 一模一样，差别只在这个头上。
 		ev.Result = gitResult(c.Writer.Header().Get(GitSourceHeader), ev.Result)

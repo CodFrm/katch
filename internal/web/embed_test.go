@@ -13,9 +13,11 @@ import (
 	"testing/fstest"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/smartystreets/goconvey/convey"
 	"go.uber.org/mock/gomock"
 
+	"github.com/CodFrm/katch/internal/metrics"
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
 	"github.com/CodFrm/katch/internal/proxy/destination"
 	"github.com/CodFrm/katch/internal/repository/upstream_repo"
@@ -185,6 +187,67 @@ func TestProxy_UnreachableUpstreamIs502(t *testing.T) {
 		w := request(t, http.MethodGet, "/deb.debian.org/pool/x.deb")
 		convey.So(w.Code, convey.ShouldEqual, http.StatusBadGateway)
 		convey.So(w.Body.String(), convey.ShouldNotContainSubstring, "deb.debian.org")
+	})
+}
+
+// countingGate 记下拉取路径喂给退避的每一次成败。
+type countingGate struct{ failures, successes int }
+
+func (g *countingGate) Failure(string)     { g.failures++ }
+func (g *countingGate) Success(string)     { g.successes++ }
+func (*countingGate) Degraded(string) bool { return false }
+
+// requestCounted 和 request 一样，只是前面挂上生产里的计数中间件，并把退避换成 gate。
+func requestCounted(t *testing.T, gate metrics.Gate, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	rec := metrics.New(metrics.Options{Registerer: prometheus.NewRegistry()})
+	engine.Use(rec.Middleware(metrics.Hooks{
+		Lookup: func(context.Context, string) bool { return true },
+		Gate:   gate,
+	}))
+	engine.NoRoute(newNoRouteHandlerFS(testDist()))
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+	return w
+}
+
+// TestProxy_DestinationDenialDoesNotFeedBackoff
+//
+// 线上 docker.io / ghcr.io / quay.io 被一起标成「限流中」，原因不是上游挂了：
+// token realm（auth.docker.io）与 blob 重定向（pkg-containers.githubusercontent.com、
+// cdn01.quay.io）落在没登记的主机上，被回源目标策略拒掉，这 502 又被当成回源失败
+// 喂给退避，于是连本来拉得到的 manifest 也一起被挡在窗口外。
+func TestProxy_DestinationDenialDoesNotFeedBackoff(t *testing.T) {
+	convey.Convey("回源目标被策略拒绝：客户端照旧 502，退避不记失败", t, func() {
+		origin := fakeOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "https://cdn.unregistered.example/blob", http.StatusTemporaryRedirect)
+		})
+		upstreamTable(t, &upstream_entity.Upstream{
+			ID: 1, Host: "deb.debian.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+			Origin: origin, Enabled: true,
+		})
+		gate := &countingGate{}
+
+		w := requestCounted(t, gate, "/deb.debian.org/pool/x.deb")
+		convey.So(w.Code, convey.ShouldEqual, http.StatusBadGateway)
+		convey.So(w.Body.String(), convey.ShouldNotContainSubstring, "unregistered")
+		convey.So(gate.failures, convey.ShouldEqual, 0)
+	})
+
+	convey.Convey("真正连不上的上游仍然记一次失败", t, func() {
+		dead := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
+		dead.Close()
+		upstreamTable(t, &upstream_entity.Upstream{
+			ID: 1, Host: "deb.debian.org", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+			Origin: dead.URL, Enabled: true,
+		})
+		gate := &countingGate{}
+
+		w := requestCounted(t, gate, "/deb.debian.org/pool/y.deb")
+		convey.So(w.Code, convey.ShouldEqual, http.StatusBadGateway)
+		convey.So(gate.failures, convey.ShouldEqual, 1)
 	})
 }
 

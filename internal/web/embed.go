@@ -22,6 +22,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/CodFrm/katch/internal/metrics"
+	"github.com/CodFrm/katch/internal/proxy/destination"
 	"github.com/CodFrm/katch/internal/proxy/dispatch"
 	"github.com/CodFrm/katch/internal/service/cache_svc"
 	"github.com/CodFrm/katch/internal/service/git_svc"
@@ -213,6 +214,11 @@ func serveProxy(c *gin.Context, kind dispatch.Kind, host, rest string) {
 			// 内网主机是否存在的工具——能回显的就是表里有的（决策 6）。
 			c.AbortWithStatus(http.StatusNotFound)
 			return
+		}
+		if errors.Is(err, destination.ErrDestinationNotAllowed) {
+			// 对客户端仍是 502，但这不是上游不可达：token realm 或重定向落到了一台
+			// 没登记的主机上，是配置的事。别让它把整个上游推进退避。
+			metrics.MarkDestinationDenied(c)
 		}
 		// 回源失败是 502 而不是 404：404 会让客户端把「这个对象不存在」当成
 		// 结论记下来，而这只是上游此刻不可达。主机名只进日志，不进响应。
