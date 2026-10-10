@@ -12,6 +12,7 @@ import (
 	api_upstream "github.com/CodFrm/katch/internal/api/upstream"
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
 	"github.com/CodFrm/katch/internal/pkg/code"
+	"github.com/CodFrm/katch/internal/proxy/dispatch"
 	"github.com/CodFrm/katch/internal/proxy/packageprofile"
 	_ "github.com/CodFrm/katch/internal/proxy/packageprofile/builtin"
 	"github.com/CodFrm/katch/internal/repository/rule_repo"
@@ -45,6 +46,29 @@ var defaultUpstream = &upstreamSvc{}
 // Upstream 返回上游业务层。
 func Upstream() UpstreamSvc {
 	return defaultUpstream
+}
+
+// CanonicalPullPath 返回 path（转义形态）的规范拉取路径：主机名在前的 registry
+// 写法 /<host>/v2/... 在这台主机开了 registry 协议时归一成 /v2/<host>/...，
+// 其余原样返回。
+//
+// 主机名之后的 /v2 是协议边界还是上游路径的第一段，路径本身分不出来——一条只开
+// static 的上游（registry 的 blob 重定向落点就是）在 /v2/ 之下有它自己的对象——
+// 分得开的只有上游表：这台主机开了 registry 协议，它的 /v2 就是 registry 接口。
+// 拉取入口与规则试算共用这一个判定，两边才不会各认各的。
+func CanonicalPullPath(ctx context.Context, path string) (string, error) {
+	host, canonical, ok := dispatch.HostFirstRegistry(path)
+	if !ok {
+		return path, nil
+	}
+	upstream, err := Upstream().FindByHost(ctx, host)
+	if err != nil {
+		return "", err
+	}
+	if upstream == nil || !upstream.Protocols.Has(upstream_entity.ProtocolRegistry) {
+		return path, nil
+	}
+	return canonical, nil
 }
 
 func (u *upstreamSvc) FindByHost(ctx context.Context, host string) (*upstream_entity.Upstream, error) {

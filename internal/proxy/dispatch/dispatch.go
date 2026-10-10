@@ -89,24 +89,38 @@ func (k Kind) String() string {
 //
 // 判定顺序即决策顺序，第一条命中即止：
 //
-//  1. /api/...、/metrics 是 katch 自身的端点；
-//  2. /registry/<host>/v2/... 是供会自行追加 /v2 的客户端使用的 registry base；
-//  3. /v2 与 /v2/ 是 registry 的探测请求；
-//  4. /v2/<host>/... 是 registry 协议，主机名在 /v2/ 之后；
-//  5. 第一段含 . 的，该段即主机名（决策 2：公网主机名必然含点）；
-//  6. 其余交给 SPA。
+//  1. /http://<host>/...、/https://<host>/... 是整条上游 URL 粘在后面的写法，
+//     协议头摘掉，其后只能是上游主机名；
+//  2. /api/...、/metrics 是 katch 自身的端点；
+//  3. /registry/<host>/v2/... 是供会自行追加 /v2 的客户端使用的 registry base；
+//  4. /v2 与 /v2/ 是 registry 的探测请求；
+//  5. /v2/<host>/... 是 registry 协议，主机名在 /v2/ 之后；
+//  6. 第一段含 . 的，该段即主机名（决策 2：公网主机名必然含点）；
+//  7. 其余交给 SPA。
+//
+// /<host>/v2/...（主机名在前的 registry 写法）不在这张表里：它和 static 上游
+// 在 /v2/ 之下的对象同一个形态，分得开的只有上游表，见 HostFirstRegistry。
 //
 // 只有 KindRegistry、KindStatic 与 KindSumDB 会带回 host/rest，其余都是空串。
 // KindRegistry 的 rest **不含** /v2 前缀——那是 registry 的协议前缀，由回源侧
 // 按上游类别补回，不属于「上游路径」。
 //
-// 注意第 4 条会把 /favicon.ico 这类根目录下的前端产物也判成上游（它含点）。
+// 注意第 6 条会把 /favicon.ico 这类根目录下的前端产物也判成上游（它含点）。
 // 这不是 bug：调用方先查 dist 再问 Classify，命中的产物文件永远赢——dist 是
 // 编译期固定的一小撮文件，而上游是运行时可增删的记录，让固定的那份优先才不会
 // 因为谁加了一条上游就把界面打坏。
 func Classify(path string) (Kind, string, string) {
 	if path == "" || path[0] != '/' {
 		return KindSPA, "", ""
+	}
+	if rest, ok := stripScheme(path); ok {
+		kind, host, tail := classifyStatic(rest)
+		if kind == KindSPA {
+			// 带着协议头就是一次明确的上游尝试，第一段不含点便拿不出上游；
+			// 回落给 SPA 会让它拿到 200 + HTML，也会让协议头成了绕到保留段的路。
+			return KindInvalid, "", ""
+		}
+		return kind, host, tail
 	}
 	if path == "/api" || path == "/metrics" ||
 		strings.HasPrefix(path, "/api/") || strings.HasPrefix(path, "/metrics/") {
@@ -126,11 +140,59 @@ func Classify(path string) (Kind, string, string) {
 		// 它不含点就是个拿不出上游的请求，和未知主机一样 404。
 		return upstream(KindRegistry, rest)
 	}
-	kind, host, rest := upstream(KindStatic, strings.TrimPrefix(path, "/"))
-	if kind == KindStatic && strings.EqualFold(host, goProxyHost) && sumDBNamespacePath(rest) {
-		return classifySumDB(rest)
+	return classifyStatic(strings.TrimPrefix(path, "/"))
+}
+
+// classifyStatic 按「第一段即主机名」解 rest（不带开头的斜杠）。
+func classifyStatic(rest string) (Kind, string, string) {
+	kind, host, tail := upstream(KindStatic, rest)
+	if kind == KindStatic && strings.EqualFold(host, goProxyHost) && sumDBNamespacePath(tail) {
+		return classifySumDB(tail)
 	}
-	return kind, host, rest
+	return kind, host, tail
+}
+
+// stripScheme 摘掉粘在路径最前面的 http:// 或 https://，返回其后不带开头斜杠的
+// 那一段。
+//
+// 「前缀 + 整条原始 URL」是 GitHub 代理通行的写法（gh-proxy、ghfast），客户端
+// 照那个约定拼出来的就是 /https://<host>/...。协议头本身不带信息——回源走什么
+// 协议由上游记录的回源地址决定——所以摘掉即可。单斜杠那一种是反代合并过重复
+// 斜杠（nginx 的 merge_slashes 默认开着）之后的同一个请求。只摘一层。
+func stripScheme(path string) (string, bool) {
+	rest := strings.TrimPrefix(path, "/")
+	scheme, after, ok := strings.Cut(rest, ":/")
+	if !ok || !strings.EqualFold(scheme, "http") && !strings.EqualFold(scheme, "https") {
+		return "", false
+	}
+	return strings.TrimPrefix(after, "/"), true
+}
+
+// HostFirstRegistry 认出「上游主机在前」的 registry 写法 /<host>/v2/...（前面可
+// 带协议头），返回主机名与归一成旧路由 /v2/<host>/... 的路径。
+//
+// 这是「把 https:// 换成 https://<katch>/，其余照抄」落到 registry 上的样子：
+// https://ghcr.io/v2/<repository>/... 照抄过来，/v2 就在主机名之后；自己追加
+// /v2/<repository> 的客户端把 <katch>/<host> 当 registry base 时也是它。
+//
+// 这里只认形态。主机名之后的 /v2 是协议边界还是上游路径的第一段，路径本身分不
+// 出来：一条只开 static 的上游（registry 的 blob 重定向落点就是）在 /v2/ 之下
+// 有它自己的对象。调用方必须先确认这台主机开了 registry 协议再用 canonical。
+// 只摘主机名之后的那一个 v2，仓库名可以合法地以 v2 开头。
+func HostFirstRegistry(path string) (host, canonical string, ok bool) {
+	if path == "" || path[0] != '/' {
+		return "", "", false
+	}
+	rest, schemed := stripScheme(path)
+	if !schemed {
+		rest = strings.TrimPrefix(path, "/")
+	}
+	kind, host, tail := upstream(KindStatic, rest)
+	if kind != KindStatic || tail != "/v2" && !strings.HasPrefix(tail, "/v2/") {
+		return "", "", false
+	}
+	rawHost, _, _ := strings.Cut(rest, "/")
+	return host, "/v2/" + rawHost + strings.TrimPrefix(tail, "/v2"), true
 }
 
 func sumDBNamespacePath(path string) bool {

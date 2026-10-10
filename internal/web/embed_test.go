@@ -21,6 +21,7 @@ import (
 	"github.com/CodFrm/katch/internal/metrics"
 	"github.com/CodFrm/katch/internal/model/entity/upstream_entity"
 	"github.com/CodFrm/katch/internal/proxy/destination"
+	"github.com/CodFrm/katch/internal/proxy/hostfirst"
 	"github.com/CodFrm/katch/internal/repository/upstream_repo"
 	mock_upstream_repo "github.com/CodFrm/katch/internal/repository/upstream_repo/mock"
 	"github.com/CodFrm/katch/internal/service/proxy_svc"
@@ -375,6 +376,76 @@ func TestProxy_RegistryBaseForHomebrew(t *testing.T) {
 		convey.So(unknown.Code, convey.ShouldEqual, http.StatusNotFound)
 		convey.So(unknown.Body.String(), convey.ShouldBeEmpty)
 		convey.So(originCalls, convey.ShouldEqual, 1)
+	})
+}
+
+// TestProxy_SchemePrefixedURLIsServed 「前缀 + 整条原始 URL」是 GitHub 代理通行的
+// 写法，照那个约定拼出来的请求必须拿到源站的字节，而不是 index.html。
+func TestProxy_SchemePrefixedURLIsServed(t *testing.T) {
+	convey.Convey("带协议头的整条上游 URL 和不带的拿到同一个对象", t, func() {
+		gotURI := ""
+		origin := fakeOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+			gotURI = r.URL.RequestURI()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"format":1}`)
+		})
+		upstreamTable(t, &upstream_entity.Upstream{
+			ID: 1, Host: "raw.githubusercontent.com", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolStatic},
+			Origin: origin, Enabled: true,
+		})
+
+		for _, path := range []string{
+			"/https://raw.githubusercontent.com/o/r/main/index.json?x=1",
+			"/http://raw.githubusercontent.com/o/r/main/index.json?x=1",
+			"/https:/raw.githubusercontent.com/o/r/main/index.json?x=1",
+		} {
+			gotURI = ""
+			w := request(t, http.MethodGet, path)
+			convey.So(w.Code, convey.ShouldEqual, http.StatusOK)
+			convey.So(w.Body.String(), convey.ShouldEqual, `{"format":1}`)
+			convey.So(gotURI, convey.ShouldEqual, "/o/r/main/index.json?x=1")
+		}
+
+		convey.Convey("协议头不放宽白名单，也不回落 index.html", func() {
+			for _, path := range []string{"/https://unknown.example/x", "/https://localhost/x", "/https://api/v1/site"} {
+				w := request(t, http.MethodGet, path)
+				convey.So(w.Code, convey.ShouldEqual, http.StatusNotFound)
+				convey.So(w.Body.String(), convey.ShouldBeEmpty)
+			}
+		})
+	})
+}
+
+// TestProxy_RegistryHostFirst 主机名在前的 registry 写法落到同一个 registry 适配器
+// 上，回源时只带一个 /v2 前缀。
+func TestProxy_RegistryHostFirst(t *testing.T) {
+	convey.Convey("/<host>/v2/... 与 /v2/<host>/... 回源到同一个地址", t, func() {
+		gotURI := ""
+		origin := fakeOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+			gotURI = r.URL.RequestURI()
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			_, _ = io.WriteString(w, `{"schemaVersion":2}`)
+		})
+		upstreamTable(t, &upstream_entity.Upstream{
+			ID: 1, Host: "ghcr.io", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolRegistry},
+			Origin: origin, Enabled: true,
+		})
+		gin.SetMode(gin.TestMode)
+		engine := gin.New()
+		engine.Use(hostfirst.Middleware())
+		engine.NoRoute(newNoRouteHandlerFS(testDist()))
+
+		for _, path := range []string{
+			"/ghcr.io/v2/o/r/manifests/t",
+			"/https://ghcr.io/v2/o/r/manifests/t",
+		} {
+			gotURI = ""
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+			convey.So(w.Code, convey.ShouldEqual, http.StatusOK)
+			convey.So(w.Body.String(), convey.ShouldEqual, `{"schemaVersion":2}`)
+			convey.So(gotURI, convey.ShouldEqual, "/v2/o/r/manifests/t")
+		}
 	})
 }
 

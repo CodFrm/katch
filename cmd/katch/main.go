@@ -27,6 +27,7 @@ import (
 	"github.com/CodFrm/katch/internal/cache"
 	"github.com/CodFrm/katch/internal/metrics"
 	"github.com/CodFrm/katch/internal/proxy/backoff"
+	"github.com/CodFrm/katch/internal/proxy/hostfirst"
 	_ "github.com/CodFrm/katch/internal/proxy/packageprofile/builtin"
 	"github.com/CodFrm/katch/internal/repository/cache_repo"
 	"github.com/CodFrm/katch/internal/repository/event_repo"
@@ -262,6 +263,9 @@ func main() {
 		// 最近请求：每秒把计数中间件攒下的拉取明细落进 recent_request，
 		// 并按设置里的保留期裁剪。必须排在仓储装配之后（它要写这张表）。
 		Registry(requestSvc).
+		// 主机名在前的 registry 写法在这里归一。必须排在计数中间件之前：它在
+		// 进入时就按路径分类，排在后面的话这类请求会被记成 static。
+		Registry(hostfirst.Mount()).
 		Registry(metrics.Mount(metrics.Hooks{
 			Gate: backoffGate,
 			// 只用来判定「这个主机名该不该有自己的标签」，不是白名单那道闸——

@@ -178,6 +178,34 @@ func TestTest_AcceptsPastedPullPath(t *testing.T) {
 	})
 }
 
+// TestTest_HostFirstRegistryPathIsEvaluatedAsRegistry 粘进来的是主机名在前的
+// registry 写法时，试算必须和真实拉取落在同一条仓库路径上：规则按仓库路径写，
+// 带着 /v2 去比会把一条实际被拒的请求报成放行。
+func TestTest_HostFirstRegistryPathIsEvaluatedAsRegistry(t *testing.T) {
+	convey.Convey("主机名在前的 registry 写法按仓库路径试算", t, func() {
+		ruleRepo, upRepo := setupRuleTest(t)
+		upRepo.EXPECT().FindByHost(gomock.Any(), "ghcr.io").Return(&upstream_entity.Upstream{
+			ID: 3, Host: "ghcr.io", Protocols: upstream_entity.ProtocolSet{upstream_entity.ProtocolRegistry},
+			Enabled: true, DefaultPolicy: upstream_entity.PolicyAllowAll,
+		}, nil).AnyTimes()
+		ruleRepo.EXPECT().List(gomock.Any()).Return([]*rule_entity.AccessRule{
+			{ID: 1, UpstreamID: 3, Action: rule_entity.ActionDeny, Pattern: "private/*"},
+		}, nil).AnyTimes()
+
+		for _, path := range []string{
+			"/v2/ghcr.io/private/img/manifests/t",
+			"/ghcr.io/v2/private/img/manifests/t",
+			"/https://ghcr.io/v2/private/img/manifests/t",
+		} {
+			resp, err := Rule().Test(context.Background(), &admin.TestRuleRequest{Path: path})
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(resp.Host, convey.ShouldEqual, "ghcr.io")
+			convey.So(resp.Path, convey.ShouldEqual, "/private/img/manifests/t")
+			convey.So(resp.Allowed, convey.ShouldBeFalse)
+		}
+	})
+}
+
 // TestTest_UnknownUpstreamIsAnError 试算是管理接口，这里说清楚「这个上游不在
 // 表里」不会泄漏什么——拉取路径上的 404 才是那条不能有差别的路。
 func TestTest_UnknownUpstreamIsAnError(t *testing.T) {

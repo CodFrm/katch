@@ -20,6 +20,14 @@ deb https://katch.example.com/deb.debian.org/debian bookworm main
 export GOPROXY=https://katch.example.com/proxy.golang.org
 ```
 
+整条原始 URL 直接粘在后面也认（GitHub 代理通行的「前缀 + 原始 URL」写法），
+registry 的 `/v2` 跟在主机名后面同样可以：
+
+```bash
+curl -fLO https://katch.example.com/https://raw.githubusercontent.com/foo/bar/main/x.sh
+curl -fL https://katch.example.com/ghcr.io/v2/foo/bar/manifests/latest
+```
+
 符合上述条件时，加一个新上游只需**在界面上加一条记录**，不是加一条路径前缀约定，
 也不需要重启进程。需要解释或改写元数据的上游还需要对应的协议适配器。
 

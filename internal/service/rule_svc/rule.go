@@ -164,9 +164,14 @@ func (r *ruleSvc) Test(
 ) (*admin.TestRuleResponse, error) {
 	host, path := req.Host, req.Path
 	if host == "" {
-		// 界面上是「把资源地址粘进去」，所以整条拉取路径也要认。分段用的是
-		// 拉取路径上那一个 dispatch.Classify，试算才不会和真实请求分家。
-		_, host, path = dispatch.Classify(req.Path)
+		// 界面上是「把资源地址粘进去」，所以整条拉取路径也要认。归一与分段用的
+		// 是拉取路径上那同一对 CanonicalPullPath 与 dispatch.Classify，试算才
+		// 不会和真实请求分家。
+		canonical, err := upstream_svc.CanonicalPullPath(ctx, req.Path)
+		if err != nil {
+			return nil, err
+		}
+		_, host, path = dispatch.Classify(canonical)
 	}
 	upstream, err := upstream_svc.Upstream().FindByHost(ctx, host)
 	if err != nil {

@@ -92,6 +92,29 @@ func TestClassify(t *testing.T) {
 		{"registry base 主机名不能藏编码斜杠", "/registry/ghcr.io%2Fevil.example/v2/foo", KindInvalid, "", ""},
 		{"registry base 路径同样挡住回溯段", "/registry/ghcr.io/v2/a/%2e%2e/x", KindInvalid, "", ""},
 
+		// ── 整条上游 URL 粘在后面：协议头摘掉，其余照上游段的规则走 ──
+		{"https:// 协议头摘掉后第一段即主机名", "/https://raw.githubusercontent.com/a/b/main/x.sh",
+			KindStatic, "raw.githubusercontent.com", "/a/b/main/x.sh"},
+		{"http:// 同样摘掉，回源协议由上游记录决定", "/http://deb.debian.org/debian/dists/stable/InRelease",
+			KindStatic, "deb.debian.org", "/debian/dists/stable/InRelease"},
+		{"反代合并过的双斜杠（https:/）是同一件事", "/https:/raw.githubusercontent.com/a/b/main/x.sh",
+			KindStatic, "raw.githubusercontent.com", "/a/b/main/x.sh"},
+		{"http:/ 合并形态同理", "/http:/deb.debian.org/debian", KindStatic, "deb.debian.org", "/debian"},
+		{"协议头不分大小写", "/HTTPS://raw.githubusercontent.com/a/b", KindStatic, "raw.githubusercontent.com", "/a/b"},
+		{"协议头之后只有主机名时上游路径是根", "/https://proxy.golang.org", KindStatic, "proxy.golang.org", "/"},
+		{"协议头之后的 GOPROXY 内嵌 SumDB 路由照常收敛",
+			"/https://proxy.golang.org/sumdb/sum.golang.org/latest", KindSumDB, "sum.golang.org", "/latest"},
+		{"协议头之后的转义序列保持原样", "/https://raw.githubusercontent.com/a/b/main/x%20y.sh",
+			KindStatic, "raw.githubusercontent.com", "/a/b/main/x%20y.sh"},
+		{"协议头之后第一段不含点就没有上游可言，不回落 SPA", "/https://localhost/x", KindInvalid, "", ""},
+		{"协议头够不到 katch 自己的保留段", "/https://api/v1/site", KindInvalid, "", ""},
+		{"协议头之后的 /v2 保留段同样够不到", "/https://v2/docker.io/library/redis/manifests/7", KindInvalid, "", ""},
+		{"协议头之后什么都没有", "/https://", KindInvalid, "", ""},
+		{"协议头只摘一层", "/https://https://deb.debian.org/x", KindInvalid, "", ""},
+		{"协议头之后的回溯段同样挡住", "/https://deb.debian.org/pool/../../etc/passwd", KindInvalid, "", ""},
+		{"协议头之后的主机名不能藏编码斜杠", "/https://a.com%2Fb/x", KindInvalid, "", ""},
+		{"只认 http 与 https，别的协议头不是上游写法", "/ftp://deb.debian.org/x", KindSPA, "", ""},
+
 		// ── 拿不出主机名或含回溯段的，一律无效 ──
 		{"回溯段会爬出回源地址的基路径", "/deb.debian.org/pool/../../etc/passwd", KindInvalid, "", ""},
 		{"转义过的回溯段是同一件事", "/deb.debian.org/pool/%2e%2e/x", KindInvalid, "", ""},
@@ -126,11 +149,70 @@ func TestClassify_NoHostLeaksOnInvalid(t *testing.T) {
 			"/sumdb/other.example/latest",
 			"/sumdb/sum.golang.org/not-a-route",
 			"/proxy.golang.org/sumdb/other.example/latest",
+			"/https://internal/x",
+			"/https://internal.corp.local/../x",
+			"/https://internal%2Fcorp.local/x",
 		} {
 			kind, host, rest := Classify(path)
 			convey.So(kind.String(), convey.ShouldEqual, KindInvalid.String())
 			convey.So(host, convey.ShouldEqual, "")
 			convey.So(rest, convey.ShouldEqual, "")
 		}
+	})
+}
+
+// TestHostFirstRegistry 钉住「上游主机在前」的 registry 写法怎么认、归一成什么。
+//
+// 这里只看路径形态：这台主机开没开 registry 协议由调用方查上游表决定——一条只开
+// static 的上游（registry 的 blob 重定向落点就是）在 /v2/ 之下有它自己的对象，
+// 光凭形态改写会把那些请求全部送错地方。
+func TestHostFirstRegistry(t *testing.T) {
+	cases := []struct {
+		name      string
+		path      string
+		host      string
+		canonical string
+		ok        bool
+	}{
+		{"主机名后的 /v2 是协议边界", "/ghcr.io/v2/o/r/manifests/t", "ghcr.io", "/v2/ghcr.io/o/r/manifests/t", true},
+		{"blob 路径同理", "/ghcr.io/v2/o/r/blobs/sha256:abc", "ghcr.io", "/v2/ghcr.io/o/r/blobs/sha256:abc", true},
+		{"边界本身映射到上游根路径", "/ghcr.io/v2", "ghcr.io", "/v2/ghcr.io", true},
+		{"边界可带尾斜杠", "/ghcr.io/v2/", "ghcr.io", "/v2/ghcr.io/", true},
+		{"带协议头的整条 registry URL", "/https://ghcr.io/v2/o/r/manifests/t", "ghcr.io", "/v2/ghcr.io/o/r/manifests/t", true},
+		{"反代合并过双斜杠的协议头", "/https:/ghcr.io/v2/o/r/manifests/t", "ghcr.io", "/v2/ghcr.io/o/r/manifests/t", true},
+		{"只摘第一个 v2，仓库名里的 v2 段留着", "/ghcr.io/v2/v2/foo/manifests/tag", "ghcr.io", "/v2/ghcr.io/v2/foo/manifests/tag", true},
+		{"仓库路径里的转义序列保持原样", "/ghcr.io/v2/o/r%20x/manifests/t", "ghcr.io", "/v2/ghcr.io/o/r%20x/manifests/t", true},
+
+		{"主机名后不是 v2", "/ghcr.io/v1/foo", "", "", false},
+		{"v2 必须是完整的一段", "/ghcr.io/v2foo/x", "", "", false},
+		{"v2 不在主机名之后", "/ghcr.io/o/v2/x", "", "", false},
+		{"只有主机名", "/ghcr.io", "", "", false},
+		{"不接受编码后的 v2 边界", "/ghcr.io/%76%32/foo", "", "", false},
+		{"旧路由不是这种写法", "/v2/ghcr.io/o/r/manifests/t", "", "", false},
+		{"registry base 不是这种写法", "/registry/ghcr.io/v2/o/r/manifests/t", "", "", false},
+		{"回溯段不归一", "/ghcr.io/v2/a/%2e%2e/x", "", "", false},
+		{"主机名不能藏编码斜杠", "/ghcr.io%2Fevil.example/v2/foo", "", "", false},
+		{"协议头之后第一段不含点", "/https://v2/ghcr.io/o", "", "", false},
+		{"不以斜杠开头", "ghcr.io/v2/o/r/manifests/t", "", "", false},
+		{"空路径", "", "", "", false},
+	}
+
+	convey.Convey("认出上游主机在前的 registry 写法", t, func() {
+		for _, c := range cases {
+			convey.Convey(c.name+"："+c.path, func() {
+				host, canonical, ok := HostFirstRegistry(c.path)
+				convey.So(ok, convey.ShouldEqual, c.ok)
+				convey.So(host, convey.ShouldEqual, c.host)
+				convey.So(canonical, convey.ShouldEqual, c.canonical)
+			})
+		}
+	})
+
+	convey.Convey("归一后的路径就是旧路由认的那一种", t, func() {
+		_, canonical, _ := HostFirstRegistry("/https://ghcr.io/v2/o/r/manifests/t")
+		kind, host, rest := Classify(canonical)
+		convey.So(kind.String(), convey.ShouldEqual, KindRegistry.String())
+		convey.So(host, convey.ShouldEqual, "ghcr.io")
+		convey.So(rest, convey.ShouldEqual, "/o/r/manifests/t")
 	})
 }
